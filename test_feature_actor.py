@@ -28,6 +28,12 @@ class _TestableFeatureActor:
         self.clock.timestamp_ns.return_value = 1_000_000_000
         self._published: list = []
         self.publish_data = lambda dt, data: self._published.append(data)
+        
+        # Mock ensemble state
+        self.ensemble_models = []
+        self.ensemble_names = []
+        self.ensemble_weights = []
+        self._kw_config = None
 
     # Bind the actual methods from FeatureActor
     on_data = FeatureActor.on_data

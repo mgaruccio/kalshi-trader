@@ -210,8 +210,55 @@ class WeatherStrategy(Strategy):
     def on_order_filled(self, event: OrderFilled):
         """Track position changes on fills."""
         self.log.info(f"Order filled: {event}")
-        # Update positions_info and sync with FeatureActor
-        # Full position tracking will be implemented with live wiring
+        
+        # Extract ticker and side from instrument ID
+        inst_str = event.instrument_id.symbol.value # e.g. "KXHIGHCHI-26MAR01-T72-NO"
+        if inst_str.endswith("-YES"):
+            ticker = inst_str[:-4]
+            side = "yes"
+        elif inst_str.endswith("-NO"):
+            ticker = inst_str[:-3]
+            side = "no"
+        else:
+            self.log.warning(f"Could not parse ticker from {inst_str}")
+            return
+
+        # Update positions_info
+        if ticker not in self._positions_info:
+            # We need the metadata (threshold, city) which we can get from parse_ticker if available
+            # or from the ModelSignal we reacted to. For now, let's parse ticker.
+            from kalshi_weather_ml.markets import parse_ticker
+            parsed = parse_ticker(ticker)
+            city = ""
+            threshold = 0.0
+            if parsed:
+                threshold = parsed["threshold"]
+                # Map series to city
+                from kalshi_weather_ml.markets import SERIES_CONFIG
+                series_to_city = {s: c for s, c in SERIES_CONFIG}
+                city = series_to_city.get(parsed["series"], "")
+            
+            self._positions_info[ticker] = {
+                "side": side,
+                "threshold": threshold,
+                "city": city,
+                "contracts": 0,
+            }
+
+        pos = self._positions_info[ticker]
+        qty = int(event.last_qty.as_double())
+        
+        if event.order_side == OrderSide.BUY:
+            pos["contracts"] += qty
+        else:
+            pos["contracts"] -= qty
+
+        # Clean up if position closed
+        if pos["contracts"] <= 0:
+            self._positions_info.pop(ticker)
+        
+        # Sync with FeatureActor
+        self._sync_positions_to_actor()
 
     def on_stop(self):
         """Cancel all active orders on shutdown."""

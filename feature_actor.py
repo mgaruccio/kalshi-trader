@@ -10,7 +10,12 @@ kalshi_weather_ml and publish ClimateEvents on the same bus path
 used by backtest replay.
 """
 import logging
-from datetime import timedelta
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Add kalshi-weather package to path
+sys.path.append("/home/mike/code/altmarkets/kalshi-weather/src")
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
@@ -47,6 +52,15 @@ except ImportError:
     COASTAL_CITIES: set = set()
     get_current_sst = None
 
+try:
+    from kalshi_weather_ml.strategy import evaluate_opportunity_ensemble
+    from kalshi_weather_ml.markets import parse_ticker
+    from kalshi_weather_ml.config import load_config
+except ImportError:
+    evaluate_opportunity_ensemble = None
+    parse_ticker = None
+    load_config = None
+
 
 class FeatureActorConfig(ActorConfig):
     model_cycle_seconds: int = 300    # 5 min between model runs
@@ -63,6 +77,50 @@ class FeatureActor(Actor):
         self._city_features: dict[str, CityFeatureState] = {}
         self._positions: dict[str, dict] = {}  # ticker -> {side, threshold, city}
         self._events_received: int = 0
+        
+        # Ensemble model state
+        self.ensemble_models = []
+        self.ensemble_names = []
+        self.ensemble_weights = []
+        self._kw_config = None
+        if load_config:
+            try:
+                self._kw_config = load_config()
+            except Exception:
+                pass
+        self._load_models()
+
+    def _load_models(self):
+        """Load ensemble models from kalshi-weather data/models directory."""
+        try:
+            from kalshi_weather_ml.config import load_config
+            from kalshi_weather_ml.models.emos import EMOSModel
+            from kalshi_weather_ml.models.ngboost_model import NGBoostModel
+            
+            # Paths relative to kalshi-weather repo
+            kw_root = Path("/home/mike/code/altmarkets/kalshi-weather")
+            models_dir = kw_root / "data" / "models"
+            calibration_path = kw_root / "data" / "calibration_dataset.parquet"
+
+            # Default to EMOS + NGBoost for the ensemble
+            emos_path = models_dir / "emos_normal.json"
+            ngb_path = models_dir / "ngboost_normal.pkl"
+
+            if emos_path.exists():
+                emos = EMOSModel.load(emos_path)
+                self.ensemble_models.append(emos)
+                self.ensemble_names.append("emos")
+                self.ensemble_weights.append(1.0)
+            
+            if ngb_path.exists():
+                ngb = NGBoostModel.load(ngb_path, calibration_path=calibration_path)
+                self.ensemble_models.append(ngb)
+                self.ensemble_names.append("ngboost")
+                self.ensemble_weights.append(1.0)
+
+            self.log.info(f"Loaded {len(self.ensemble_models)} models for ensemble inference")
+        except Exception as e:
+            self.log.error(f"Failed to load models in FeatureActor: {e}")
 
     def on_start(self):
         """Subscribe to climate events and start model cycle timer."""
@@ -98,9 +156,6 @@ class FeatureActor(Actor):
         1. For each city with active positions, snapshot features
         2. Run the ensemble model (EMOS + NGBoost + DRN)
         3. Publish ModelSignal for each evaluated opportunity
-
-        For now, publishes a ModelSignal with p_win from a placeholder
-        so the strategy pipeline can be tested end-to-end.
         """
         if not self._positions:
             return
@@ -112,6 +167,7 @@ class FeatureActor(Actor):
             cities_with_positions.setdefault(city, []).append(ticker)
 
         ts = self.clock.timestamp_ns()
+        now_dt = datetime.now()
 
         for city, tickers in cities_with_positions.items():
             state = self._city_features.get(city)
@@ -122,16 +178,59 @@ class FeatureActor(Actor):
             if not features:
                 continue
 
+            # Extract forecasts from features
+            ecmwf = features.get("ecmwf_high")
+            gfs = features.get("gfs_high")
+            if ecmwf is None or gfs is None:
+                # Fallback to forecast_high if available
+                ecmwf = ecmwf or features.get("forecast_high")
+                gfs = gfs or features.get("forecast_high")
+            
+            if ecmwf is None or gfs is None:
+                continue
+
             for ticker in tickers:
                 pos_info = self._positions[ticker]
-                # Placeholder: real implementation imports and runs
-                # kalshi_weather_ml models here
+                
+                p_win = 0.0
+                model_scores = {}
+                
+                # Real model inference if available
+                if evaluate_opportunity_ensemble and parse_ticker and self.ensemble_models:
+                    parsed = parse_ticker(ticker)
+                    if parsed:
+                        market = {
+                            "ticker": ticker,
+                            "city": city,
+                            "direction": "above", # KXHIGH are above contracts
+                            "threshold": float(parsed["threshold"]),
+                            "settlement_date": parsed["settlement_date"],
+                            "yes_bid": 50, # Dummy prices for p_win calculation
+                            "yes_ask": 51,
+                        }
+                        try:
+                            opps = evaluate_opportunity_ensemble(
+                                market, ecmwf, gfs, self._kw_config,
+                                self.ensemble_models, self.ensemble_names,
+                                self.ensemble_weights, now_dt,
+                                extra_features=features,
+                            )
+                            # Find the opportunity for the current side
+                            side = pos_info.get("side", "no").lower()
+                            for opp in opps:
+                                if opp.side == side:
+                                    p_win = opp.p_win
+                                    model_scores = opp.model_scores
+                                    break
+                        except Exception as e:
+                            self.log.warning(f"Ensemble eval failed for {ticker}: {e}")
+
                 signal = ModelSignal(
                     city=city,
                     ticker=ticker,
                     side=pos_info.get("side", "no"),
-                    p_win=0.0,  # placeholder -- real model inference in Phase 3
-                    model_scores={},
+                    p_win=p_win,
+                    model_scores=model_scores,
                     features_snapshot=features,
                     ts_event=ts,
                     ts_init=ts,

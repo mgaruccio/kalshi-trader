@@ -10,6 +10,15 @@ dependencies = [
     "nautilus-trader>=1.224.0",
     "pydantic-settings>=2.13.1",
     "websockets>=16.0",
+    "scipy>=1.15.0",
+    "scikit-learn>=1.6.0",
+    "lightgbm>=4.5.0",
+    "ngboost>=0.5.9",
+    "properscoring>=0.1",
+    "torch>=2.5.0",
+    "requests>=2.32.5",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=0.24.0",
 ]
 
 [tool.ty.rules]
