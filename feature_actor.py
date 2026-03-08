@@ -4,6 +4,10 @@ FeatureActor sits between raw climate data and the trading strategy.
 It accumulates ClimateEvent data per-city, periodically runs the ML
 ensemble (emitting ModelSignal), and continuously checks exit rules
 (emitting DangerAlert).
+
+In live_mode, timer-based pollers fetch real-time data from
+kalshi_weather_ml and publish ClimateEvents on the same bus path
+used by backtest replay.
 """
 import logging
 from datetime import timedelta
@@ -17,6 +21,31 @@ from data_types import ClimateEvent, ModelSignal, DangerAlert
 from exit_rules import CityFeatureState, check_exit_rules, should_exit
 
 log = logging.getLogger(__name__)
+
+# Optional live dependencies -- may not be installed in backtest-only environments
+try:
+    from kalshi_weather_ml.observations import get_current_temp
+except ImportError:
+    get_current_temp = None
+
+try:
+    from kalshi_weather_ml.forecasts import (
+        get_forecast,
+        get_weather_features,
+        PRIMARY_MODEL,
+        CONSENSUS_MODEL,
+    )
+except ImportError:
+    get_forecast = None
+    get_weather_features = None
+    PRIMARY_MODEL = "ecmwf_ifs025"
+    CONSENSUS_MODEL = "gfs_seamless"
+
+try:
+    from kalshi_weather_ml.data_sources.sst import COASTAL_CITIES, get_current_sst
+except ImportError:
+    COASTAL_CITIES: set = set()
+    get_current_sst = None
 
 
 class FeatureActorConfig(ActorConfig):
@@ -43,7 +72,14 @@ class FeatureActor(Actor):
             interval=timedelta(seconds=self._cfg.model_cycle_seconds),
             callback=self._on_model_timer,
         )
-        self.log.info(f"FeatureActor started (cycle={self._cfg.model_cycle_seconds}s)")
+
+        if self._cfg.live_mode:
+            self._start_live_pollers()
+
+        self.log.info(
+            f"FeatureActor started (cycle={self._cfg.model_cycle_seconds}s, "
+            f"live={self._cfg.live_mode})"
+        )
 
     def on_data(self, data):
         """Handle incoming ClimateEvent -- accumulate features, check danger."""
@@ -145,6 +181,134 @@ class FeatureActor(Actor):
             positions: ticker -> {"side": "no", "threshold": 55.0, "city": "chicago"}
         """
         self._positions = positions
+
+    # --- Live pollers (only active when live_mode=True) ---
+
+    def _start_live_pollers(self):
+        """Start timer-based pollers for each data source."""
+        # METAR: every 10 min (critical for exit triggers)
+        self.clock.set_timer(
+            "poll_metar",
+            interval=timedelta(minutes=10),
+            callback=self._poll_metar,
+        )
+        # ECMWF/GFS forecasts: every 1 hour
+        self.clock.set_timer(
+            "poll_forecast",
+            interval=timedelta(hours=1),
+            callback=self._poll_forecasts,
+        )
+        # SST: every 1 hour
+        self.clock.set_timer(
+            "poll_sst",
+            interval=timedelta(hours=1),
+            callback=self._poll_sst,
+        )
+        self.log.info("Live pollers started: METAR(10m), forecast(1h), SST(1h)")
+
+    def _poll_metar(self, event):
+        """Poll real-time METAR observations for all cities with positions."""
+        if not self._positions:
+            return
+        if get_current_temp is None:
+            return
+
+        cities = {info["city"] for info in self._positions.values()}
+        ts = self.clock.timestamp_ns()
+
+        for city in cities:
+            try:
+                temp = get_current_temp(city)
+                if temp is not None:
+                    evt = ClimateEvent(
+                        source="metar_obs",
+                        city=city,
+                        features={"obs_temp": temp},
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(ClimateEvent), evt)
+                    # Also ingest locally (same path as backtest)
+                    self.on_data(evt)
+            except Exception as e:
+                self.log.warning(f"METAR poll failed for {city}: {e}")
+
+    def _poll_forecasts(self, event):
+        """Poll ECMWF/GFS forecasts for cities with positions."""
+        if not self._positions:
+            return
+        if get_forecast is None:
+            return
+
+        from datetime import date
+
+        cities = {info["city"] for info in self._positions.values()}
+        today = date.today().isoformat()
+        ts = self.clock.timestamp_ns()
+
+        for city in cities:
+            try:
+                ecmwf = get_forecast(city, today, PRIMARY_MODEL)
+                gfs = get_forecast(city, today, CONSENSUS_MODEL)
+                wx = get_weather_features(city, today) if get_weather_features else {}
+
+                features = {}
+                if ecmwf is not None:
+                    features["ecmwf_high"] = ecmwf
+                if gfs is not None:
+                    features["gfs_high"] = gfs
+                if ecmwf is not None and gfs is not None:
+                    features["forecast_high"] = max(ecmwf, gfs)
+                features.update(wx)
+
+                if features:
+                    evt = ClimateEvent(
+                        source="ecmwf_forecast",
+                        city=city,
+                        features=features,
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(ClimateEvent), evt)
+                    self.on_data(evt)
+            except Exception as e:
+                self.log.warning(f"Forecast poll failed for {city}: {e}")
+
+    def _poll_sst(self, event):
+        """Poll SST data for coastal cities with positions."""
+        if not self._positions:
+            return
+        if get_current_sst is None:
+            return
+
+        cities = {info["city"] for info in self._positions.values()}
+        ts = self.clock.timestamp_ns()
+
+        for city in cities:
+            try:
+                if city not in COASTAL_CITIES:
+                    continue
+
+                sst_data = get_current_sst(city)
+                if sst_data:
+                    evt = ClimateEvent(
+                        source="ndbc_buoy_sst",
+                        city=city,
+                        features=sst_data,
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(ClimateEvent), evt)
+                    self.on_data(evt)
+            except Exception as e:
+                self.log.warning(f"SST poll failed for {city}: {e}")
+
+    @property
+    def poll_cities(self) -> set[str]:
+        """Return set of cities currently being polled (from positions)."""
+        if self._positions:
+            return {info["city"] for info in self._positions.values()}
+        return set()
 
     @property
     def events_received(self) -> int:
