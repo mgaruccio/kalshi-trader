@@ -1,0 +1,10 @@
+services:
+  trader:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ~/.config/kalshi:/root/.config/kalshi:ro
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
