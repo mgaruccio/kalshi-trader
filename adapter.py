@@ -49,6 +49,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 KALSHI_VENUE = Venue("KALSHI")
 
 
+def _parse_ts(ts_raw, fallback_ns: int) -> int:
+    """Parse Kalshi WebSocket timestamp to nanoseconds.
+
+    Kalshi sends ISO 8601 strings like '2026-03-08T23:37:31.189819Z'.
+    Nautilus expects integer nanoseconds.
+    """
+    if ts_raw is None:
+        return fallback_ns
+    if isinstance(ts_raw, (int, float)):
+        return int(ts_raw * 1_000_000_000)
+    if isinstance(ts_raw, str):
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1_000_000_000)
+        except ValueError:
+            return fallback_ns
+    return fallback_ns
+
+
 class KalshiConfig(BaseSettings):
     api_key_id: str = ""
     private_key_path: str = ""
@@ -128,63 +148,81 @@ class KalshiDataClient(LiveMarketDataClient):
 
             if msg_type in ("orderbook_delta", "orderbook_snapshot"):
                 data = msg.get("msg", {})
-                self._log.info(f"Received market data: {msg_type}")
+                self._log.debug(f"Received market data: {msg_type}")
                 ticker = data.get("market_ticker")
                 if not ticker:
+                    self._log.warning("No ticker in message!")
                     return
 
                 ts = self._clock.timestamp_ns()
+                
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                self._log.debug(f"Ticker: {ticker} | Bids: {len(bids)} Asks: {len(asks)}")
 
-                # Update both YES and NO instruments if subscribed
                 for side_suffix in ["-YES", "-NO"]:
                     instr_id = InstrumentId(
                         Symbol(f"{ticker}{side_suffix}"), KALSHI_VENUE
                     )
-                    if instr_id in self._subscriptions:
-                        instrument = self._instrument_provider.find(instr_id)
-                        if not instrument:
-                            continue
+                    
+                    if instr_id not in self._subscriptions:
+                        self._log.debug(f"Skipping {instr_id} - not in subscriptions")
+                        continue
+                        
+                    instrument = self._instrument_provider.find(instr_id)
+                    if not instrument:
+                        self._log.warning(f"Instrument {instr_id} NOT found in provider!")
+                        continue
 
-                        bids = data.get("bids", [])
-                        asks = data.get("asks", [])
+                    if not self._cache.instrument(instr_id):
+                        self._log.debug(f"Instrument {instr_id} not in cache, emitting")
+                        self._handle_data(instrument)
 
-                        best_bid = bids[0] if bids else None
-                        best_ask = asks[0] if asks else None
+                    best_bid = bids[0] if bids else None
+                    best_ask = asks[0] if asks else None
 
-                        if best_bid and best_ask:
-                            b_price_cents = best_bid[0]
-                            b_qty = best_bid[1]
-                            a_price_cents = best_ask[0]
-                            a_qty = best_ask[1]
+                    b_price_cents = best_bid[0] if best_bid else 0
+                    b_qty = best_bid[1] if best_bid else 0
+                    a_price_cents = best_ask[0] if best_ask else 0
+                    a_qty = best_ask[1] if best_ask else 0
 
-                            if side_suffix == "-NO":
-                                # Invert prices for NO
-                                _b_price_cents = 100 - a_price_cents
-                                _a_price_cents = 100 - b_price_cents
-                                _b_qty = a_qty
-                                _a_qty = b_qty
-                                b_price_cents, a_price_cents = (
-                                    _b_price_cents,
-                                    _a_price_cents,
-                                )
-                                b_qty, a_qty = _b_qty, _a_qty
+                    if side_suffix == "-NO":
+                        _b_price_cents = 100 - a_price_cents if best_ask else 0
+                        _a_price_cents = 100 - b_price_cents if best_bid else 0
+                        _b_qty = a_qty
+                        _a_qty = b_qty
+                        b_price_cents, a_price_cents = _b_price_cents, _a_price_cents
+                        b_qty, a_qty = _b_qty, _a_qty
 
-                            b_price = b_price_cents / 100.0
-                            a_price = a_price_cents / 100.0
-                            
-                            ts_exchange = data.get("ts")
-                            ts_event = (ts_exchange * 1_000_000) if ts_exchange else ts
+                    try:
+                        # We MUST provide valid prices for Nautilus QuoteTick
+                        # If one side is missing, we use a dummy extreme price for it.
+                        b_p = b_price_cents / 100.0 if b_price_cents > 0 else 0.01
+                        a_p = a_price_cents / 100.0 if a_price_cents > 0 else 0.99
+                        b_q = b_qty if b_price_cents > 0 else 0
+                        a_q = a_qty if a_price_cents > 0 else 0
 
-                            tick = QuoteTick(
-                                instrument_id=instr_id,
-                                bid_price=instrument.make_price(b_price),
-                                ask_price=instrument.make_price(a_price),
-                                bid_size=instrument.make_qty(b_qty),
-                                ask_size=instrument.make_qty(a_qty),
-                                ts_event=ts_event,
-                                ts_init=ts,
-                            )
-                            self._handle_data(tick)
+                        b_price = instrument.make_price(b_p)
+                        a_price = instrument.make_price(a_p)
+                        b_size = instrument.make_qty(b_q)
+                        a_size = instrument.make_qty(a_q)
+
+                        ts_event = _parse_ts(data.get("ts"), fallback_ns=int(ts))
+
+                        tick = QuoteTick(
+                            instrument_id=instr_id,
+                            bid_price=b_price,
+                            ask_price=a_price,
+                            bid_size=b_size,
+                            ask_size=a_size,
+                            ts_event=ts_event,
+                            ts_init=int(ts),
+                        )
+                        self._log.debug(f"Emitting QuoteTick for {instr_id}")
+                        self._handle_data(tick)
+                    except Exception as ex:
+                        self._log.error(f"Failed to create/emit QuoteTick for {instr_id}: {ex}")
+
         except Exception as e:
             self._log.error(f"Error handling WS message: {e}")
 
@@ -203,6 +241,10 @@ class KalshiDataClient(LiveMarketDataClient):
         instrument_id = command.instrument_id
         self._subscriptions.add(instrument_id)
         await self._send_subscribe(instrument_id)
+
+        instrument = self._instrument_provider.find(instrument_id)
+        if instrument and not self._cache.instrument(instrument_id):
+            self._handle_data(instrument)
 
     async def _unsubscribe_quote_ticks(self, command) -> None:
         instrument_id = command.instrument_id
@@ -291,8 +333,7 @@ class KalshiExecutionClient(LiveExecutionClient):
                 c_oid = ClientOrderId(data.get("client_order_id"))
                 v_oid = data.get("order_id")
 
-                ts_exchange = data.get("ts")
-                ts_event = (ts_exchange * 1_000_000) if ts_exchange else ts
+                ts_event = _parse_ts(data.get("ts"), fallback_ns=ts)
 
                 ticker = data.get("ticker")
                 side = data.get("side", "yes")
@@ -339,8 +380,7 @@ class KalshiExecutionClient(LiveExecutionClient):
                     Symbol(f"{ticker}-{side.upper()}"), KALSHI_VENUE
                 )
                 
-                ts_exchange = data.get("ts")
-                ts_event = (ts_exchange * 1_000_000) if ts_exchange else ts
+                ts_event = _parse_ts(data.get("ts"), fallback_ns=ts)
 
                 instrument = self._instrument_provider.find(instrument_id)
                 if not instrument:
@@ -595,9 +635,21 @@ class KalshiExecutionClientFactory(LiveExecClientFactory):
         )
 
 
+_SHARED_PROVIDER = None
+
 class KalshiInstrumentProvider(InstrumentProvider):
+    def __new__(cls, *args, **kwargs):
+        global _SHARED_PROVIDER
+        if _SHARED_PROVIDER is None:
+            _SHARED_PROVIDER = super().__new__(cls)
+            _SHARED_PROVIDER._initialized = False
+        return _SHARED_PROVIDER
+
     def __init__(self, config: KalshiConfig):
+        if getattr(self, '_initialized', False):
+            return
         super().__init__()
+        self._initialized = True
         self.config = config
 
         self.k_api_config = kalshi_python.Configuration()
@@ -609,15 +661,10 @@ class KalshiInstrumentProvider(InstrumentProvider):
         self.k_api = MarketsApi(self.k_client)
 
     def load_all(self, filters: dict | None = None):
-        import time
         try:
-            kwargs = {"limit": 200, "status": "open"}
-            if filters and "series_ticker" in filters:
-                kwargs["series_ticker"] = filters["series_ticker"]
-
             cursor = None
             while True:
-                resp = self.k_api.get_markets(cursor=cursor, **kwargs)
+                resp = self.k_api.get_markets(limit=50, cursor=cursor, status="open")
                 for m in getattr(resp, "markets", None) or []:
                     if m.status not in ("active", "open"):
                         continue
@@ -629,9 +676,8 @@ class KalshiInstrumentProvider(InstrumentProvider):
                 cursor = getattr(resp, "cursor", None)
                 if not cursor:
                     break
-                time.sleep(0.2)
         except Exception as e:
-            self._log.error(f"Error loading instruments: {e}")
+            logging.error(f"Error loading instruments: {e}")
 
     def _build_instrument(self, market, side: str) -> CurrencyPair:
         from decimal import Decimal

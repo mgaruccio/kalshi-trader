@@ -1,0 +1,6 @@
+[Unit]
+Description=Check collector health
+
+[Service]
+Type=oneshot
+ExecStart=/root/kalshi-trader/collector-health.sh

@@ -31,9 +31,26 @@ class KalshiDiscoveryStrategy(Strategy):
 
     def on_start(self):
         self.log.info("Starting KalshiDiscoveryStrategy")
+        self._tick_count = 0
+        self._zero_tick_streak = 0
         # Trigger an immediate discovery, then start a timer to poll every 10 minutes
         self.discover_markets()
         self.clock.set_timer("discovery_timer", interval=datetime.timedelta(seconds=600), callback=self.discover_markets)
+        self.clock.set_timer("heartbeat", interval=datetime.timedelta(seconds=60), callback=self._heartbeat)
+
+    def on_quote_tick(self, tick):
+        self._tick_count += 1
+
+    def _heartbeat(self, event=None):
+        count = self._tick_count
+        self._tick_count = 0
+        self.log.info(f"HEARTBEAT: {count} ticks/60s, {len(self.subscribed_ids)} instruments")
+        if count == 0:
+            self._zero_tick_streak += 1
+            if self._zero_tick_streak >= 5:
+                self.log.error("NO TICKS FOR 5 MINUTES — possible connection issue")
+        else:
+            self._zero_tick_streak = 0
 
     def on_timer(self, timer_id: str):
         if timer_id == "discovery_timer":

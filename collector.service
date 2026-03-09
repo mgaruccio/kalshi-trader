@@ -1,0 +1,25 @@
+[Unit]
+Description=Kalshi Market Data Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/kalshi-trader
+ExecStart=/root/kalshi-trader/.venv/bin/python collector.py
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+# Resource limits
+MemoryMax=512M
+MemoryHigh=384M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=collector
+
+[Install]
+WantedBy=multi-user.target
