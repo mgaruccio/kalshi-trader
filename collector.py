@@ -34,6 +34,9 @@ class KalshiDiscoveryStrategy(Strategy):
         self.log.info("Starting KalshiDiscoveryStrategy")
         self._tick_count = 0
         self._zero_tick_streak = 0
+        # Capture event loop reference — timer callbacks can't find it via get_running_loop()
+        import asyncio
+        self._loop = asyncio.get_running_loop()
         # Trigger an immediate discovery, then start a timer to poll every 10 minutes
         self.discover_markets()
         self.clock.set_timer("discovery_timer", interval=datetime.timedelta(seconds=600), callback=self.discover_markets)
@@ -60,10 +63,8 @@ class KalshiDiscoveryStrategy(Strategy):
     def discover_markets(self, event=None):
         self.log.info(f"[{time.strftime('%X')}] Starting background market discovery...")
 
-        import asyncio
-        loop = asyncio.get_running_loop()
-        # Run in a background thread so we don't block Nautilus's event loop with synchronous REST calls and sleeps
-        future = loop.run_in_executor(None, self._sync_discover_markets, loop)
+        # Use stored loop reference — timer callbacks don't have asyncio context
+        future = self._loop.run_in_executor(None, self._sync_discover_markets, self._loop)
         future.add_done_callback(self._on_discovery_done)
 
     def _on_discovery_done(self, future):
