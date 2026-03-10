@@ -66,6 +66,7 @@ class FeatureActorConfig(ActorConfig):
     model_cycle_seconds: int = 300    # 5 min between model runs
     danger_check_enabled: bool = True  # check exit rules on each event
     live_mode: bool = False            # enables live pollers in Phase 3
+    scan_opportunities: bool = True   # scan all instruments for entry opportunities
 
 
 class FeatureActor(Actor):
@@ -82,12 +83,13 @@ class FeatureActor(Actor):
         self.ensemble_models = []
         self.ensemble_names = []
         self.ensemble_weights = []
+        self._models_loaded = False
         self._kw_config = None
         if load_config:
             try:
                 self._kw_config = load_config()
-            except Exception:
-                pass
+            except Exception as e:
+                self.log.error(f"Config load failed: {e}")
         self._load_models()
 
     def _load_models(self):
@@ -118,13 +120,26 @@ class FeatureActor(Actor):
                 self.ensemble_names.append("ngboost")
                 self.ensemble_weights.append(1.0)
 
-            self.log.info(f"Loaded {len(self.ensemble_models)} models for ensemble inference")
+            if self.ensemble_models:
+                self._models_loaded = True
+                # Load production weights from trader_config.json if available
+                if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
+                    config_weights = self._kw_config.ensemble_weights
+                    if config_weights:
+                        self.ensemble_weights = [
+                            config_weights.get(name, 1.0)
+                            for name in self.ensemble_names
+                        ]
+                        self.log.info(f"Loaded production weights: {dict(zip(self.ensemble_names, self.ensemble_weights))}")
+                self.log.info(f"Loaded {len(self.ensemble_models)} models for ensemble inference")
+            else:
+                self.log.error("No models loaded — model files not found")
         except Exception as e:
             self.log.error(f"Failed to load models in FeatureActor: {e}")
 
     def on_start(self):
         """Subscribe to climate events and start model cycle timer."""
-        self.subscribe_data(DataType(ClimateEvent))
+        self.subscribe_data(DataType(ClimateEvent), client_id=ClientId("CLIMATE"))
         self.clock.set_timer(
             "model_cycle",
             interval=timedelta(seconds=self._cfg.model_cycle_seconds),
@@ -150,97 +165,185 @@ class FeatureActor(Actor):
                 self._check_danger(data.city)
 
     def _on_model_timer(self, event):
-        """Run ML ensemble on accumulated features for each city with positions.
+        """Run ML ensemble on accumulated features.
 
-        In the full implementation, this will:
-        1. For each city with active positions, snapshot features
-        2. Run the ensemble model (EMOS + NGBoost + DRN)
-        3. Publish ModelSignal for each evaluated opportunity
+        1. For each city with active positions, re-evaluate and publish ModelSignal
+        2. Scan all cached instruments for new entry opportunities
         """
-        if not self._positions:
-            return
-
-        # Group positions by city
-        cities_with_positions: dict[str, list[str]] = {}
-        for ticker, info in self._positions.items():
-            city = info.get("city", "")
-            cities_with_positions.setdefault(city, []).append(ticker)
-
         ts = self.clock.timestamp_ns()
         now_dt = datetime.now()
 
-        for city, tickers in cities_with_positions.items():
+        # Track tickers already evaluated for position monitoring
+        evaluated_tickers: set[str] = set()
+
+        # --- Position monitoring: re-evaluate held positions ---
+        if self._positions:
+            cities_with_positions: dict[str, list[str]] = {}
+            for ticker, info in self._positions.items():
+                city = info.get("city", "")
+                cities_with_positions.setdefault(city, []).append(ticker)
+
+            for city, tickers in cities_with_positions.items():
+                state = self._city_features.get(city)
+                if state is None:
+                    continue
+
+                features = state.snapshot()
+                if not features:
+                    continue
+
+                ecmwf = features.get("ecmwf_high")
+                gfs = features.get("gfs_high")
+                if ecmwf is None or gfs is None:
+                    ecmwf = ecmwf or features.get("forecast_high")
+                    gfs = gfs or features.get("forecast_high")
+
+                if ecmwf is None or gfs is None:
+                    continue
+
+                for ticker in tickers:
+                    evaluated_tickers.add(ticker)
+                    pos_info = self._positions[ticker]
+
+                    p_win = 0.0
+                    model_scores = {}
+
+                    if evaluate_opportunity_ensemble and parse_ticker and self.ensemble_models:
+                        parsed = parse_ticker(ticker)
+                        if parsed:
+                            market = {
+                                "ticker": ticker,
+                                "city": city,
+                                "direction": "above",
+                                "threshold": float(parsed["threshold"]),
+                                "settlement_date": parsed["settlement_date"],
+                                "yes_bid": 50,
+                                "yes_ask": 51,
+                            }
+                            try:
+                                opps = evaluate_opportunity_ensemble(
+                                    market, ecmwf, gfs, self._kw_config,
+                                    self.ensemble_models, self.ensemble_names,
+                                    self.ensemble_weights, now_dt,
+                                    extra_features=features,
+                                )
+                                side = pos_info.get("side", "no").lower()
+                                for opp in opps:
+                                    if opp.side == side:
+                                        p_win = opp.p_win
+                                        model_scores = opp.model_scores
+                                        break
+                            except Exception as e:
+                                self.log.warning(f"Ensemble eval failed for {ticker}: {e}")
+
+                    signal = ModelSignal(
+                        city=city,
+                        ticker=ticker,
+                        side=pos_info.get("side", "no"),
+                        p_win=p_win,
+                        model_scores=model_scores,
+                        features_snapshot=features,
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(ModelSignal), signal)
+
+        # --- Opportunity scanning: evaluate all cached instruments for new entries ---
+        if self._cfg.scan_opportunities:
+            self._scan_opportunities(ts, now_dt, evaluated_tickers)
+
+    def _scan_opportunities(
+        self,
+        ts: int,
+        now_dt: datetime,
+        skip_tickers: set[str],
+    ):
+        """Evaluate all cached instruments for entry opportunities."""
+        if not (evaluate_opportunity_ensemble and parse_ticker):
+            self.log.error("Cannot scan: ensemble functions not available (import failed)")
+            return
+        if not self._models_loaded:
+            self.log.error("Cannot scan: no models loaded")
+            return
+
+        instruments = self.cache.instruments()
+        if not instruments:
+            return
+
+        from kalshi_weather_ml.markets import SERIES_CONFIG
+
+        series_to_city = {s: c for s, c in SERIES_CONFIG}
+
+        # Group instruments by city, dedup tickers
+        city_tickers: dict[str, list[dict]] = {}
+        seen_tickers: set[str] = set()
+        for inst in instruments:
+            sym = inst.id.symbol.value  # "KXHIGHCHI-26MAR01-T55-NO"
+            if not (sym.endswith("-YES") or sym.endswith("-NO")):
+                continue
+            ticker = sym.rsplit("-", 1)[0]
+            if ticker in skip_tickers or ticker in seen_tickers:
+                continue
+            seen_tickers.add(ticker)
+
+            parsed = parse_ticker(ticker)
+            if not parsed:
+                continue
+            city = series_to_city.get(parsed["series"], "")
+            if city:
+                city_tickers.setdefault(city, []).append(
+                    {"ticker": ticker, "parsed": parsed}
+                )
+
+        for city, ticker_list in city_tickers.items():
             state = self._city_features.get(city)
             if state is None:
                 continue
-
             features = state.snapshot()
-            if not features:
-                continue
-
-            # Extract forecasts from features
             ecmwf = features.get("ecmwf_high")
             gfs = features.get("gfs_high")
             if ecmwf is None or gfs is None:
-                # Fallback to forecast_high if available
-                ecmwf = ecmwf or features.get("forecast_high")
-                gfs = gfs or features.get("forecast_high")
-            
-            if ecmwf is None or gfs is None:
                 continue
 
-            for ticker in tickers:
-                pos_info = self._positions[ticker]
-                
-                p_win = 0.0
-                model_scores = {}
-                
-                # Real model inference if available
-                if evaluate_opportunity_ensemble and parse_ticker and self.ensemble_models:
-                    parsed = parse_ticker(ticker)
-                    if parsed:
-                        market = {
-                            "ticker": ticker,
-                            "city": city,
-                            "direction": "above", # KXHIGH are above contracts
-                            "threshold": float(parsed["threshold"]),
-                            "settlement_date": parsed["settlement_date"],
-                            "yes_bid": 50, # Dummy prices for p_win calculation
-                            "yes_ask": 51,
-                        }
-                        try:
-                            opps = evaluate_opportunity_ensemble(
-                                market, ecmwf, gfs, self._kw_config,
-                                self.ensemble_models, self.ensemble_names,
-                                self.ensemble_weights, now_dt,
-                                extra_features=features,
-                            )
-                            # Find the opportunity for the current side
-                            side = pos_info.get("side", "no").lower()
-                            for opp in opps:
-                                if opp.side == side:
-                                    p_win = opp.p_win
-                                    model_scores = opp.model_scores
-                                    break
-                        except Exception as e:
-                            self.log.warning(f"Ensemble eval failed for {ticker}: {e}")
-
-                signal = ModelSignal(
-                    city=city,
-                    ticker=ticker,
-                    side=pos_info.get("side", "no"),
-                    p_win=p_win,
-                    model_scores=model_scores,
-                    features_snapshot=features,
-                    ts_event=ts,
-                    ts_init=ts,
-                )
-                self.publish_data(DataType(ModelSignal), signal)
+            for entry in ticker_list:
+                ticker = entry["ticker"]
+                parsed = entry["parsed"]
+                market = {
+                    "ticker": ticker,
+                    "city": city,
+                    "direction": "above",
+                    "threshold": float(parsed["threshold"]),
+                    "settlement_date": parsed["settlement_date"],
+                    "yes_bid": 50,
+                    "yes_ask": 51,
+                }
+                try:
+                    opps = evaluate_opportunity_ensemble(
+                        market, ecmwf, gfs, self._kw_config,
+                        self.ensemble_models, self.ensemble_names,
+                        self.ensemble_weights, now_dt,
+                        extra_features=features,
+                    )
+                    for opp in opps:
+                        signal = ModelSignal(
+                            city=city,
+                            ticker=ticker,
+                            side=opp.side,
+                            p_win=opp.p_win,
+                            model_scores=opp.model_scores,
+                            features_snapshot=features,
+                            ts_event=ts,
+                            ts_init=ts,
+                        )
+                        self.publish_data(DataType(ModelSignal), signal)
+                except Exception as e:
+                    self.log.warning(f"Scan eval failed for {ticker}: {e}")
 
     def _check_danger(self, city: str):
         """Run exit rules for a city and publish DangerAlert if triggered."""
         state = self._city_features.get(city)
         if state is None:
+            self.log.warning(f"No feature state for {city}, skipping danger check")
             return
 
         features = state.snapshot()

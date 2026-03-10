@@ -5,6 +5,7 @@ WeatherStrategy (entry/exit execution) into a NautilusTrader
 live TradingNode with Kalshi data + execution clients.
 """
 import logging
+import sys
 
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.live.config import TradingNodeConfig, LiveDataClientConfig, LiveExecClientConfig
@@ -19,30 +20,31 @@ from feature_actor import FeatureActor, FeatureActorConfig
 from weather_strategy import WeatherStrategy, WeatherStrategyConfig
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
 def main():
     try:
         config_obj = KalshiConfig()
     except Exception as e:
-        print(f"Failed to load configuration: {e}")
-        print("Please ensure KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH are set.")
-        return
+        log.error(f"Failed to load configuration: {e}")
+        log.error("Please ensure KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH are set.")
+        sys.exit(1)
 
     if not config_obj.api_key_id or not config_obj.private_key_path:
-        print("Configuration Error: KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH is empty.")
-        return
+        log.error("Configuration Error: KALSHI_API_KEY_ID or KALSHI_PRIVATE_KEY_PATH is empty.")
+        sys.exit(1)
 
     # 1. Load instruments
     provider = KalshiInstrumentProvider(config=config_obj)
-    print("Loading instruments from Kalshi...")
+    log.info("Loading instruments from Kalshi...")
     provider.load_all(filters={"series_ticker": "KXHIGH"})
     instruments = provider.list_all()
 
     if not instruments:
-        print("No KXHIGH instruments found!")
-        return
-    print(f"Loaded {len(instruments)} instruments")
+        log.error("No KXHIGH instruments found!")
+        sys.exit(1)
+    log.info(f"Loaded {len(instruments)} instruments")
 
     # 2. Setup TradingNode
     config = TradingNodeConfig(
@@ -77,11 +79,11 @@ def main():
     node.trader.add_strategy(weather_strategy)
 
     # 5. Run
-    print("Starting Weather TradingNode. Press Ctrl+C to stop.")
+    log.info("Starting Weather TradingNode. Press Ctrl+C to stop.")
     try:
         node.run()
     except KeyboardInterrupt:
-        print("Stopping TradingNode...")
+        log.info("Stopping TradingNode...")
         node.stop()
     finally:
         node.dispose()

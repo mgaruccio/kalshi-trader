@@ -30,6 +30,7 @@ class _TestableWeatherStrategy:
 
     # Bind actual methods from WeatherStrategy
     on_data = WeatherStrategy.on_data
+    _quote_key = WeatherStrategy._quote_key
     _evaluate_entry = WeatherStrategy._evaluate_entry
     _evaluate_exit = WeatherStrategy._evaluate_exit
     _check_profit_targets = WeatherStrategy._check_profit_targets

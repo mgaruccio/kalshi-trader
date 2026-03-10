@@ -28,6 +28,7 @@ class KalshiDiscoveryStrategy(Strategy):
         super().__init__(config)
         self.provider = provider
         self.subscribed_ids = set()
+        self._discovery_consecutive_failures = 0
 
     def on_start(self):
         self.log.info("Starting KalshiDiscoveryStrategy")
@@ -56,13 +57,20 @@ class KalshiDiscoveryStrategy(Strategy):
         if timer_id == "discovery_timer":
             self.discover_markets()
 
-    def discover_markets(self):
+    def discover_markets(self, event=None):
         self.log.info(f"[{time.strftime('%X')}] Starting background market discovery...")
-        
+
         import asyncio
         loop = asyncio.get_running_loop()
         # Run in a background thread so we don't block Nautilus's event loop with synchronous REST calls and sleeps
-        loop.run_in_executor(None, self._sync_discover_markets, loop)
+        future = loop.run_in_executor(None, self._sync_discover_markets, loop)
+        future.add_done_callback(self._on_discovery_done)
+
+    def _on_discovery_done(self, future):
+        """Log exceptions from background discovery thread."""
+        exc = future.exception()
+        if exc is not None:
+            self.log.error(f"Background discovery thread failed: {exc}")
 
     def _sync_discover_markets(self, loop):
         import time
@@ -141,8 +149,17 @@ class KalshiDiscoveryStrategy(Strategy):
             else:
                 self.log.info("No new active high temp markets found.")
 
+            self._discovery_consecutive_failures = 0
+
         except Exception as e:
-            self.log.error(f"Error during market discovery: {e}")
+            self._discovery_consecutive_failures += 1
+            if self._discovery_consecutive_failures >= 3:
+                self.log.error(
+                    f"Market discovery failed {self._discovery_consecutive_failures} consecutive times — "
+                    f"escalation needed: {e}"
+                )
+            else:
+                self.log.error(f"Error during market discovery: {e}")
 
     async def _subscribe_all(self, new_instruments):
         for inst in new_instruments:

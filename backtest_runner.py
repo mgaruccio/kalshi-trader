@@ -9,18 +9,23 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import CustomData, DataType, QuoteTick
 from nautilus_trader.model.enums import AccountType, OmsType
+from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Money
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
 
 from adapter import KALSHI_VENUE
 from data_types import ClimateEvent
+
+CLIMATE_CLIENT = ClientId("CLIMATE")
 
 log = logging.getLogger(__name__)
 
@@ -63,38 +68,113 @@ def load_climate_events(parquet_path: Path) -> list[ClimateEvent]:
     return events
 
 
+def _find_session_dir(catalog_path: Path) -> Path | None:
+    """Find the session directory inside a streaming catalog.
+
+    NT streaming writer creates: catalog_path/live/<session_id>/
+    Returns the first session dir found, or None.
+    """
+    live_dir = catalog_path / "live"
+    if not live_dir.exists():
+        return None
+    sessions = [d for d in live_dir.iterdir() if d.is_dir()]
+    if not sessions:
+        return None
+    if len(sessions) > 1:
+        log.warning(f"Multiple sessions found, using first: {sessions[0].name}")
+    return sessions[0]
+
+
+def _read_ipc_stream(path: Path):
+    """Read an Arrow IPC stream file and return a pyarrow Table."""
+    with open(path, "rb") as f:
+        return ipc.open_stream(f).read_all()
+
+
 def load_instruments_from_catalog(catalog_path: Path) -> list:
-    """Load all instruments from a ParquetDataCatalog."""
+    """Load CurrencyPair instruments from an NT streaming catalog.
+
+    Reads currency_pair_*.feather files (Arrow IPC stream format) and
+    deserializes them via ArrowSerializer.
+    """
     if not catalog_path.exists():
         log.warning(f"No catalog at {catalog_path}")
         return []
 
-    catalog = ParquetDataCatalog(str(catalog_path))
-    instruments = catalog.instruments()
-    log.info(f"Loaded {len(instruments)} instruments from catalog {catalog_path}")
+    session_dir = _find_session_dir(catalog_path)
+    if session_dir is None:
+        log.warning(f"No session directory in {catalog_path}")
+        return []
+
+    feather_files = sorted(session_dir.glob("currency_pair_*.feather"))
+    if not feather_files:
+        log.warning(f"No currency_pair feather files in {session_dir}")
+        return []
+
+    instruments = []
+    skipped = 0
+    for fp in feather_files:
+        try:
+            table = _read_ipc_stream(fp)
+            instruments.extend(ArrowSerializer.deserialize(CurrencyPair, table))
+        except Exception:
+            skipped += 1
+            log.warning(f"Failed to read {fp.name}", exc_info=True)
+
+    if skipped > 0:
+        log.warning(f"Skipped {skipped}/{len(feather_files)} instrument files")
+    log.info(f"Loaded {len(instruments)} instruments from {session_dir.name}")
     return instruments
 
 
 def load_quote_ticks_from_catalog(catalog_path: Path, instrument_ids: list | None = None) -> list[QuoteTick]:
-    """Load all QuoteTick data for instruments in a ParquetDataCatalog."""
+    """Load QuoteTick data from an NT streaming catalog.
+
+    Reads quote_tick/<instrument_id>/*.feather files (Arrow IPC stream format)
+    and deserializes them via ArrowSerializer.
+    """
     if not catalog_path.exists():
         log.warning(f"No catalog at {catalog_path}")
         return []
 
-    catalog = ParquetDataCatalog(str(catalog_path))
-    if instrument_ids is None:
-        # Load all instruments in the catalog if none specified
-        instrument_ids = [inst.id for inst in catalog.instruments()]
-    
+    session_dir = _find_session_dir(catalog_path)
+    if session_dir is None:
+        log.warning(f"No session directory in {catalog_path}")
+        return []
+
+    quote_tick_dir = session_dir / "quote_tick"
+    if not quote_tick_dir.exists():
+        log.warning(f"No quote_tick directory in {session_dir}")
+        return []
+
+    # Filter to requested instrument IDs if specified
+    if instrument_ids is not None:
+        id_strs = {str(iid) for iid in instrument_ids}
+    else:
+        id_strs = None
+
     ticks = []
-    for inst_id in instrument_ids:
-        log.debug(f"Loading ticks for {inst_id}...")
-        inst_ticks = catalog.load_quote_ticks(instrument_id=inst_id)
-        if inst_ticks:
-            ticks.extend(inst_ticks)
-    
-    log.info(f"Loaded {len(ticks)} total QuoteTicks from catalog")
-    # Sort by ts_event for chronological replay
+    skipped = 0
+    total_files = 0
+    subdirs = sorted(d for d in quote_tick_dir.iterdir() if d.is_dir())
+    for subdir in subdirs:
+        if id_strs is not None and subdir.name not in id_strs:
+            continue
+        for fp in sorted(subdir.glob("*.feather")):
+            total_files += 1
+            try:
+                table = _read_ipc_stream(fp)
+                # ArrowSerializer returns pyo3 QuoteTick; convert to Cython
+                # for BacktestEngine compatibility
+                pyo3_ticks = ArrowSerializer.deserialize(QuoteTick, table)
+                ticks.extend(QuoteTick.from_pyo3(t) for t in pyo3_ticks)
+            except Exception:
+                skipped += 1
+                log.warning(f"Failed to read {fp.name}", exc_info=True)
+
+    if skipped > 0:
+        log.warning(f"Skipped {skipped}/{total_files} quote tick files")
+    log.info(f"Loaded {len(ticks)} QuoteTicks from {len(subdirs)} instruments")
     ticks.sort(key=lambda t: t.ts_event)
     return ticks
 
@@ -156,6 +236,16 @@ def run_backtest(
             ids = [inst.id for inst in instruments] if instruments else None
             quote_ticks = load_quote_ticks_from_catalog(catalog_path, ids)
 
+    # Filter climate events to quote tick window (avoid processing years of
+    # history when only a few hours of quotes exist)
+    if climate_events and quote_ticks:
+        first_qt_ns = quote_ticks[0].ts_event
+        buffer_ns = 72 * 3600 * 1_000_000_000  # 72h buffer
+        cutoff_ns = first_qt_ns - buffer_ns
+        original = len(climate_events)
+        climate_events = [e for e in climate_events if e.ts_event >= cutoff_ns]
+        log.info(f"Filtered climate events: {original} -> {len(climate_events)} (72h before first quote tick)")
+
     # Create engine
     engine = create_backtest_engine(starting_balance_usd)
 
@@ -164,9 +254,10 @@ def run_backtest(
         for inst in instruments:
             engine.add_instrument(inst)
 
-    # Add data
+    # Add data -- wrap ClimateEvents in CustomData for NT DataEngine routing
     if climate_events:
-        engine.add_data(climate_events)
+        wrapped = [CustomData(DataType(ClimateEvent), e) for e in climate_events]
+        engine.add_data(wrapped, client_id=CLIMATE_CLIENT)
 
     if quote_ticks:
         engine.add_data(quote_ticks)

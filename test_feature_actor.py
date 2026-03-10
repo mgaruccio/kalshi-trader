@@ -33,11 +33,17 @@ class _TestableFeatureActor:
         self.ensemble_models = []
         self.ensemble_names = []
         self.ensemble_weights = []
+        self._models_loaded = False
         self._kw_config = None
+
+        # Mock cache for opportunity scanning
+        self.cache = MagicMock()
+        self.cache.instruments.return_value = []
 
     # Bind the actual methods from FeatureActor
     on_data = FeatureActor.on_data
     _on_model_timer = FeatureActor._on_model_timer
+    _scan_opportunities = FeatureActor._scan_opportunities
     _check_danger = FeatureActor._check_danger
     update_positions = FeatureActor.update_positions
 

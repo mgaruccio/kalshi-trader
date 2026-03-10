@@ -46,6 +46,8 @@ from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClient
 from nautilus_trader.common.providers import InstrumentProvider
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+log = logging.getLogger(__name__)
+
 KALSHI_VENUE = Venue("KALSHI")
 
 
@@ -88,6 +90,7 @@ def _get_ticker_and_side(instrument_id: InstrumentId):
     elif val.endswith("-NO"):
         return val[:-3], "no"
     else:
+        log.error(f"Cannot parse side from {val}, defaulting YES — THIS IS DANGEROUS")
         return val, "yes"  # fallback
 
 
@@ -104,6 +107,7 @@ class KalshiDataClient(LiveMarketDataClient):
         self._ws: Any = None
         self._ws_task: Optional[asyncio.Task] = None
         self._subscriptions: set[InstrumentId] = set()
+        self._orderbooks: dict[str, dict[str, dict[float, float]]] = {}
         self._auth = KalshiAuth(config.api_key_id, config.private_key_path)
 
     async def _connect(self):
@@ -146,88 +150,107 @@ class KalshiDataClient(LiveMarketDataClient):
             msg = json.loads(msg_str)
             msg_type = msg.get("type")
 
-            if msg_type in ("orderbook_delta", "orderbook_snapshot"):
+            if msg_type == "orderbook_snapshot":
                 data = msg.get("msg", {})
-                self._log.debug(f"Received market data: {msg_type}")
                 ticker = data.get("market_ticker")
                 if not ticker:
-                    self._log.warning("No ticker in message!")
                     return
 
                 ts = self._clock.timestamp_ns()
-                
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
-                self._log.debug(f"Ticker: {ticker} | Bids: {len(bids)} Asks: {len(asks)}")
 
-                for side_suffix in ["-YES", "-NO"]:
-                    instr_id = InstrumentId(
-                        Symbol(f"{ticker}{side_suffix}"), KALSHI_VENUE
-                    )
-                    
-                    if instr_id not in self._subscriptions:
-                        self._log.debug(f"Skipping {instr_id} - not in subscriptions")
-                        continue
-                        
-                    instrument = self._instrument_provider.find(instr_id)
-                    if not instrument:
-                        self._log.warning(f"Instrument {instr_id} NOT found in provider!")
-                        continue
+                # Kalshi V2 snapshot: yes_dollars_fp / no_dollars_fp (list of [price_str, qty_str])
+                yes_raw = data.get("yes_dollars_fp", [])
+                no_raw = data.get("no_dollars_fp", [])
+                book: dict[str, dict[float, float]] = {"yes": {}, "no": {}}
+                for p, q in yes_raw:
+                    book["yes"][float(p)] = float(q)
+                for p, q in no_raw:
+                    book["no"][float(p)] = float(q)
+                self._orderbooks[ticker] = book
 
-                    if not self._cache.instrument(instr_id):
-                        self._log.debug(f"Instrument {instr_id} not in cache, emitting")
-                        self._handle_data(instrument)
+                self._emit_quote_ticks(ticker, data, ts)
 
-                    best_bid = bids[0] if bids else None
-                    best_ask = asks[0] if asks else None
+            elif msg_type == "orderbook_delta":
+                data = msg.get("msg", {})
+                ticker = data.get("market_ticker")
+                if not ticker:
+                    return
 
-                    b_price_cents = best_bid[0] if best_bid else 0
-                    b_qty = best_bid[1] if best_bid else 0
-                    a_price_cents = best_ask[0] if best_ask else 0
-                    a_qty = best_ask[1] if best_ask else 0
+                ts = self._clock.timestamp_ns()
 
-                    if side_suffix == "-NO":
-                        _b_price_cents = 100 - a_price_cents if best_ask else 0
-                        _a_price_cents = 100 - b_price_cents if best_bid else 0
-                        _b_qty = a_qty
-                        _a_qty = b_qty
-                        b_price_cents, a_price_cents = _b_price_cents, _a_price_cents
-                        b_qty, a_qty = _b_qty, _a_qty
+                # Kalshi V2 delta: side, price_dollars (string), delta_fp (string)
+                side = data.get("side")  # "yes" or "no"
+                price = float(data.get("price_dollars", "0"))
+                delta = float(data.get("delta_fp", "0"))
 
-                    try:
-                        # We MUST provide valid prices for Nautilus QuoteTick
-                        # If one side is missing, we use a dummy extreme price for it.
-                        b_p = b_price_cents / 100.0 if b_price_cents > 0 else 0.01
-                        a_p = a_price_cents / 100.0 if a_price_cents > 0 else 0.99
-                        b_q = b_qty if b_price_cents > 0 else 0
-                        a_q = a_qty if a_price_cents > 0 else 0
+                book = self._orderbooks.setdefault(ticker, {"yes": {}, "no": {}})
+                if side in ("yes", "no"):
+                    if delta <= 0:
+                        book[side].pop(price, None)
+                    else:
+                        book[side][price] = delta
 
-                        b_price = instrument.make_price(b_p)
-                        a_price = instrument.make_price(a_p)
-                        b_size = instrument.make_qty(b_q)
-                        a_size = instrument.make_qty(a_q)
-
-                        ts_event = _parse_ts(data.get("ts"), fallback_ns=int(ts))
-
-                        tick = QuoteTick(
-                            instrument_id=instr_id,
-                            bid_price=b_price,
-                            ask_price=a_price,
-                            bid_size=b_size,
-                            ask_size=a_size,
-                            ts_event=ts_event,
-                            ts_init=int(ts),
-                        )
-                        self._log.debug(f"Emitting QuoteTick for {instr_id}")
-                        self._handle_data(tick)
-                    except Exception as ex:
-                        self._log.error(f"Failed to create/emit QuoteTick for {instr_id}: {ex}")
+                self._emit_quote_ticks(ticker, data, ts)
 
         except Exception as e:
             self._log.error(f"Error handling WS message: {e}")
 
+    def _emit_quote_ticks(self, ticker: str, data: dict, ts: int):
+        """Derive and emit QuoteTicks for YES and NO sides from current orderbook state."""
+        book = self._orderbooks.get(ticker)
+        if not book:
+            return
+
+        yes_levels = {p: q for p, q in book["yes"].items() if q > 0}
+        no_levels = {p: q for p, q in book["no"].items() if q > 0}
+
+        for side_suffix in ["-YES", "-NO"]:
+            instr_id = InstrumentId(Symbol(f"{ticker}{side_suffix}"), KALSHI_VENUE)
+            if instr_id not in self._subscriptions:
+                continue
+
+            instrument = self._instrument_provider.find(instr_id)
+            if not instrument:
+                continue
+
+            if not self._cache.instrument(instr_id):
+                self._handle_data(instrument)
+
+            # YES: bid = max(yes prices), ask = 1.0 - max(no prices)
+            # NO:  bid = max(no prices),  ask = 1.0 - max(yes prices)
+            if side_suffix == "-YES":
+                best_bid = max(yes_levels.keys()) if yes_levels else None
+                best_ask = (1.0 - max(no_levels.keys())) if no_levels else None
+                bid_qty = yes_levels.get(best_bid, 0) if best_bid is not None else 0
+                ask_qty = no_levels.get(max(no_levels.keys()), 0) if no_levels else 0
+            else:
+                best_bid = max(no_levels.keys()) if no_levels else None
+                best_ask = (1.0 - max(yes_levels.keys())) if yes_levels else None
+                bid_qty = no_levels.get(best_bid, 0) if best_bid is not None else 0
+                ask_qty = yes_levels.get(max(yes_levels.keys()), 0) if yes_levels else 0
+
+            if best_bid is None or best_ask is None:
+                continue  # No complete book yet — do NOT emit garbage
+
+            try:
+                ts_event = _parse_ts(data.get("ts"), fallback_ns=int(ts))
+
+                tick = QuoteTick(
+                    instrument_id=instr_id,
+                    bid_price=instrument.make_price(best_bid),
+                    ask_price=instrument.make_price(best_ask),
+                    bid_size=instrument.make_qty(int(bid_qty)),
+                    ask_size=instrument.make_qty(int(ask_qty)),
+                    ts_event=ts_event,
+                    ts_init=int(ts),
+                )
+                self._handle_data(tick)
+            except Exception as ex:
+                self._log.error(f"Failed to create/emit QuoteTick for {instr_id}: {ex}")
+
     async def _send_subscribe(self, instrument_id: InstrumentId):
         if not self._ws:
+            self._log.warning(f"WS not connected, cannot subscribe {instrument_id}")
             return
         ticker, _ = _get_ticker_and_side(instrument_id)
         sub_msg = {
@@ -384,6 +407,7 @@ class KalshiExecutionClient(LiveExecutionClient):
 
                 instrument = self._instrument_provider.find(instrument_id)
                 if not instrument:
+                    self._log.error(f"FILL DROPPED: instrument {instrument_id} not in provider — POSITION MISMATCH RISK")
                     return
 
                 if c_oid not in self._accepted_orders:
@@ -661,6 +685,7 @@ class KalshiInstrumentProvider(InstrumentProvider):
         self.k_api = MarketsApi(self.k_client)
 
     def load_all(self, filters: dict | None = None):
+        self._api_healthy = True
         try:
             cursor = None
             while True:
@@ -677,7 +702,8 @@ class KalshiInstrumentProvider(InstrumentProvider):
                 if not cursor:
                     break
         except Exception as e:
-            logging.error(f"Error loading instruments: {e}")
+            self._api_healthy = False
+            log.error(f"API failure during load_all — returning empty instrument list: {e}")
 
     def _build_instrument(self, market, side: str) -> CurrencyPair:
         from decimal import Decimal
