@@ -111,38 +111,39 @@ class KalshiDiscoveryStrategy(Strategy):
             
             new_instruments = []
             
-            # 2. Fetch open markets specifically for each series
+            # 2. Fetch open + unopened markets for each series
+            # "unopened" captures tomorrow's contracts before they open,
+            # so we're subscribed and collecting from the first tick.
             for s_ticker in weather_series:
-                cursor = None
-                while True:
-                    try:
-                        res = markets_api.get_markets(limit=200, status="open", series_ticker=s_ticker, cursor=cursor)
-                        markets_found = getattr(res, "markets", None) or []
-                        
-                        for m in markets_found:
-                            if m.status not in ("active", "open"):
-                                continue
-                                
-                            yes_inst = self.provider._build_instrument(m, "YES")
-                            no_inst = self.provider._build_instrument(m, "NO")
-                            
-                            if not self.provider.find(yes_inst.id):
-                                self.provider.add(yes_inst)
-                                self.provider.add(no_inst)
-                                new_instruments.extend([yes_inst, no_inst])
-                                
-                        cursor = getattr(res, "cursor", None)
-                        if not cursor:
-                            break # Move to next series
-                            
-                        time.sleep(0.15) # Rate limit per page
-                    except ApiException as e:
-                        if e.status == 429:
-                            time.sleep(2)
-                        else:
-                            raise e
-                
-                time.sleep(0.15) # Rate limit between series
+                for status_filter in ("open", "unopened"):
+                    cursor = None
+                    while True:
+                        try:
+                            res = markets_api.get_markets(limit=200, status=status_filter, series_ticker=s_ticker, cursor=cursor)
+                            markets_found = getattr(res, "markets", None) or []
+
+                            for m in markets_found:
+                                yes_inst = self.provider._build_instrument(m, "YES")
+                                no_inst = self.provider._build_instrument(m, "NO")
+
+                                if not self.provider.find(yes_inst.id):
+                                    self.provider.add(yes_inst)
+                                    self.provider.add(no_inst)
+                                    new_instruments.extend([yes_inst, no_inst])
+
+                            cursor = getattr(res, "cursor", None)
+                            if not cursor:
+                                break
+
+                            time.sleep(0.15)  # Rate limit per page
+                        except ApiException as e:
+                            if e.status == 429:
+                                time.sleep(2)
+                            else:
+                                raise e
+
+                    time.sleep(0.15)  # Rate limit between status filters
+                time.sleep(0.15)  # Rate limit between series
                 
             if new_instruments:
                 self.log.info(f"Discovered {len(new_instruments)} new instruments. Scheduling subscriptions...")
