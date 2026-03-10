@@ -97,7 +97,7 @@ class KalshiDiscoveryStrategy(Strategy):
                         title = getattr(s, "title", "") or ""
                         ticker = getattr(s, "ticker", "") or ""
                         
-                        if category == "Climate and Weather" and ("high" in title.lower() or "low" in title.lower()):
+                        if category == "Climate and Weather" and "high" in title.lower():
                             weather_series.append(ticker)
                     break
                 except ApiException as e:
