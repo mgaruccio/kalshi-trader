@@ -53,11 +53,12 @@ except ImportError:
     get_current_sst = None
 
 try:
-    from kalshi_weather_ml.strategy import evaluate_opportunity_ensemble
+    from kalshi_weather_ml.strategy import score_opportunities, score_and_filter
     from kalshi_weather_ml.markets import parse_ticker
     from kalshi_weather_ml.config import load_config
 except ImportError:
-    evaluate_opportunity_ensemble = None
+    score_opportunities = None
+    score_and_filter = None
     parse_ticker = None
     load_config = None
 
@@ -215,33 +216,29 @@ class FeatureActor(Actor):
                     p_win = 0.0
                     model_scores = {}
 
-                    if evaluate_opportunity_ensemble and parse_ticker and self.ensemble_models:
+                    if score_opportunities and parse_ticker and self.ensemble_models:
                         parsed = parse_ticker(ticker)
                         if parsed:
-                            market = {
-                                "ticker": ticker,
-                                "city": city,
-                                "direction": "above",
-                                "threshold": float(parsed["threshold"]),
-                                "settlement_date": parsed["settlement_date"],
-                                "yes_bid": 50,
-                                "yes_ask": 51,
-                            }
                             try:
-                                opps = evaluate_opportunity_ensemble(
-                                    market, ecmwf, gfs, self._kw_config,
-                                    self.ensemble_models, self.ensemble_names,
-                                    self.ensemble_weights, now_dt,
+                                scores = score_opportunities(
+                                    ticker=ticker, city=city, direction="above",
+                                    threshold=float(parsed["threshold"]),
+                                    settlement_date=parsed["settlement_date"],
+                                    ecmwf=ecmwf, gfs=gfs,
+                                    models=self.ensemble_models,
+                                    model_names=self.ensemble_names,
+                                    model_weights=self.ensemble_weights,
+                                    now=now_dt,
                                     extra_features=features,
                                 )
                                 side = pos_info.get("side", "no").lower()
-                                for opp in opps:
-                                    if opp.side == side:
-                                        p_win = opp.p_win
-                                        model_scores = opp.model_scores
+                                for s in scores:
+                                    if s.side == side:
+                                        p_win = s.p_win
+                                        model_scores = s.model_scores
                                         break
                             except Exception as e:
-                                self.log.warning(f"Ensemble eval failed for {ticker}: {e}")
+                                self.log.warning(f"Score eval failed for {ticker}: {e}")
 
                     signal = ModelSignal(
                         city=city,
@@ -266,8 +263,8 @@ class FeatureActor(Actor):
         skip_tickers: set[str],
     ):
         """Evaluate all cached instruments for entry opportunities."""
-        if not (evaluate_opportunity_ensemble and parse_ticker):
-            self.log.error("Cannot scan: ensemble functions not available (import failed)")
+        if not (score_and_filter and parse_ticker):
+            self.log.error("Cannot scan: scoring functions not available (import failed)")
             return
         if not self._models_loaded:
             self.log.error("Cannot scan: no models loaded")
@@ -325,19 +322,24 @@ class FeatureActor(Actor):
                     "yes_ask": 51,
                 }
                 try:
-                    opps = evaluate_opportunity_ensemble(
-                        market, ecmwf, gfs, self._kw_config,
-                        self.ensemble_models, self.ensemble_names,
-                        self.ensemble_weights, now_dt,
+                    scored = score_and_filter(
+                        ticker=ticker, city=city, direction="above",
+                        threshold=float(parsed["threshold"]),
+                        settlement_date=parsed["settlement_date"],
+                        ecmwf=ecmwf, gfs=gfs, config=self._kw_config,
+                        models=self.ensemble_models,
+                        model_names=self.ensemble_names,
+                        model_weights=self.ensemble_weights,
+                        now=now_dt,
                         extra_features=features,
                     )
-                    for opp in opps:
+                    for s in scored:
                         signal = ModelSignal(
                             city=city,
                             ticker=ticker,
-                            side=opp.side,
-                            p_win=opp.p_win,
-                            model_scores=opp.model_scores,
+                            side=s.side,
+                            p_win=s.p_win,
+                            model_scores=s.model_scores,
                             features_snapshot=features,
                             ts_event=ts,
                             ts_init=ts,

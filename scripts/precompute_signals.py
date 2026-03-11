@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+"""Pre-compute ModelSignals offline for fast backtesting.
+
+Runs ML inference once per (ticker, side) combination for each climate event
+window, producing model_signals.parquet. This avoids repeated inference
+during NautilusTrader backtest — signals are injected as CustomData.
+
+Usage:
+    cd ~/code/kalshi-trader
+    uv run python scripts/precompute_signals.py
+"""
+import json
+import logging
+import sys
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# kalshi-weather on path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, "/home/mike/code/altmarkets/kalshi-weather/src")
+
+from kalshi_weather_ml.config import load_config
+from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
+from kalshi_weather_ml.strategy import score_opportunities
+from kalshi_weather_ml.models.emos import EMOSModel
+from kalshi_weather_ml.models.ngboost_model import NGBoostModel
+from kalshi_weather_ml.models.drn_model import DRNModel
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+KW_ROOT = Path("/home/mike/code/altmarkets/kalshi-weather")
+TRADER_ROOT = Path(__file__).resolve().parent.parent
+CATALOG_DIR = TRADER_ROOT / "kalshi_data_catalog"
+CLIMATE_EVENTS = KW_ROOT / "data" / "climate_events.parquet"
+OUTPUT = TRADER_ROOT / "data" / "model_signals.parquet"
+
+
+def load_models(config):
+    """Load ensemble models from config, matching FeatureActor logic."""
+    models_dir = KW_ROOT / "data" / "models"
+    model_loaders = {
+        "emos": lambda: EMOSModel.load(models_dir / "emos_normal.json"),
+        "ngboost": lambda: NGBoostModel.load(models_dir / "ngboost_normal.pkl"),
+        "ngboost_spread": lambda: NGBoostModel.load(models_dir / "ngboost_normal_wx_spread.pkl"),
+        "drn": lambda: DRNModel.load(models_dir / "drn_normal"),
+        "drn_spread": lambda: DRNModel.load(models_dir / "drn_normal_wx_spread"),
+    }
+    model_names = config.ensemble_models or ["emos", "ngboost"]
+    weights_map = config.ensemble_weights or {}
+
+    models, names, weights = [], [], []
+    for name in model_names:
+        loader = model_loaders.get(name)
+        if not loader:
+            continue
+        try:
+            models.append(loader())
+            names.append(name)
+            weights.append(weights_map.get(name, 1.0))
+            log.info(f"Loaded {name} (weight={weights[-1]})")
+        except Exception as e:
+            log.error(f"Failed to load {name}: {e}")
+
+    return models, names, weights
+
+
+def discover_tickers(catalog_path: Path) -> list[str]:
+    """Get unique tickers from catalog instruments."""
+    qt_dir = catalog_path / "data" / "quote_tick"
+    if not qt_dir.exists():
+        return []
+    tickers = set()
+    for inst_dir in qt_dir.iterdir():
+        if not inst_dir.is_dir():
+            continue
+        # Directory names: "KXHIGHCHI-26MAR10-T55-NO.KALSHI"
+        name = inst_dir.name.replace(".KALSHI", "")
+        if name.endswith("-YES") or name.endswith("-NO"):
+            ticker = name.rsplit("-", 1)[0]
+            tickers.add(ticker)
+    return sorted(tickers)
+
+
+def get_first_tick_ns(catalog_path: Path) -> int | None:
+    """Get first tick timestamp from catalog."""
+    qt_dir = catalog_path / "data" / "quote_tick"
+    if not qt_dir.exists():
+        return None
+    for inst_dir in sorted(qt_dir.iterdir()):
+        if not inst_dir.is_dir():
+            continue
+        for f in sorted(inst_dir.glob("*.parquet")):
+            try:
+                col = pq.read_table(str(f), columns=["ts_event"]).column("ts_event")
+                if len(col) > 0:
+                    return int(col[0].as_py())
+            except Exception:
+                continue
+    return None
+
+
+def load_city_features(climate_events_path: Path, cutoff_ns: int | None) -> dict[str, dict]:
+    """Load climate events and merge features per city.
+
+    Returns {city: {feature_name: value}} with all features merged across sources.
+    """
+    table = pq.read_table(str(climate_events_path))
+    df = table.to_pandas()
+
+    if cutoff_ns is not None:
+        df = df[df["ts_event"] >= cutoff_ns]
+
+    city_features: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        city = str(row["city"])
+        features = json.loads(row["features"]) if isinstance(row["features"], str) else row["features"]
+        state = city_features.setdefault(city, {})
+        state.update({k: float(v) for k, v in features.items()})
+
+    return city_features
+
+
+def main():
+    config = load_config()
+    # No min_p_win hack needed — score_opportunities() never filters.
+    models, names, weights = load_models(config)
+    if not models:
+        log.error("No models loaded")
+        return
+
+    tickers = discover_tickers(CATALOG_DIR)
+    log.info(f"Found {len(tickers)} tickers in catalog")
+
+    first_ns = get_first_tick_ns(CATALOG_DIR)
+    log.info(f"First tick ns: {first_ns}")
+
+    city_features = load_city_features(CLIMATE_EVENTS, first_ns)
+    log.info(f"Loaded features for {len(city_features)} cities")
+
+    series_to_city = {s: c for s, c in SERIES_CONFIG}
+    now = datetime.now()
+
+    rows = []
+    n_accept = 0
+    n_reject = 0
+    n_skip = 0
+
+    for ticker in tickers:
+        parsed = parse_ticker(ticker)
+        if not parsed:
+            n_skip += 1
+            continue
+
+        city = series_to_city.get(parsed["series"], "")
+        if not city:
+            n_skip += 1
+            continue
+
+        features = city_features.get(city)
+        if not features:
+            n_skip += 1
+            continue
+
+        ecmwf = features.get("ecmwf_high")
+        gfs = features.get("gfs_high")
+        if ecmwf is None or gfs is None:
+            n_skip += 1
+            continue
+
+        try:
+            scores = score_opportunities(
+                ticker=ticker, city=city, direction="above",
+                threshold=float(parsed["threshold"]),
+                settlement_date=parsed["settlement_date"],
+                ecmwf=ecmwf, gfs=gfs,
+                models=models, model_names=names, model_weights=weights,
+                now=now, extra_features=features,
+            )
+        except Exception as e:
+            log.warning(f"Eval failed for {ticker}: {e}")
+            n_skip += 1
+            continue
+
+        # Offset signals 5 seconds after first tick so quotes are cached first
+        base_ts = (first_ns or 0) + 5_000_000_000
+
+        for s in scores:
+            model_scores = {n: s.model_scores.get(n, 0.0) for n in names}
+            rows.append({
+                "city": city,
+                "ticker": ticker,
+                "side": s.side,
+                "p_win": s.p_win,
+                "model_scores": json.dumps(model_scores),
+                "features_snapshot": json.dumps({}),  # not needed for backtest
+                "ts_event": base_ts,
+                "ts_init": base_ts,
+            })
+            if s.p_win >= 0.95:
+                n_accept += 1
+            else:
+                n_reject += 1
+
+    log.info(f"Generated {len(rows)} signals: {n_accept} with pw>=0.95, {n_reject} with pw<0.95, {n_skip} skipped")
+
+    if rows:
+        OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        table = pa.Table.from_pylist(rows)
+        pq.write_table(table, str(OUTPUT))
+        log.info(f"Wrote {OUTPUT}")
+
+
+if __name__ == "__main__":
+    main()
