@@ -43,6 +43,7 @@ class WeatherStrategy(Strategy):
         self._latest_quotes: dict[str, QuoteTick] = {}  # instrument_id_str -> tick
         self._positions_info: dict[str, dict] = {}  # ticker -> {side, threshold, city, contracts}
         self._danger_exited: set[str] = set()  # tickers we've danger-exited (no retry)
+        self._profit_target_pending: set[str] = set()  # tickers with pending sell orders
         self._feature_actor = None  # set after construction
         self._signals_received: int = 0
         self._alerts_received: int = 0
@@ -188,6 +189,7 @@ class WeatherStrategy(Strategy):
             quantity=instrument.make_qty(contracts),
             price=price,
             time_in_force=TimeInForce.GTC,
+            reduce_only=True,
         )
         self.submit_order(order)
 
@@ -198,15 +200,23 @@ class WeatherStrategy(Strategy):
         # Extract ticker (everything before -YES or -NO)
         if inst_str.endswith("-YES"):
             ticker = inst_str[:-4]
-            side = "YES"
+            tick_side = "yes"
         elif inst_str.endswith("-NO"):
             ticker = inst_str[:-3]
-            side = "NO"
+            tick_side = "no"
         else:
             return
 
         pos_info = self._positions_info.get(ticker)
         if pos_info is None:
+            return
+
+        # Only sell on the instrument we actually hold — don't create naked shorts
+        if pos_info.get("side", "").lower() != tick_side:
+            return
+
+        # Don't submit duplicate sells for same ticker
+        if ticker in self._profit_target_pending:
             return
 
         bid_cents = int(tick.bid_price.as_double() * 100)
@@ -223,8 +233,9 @@ class WeatherStrategy(Strategy):
                 price=tick.bid_price,
                 time_in_force=TimeInForce.GTC,
             )
+            self._profit_target_pending.add(ticker)
             self.submit_order(order)
-            self.log.info(f"Profit target hit: {ticker} bid={bid_cents}c >= {self._cfg.sell_target_cents}c")
+            self.log.info(f"Profit target hit: {ticker} {tick_side} bid={bid_cents}c >= {self._cfg.sell_target_cents}c")
 
     def on_order_filled(self, event: OrderFilled):
         """Track position changes on fills."""
@@ -274,6 +285,7 @@ class WeatherStrategy(Strategy):
 
         # Clean up if position closed
         if pos["contracts"] <= 0:
+            self._profit_target_pending.discard(ticker)
             self._positions_info.pop(ticker)
         
         # Sync with FeatureActor

@@ -5,15 +5,19 @@ Phase A — Validation Run: single run with production defaults, full catalog.
 Reports signals, orders, fills, balance and diagnoses failures at each stage.
 
 Phase B — Parameter Sweep: 12-combo grid over min_p_win × max_cost_cents,
-using a thin catalog for speed (falls back to full catalog if thin doesn't exist).
+using pre-computed signals for speed (no ML inference during backtest).
 
 Usage:
     cd ~/code/kalshi-trader
-    uv run python experiments/exp05_backtest_sweep.py
+    uv run python scripts/precompute_signals.py   # once
+    PYTHONUNBUFFERED=1 uv run python experiments/exp05_backtest_sweep.py
 """
 import logging
 import sys
 from pathlib import Path
+
+# Force unbuffered stdout (NautilusTrader Cython cleanup doesn't flush Python buffers)
+sys.stdout.reconfigure(line_buffering=True)
 
 # kalshi-trader root must be on sys.path for local imports to resolve
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -26,6 +30,7 @@ from backtest_runner import run_backtest
 CATALOG_FULL = Path.home() / "code/kalshi-trader/kalshi_data_catalog"
 CATALOG_THIN = Path.home() / "code/kalshi-trader/kalshi_data_catalog_thin"
 CLIMATE_EVENTS = Path.home() / "code/altmarkets/kalshi-weather/data/climate_events.parquet"
+MODEL_SIGNALS = Path.home() / "code/kalshi-trader/data/model_signals.parquet"
 
 # Production defaults
 PROD_MIN_P_WIN = 0.95
@@ -50,13 +55,18 @@ def _extract_results(engine) -> dict:
         "signals": 0,
         "alerts": 0,
         "positions_open": 0,
+        "positions_closed": 0,
         "danger_exited": 0,
         "events_received": 0,
         "cities_with_features": 0,
         "models_loaded": False,
         "orders": 0,
         "fills": 0,
+        "buys": 0,
+        "sells": 0,
         "balance": None,
+        "realized_pnl": 0.0,
+        "unrealized_cost": 0.0,
     }
 
     strategies = list(engine.trader.strategies())
@@ -78,9 +88,9 @@ def _extract_results(engine) -> dict:
     try:
         orders = engine.cache.orders()
         results["orders"] = len(orders)
-        results["fills"] = sum(
-            1 for o in orders if o.filled_qty.as_double() > 0
-        )
+        results["fills"] = sum(1 for o in orders if o.filled_qty.as_double() > 0)
+        results["buys"] = sum(1 for o in orders if o.side.value == 1 and o.filled_qty.as_double() > 0)
+        results["sells"] = sum(1 for o in orders if o.side.value == 2 and o.filled_qty.as_double() > 0)
     except Exception as e:
         log.warning(f"Could not inspect orders: {e}")
 
@@ -90,6 +100,25 @@ def _extract_results(engine) -> dict:
             results["balance"] = accounts[0].balance_total().as_double()
     except Exception as e:
         log.warning(f"Could not inspect accounts: {e}")
+
+    # Compute realized PnL from closed positions and unrealized cost from open
+    try:
+        positions = engine.cache.positions()
+        closed = [p for p in positions if p.is_closed]
+        opened = [p for p in positions if p.is_open]
+        results["positions_closed"] = len(closed)
+
+        realized = 0.0
+        for p in closed:
+            realized += p.realized_pnl.as_double()
+        results["realized_pnl"] = realized
+
+        cost = 0.0
+        for p in opened:
+            cost += p.avg_px_open * abs(p.signed_qty)
+        results["unrealized_cost"] = cost
+    except Exception as e:
+        log.warning(f"Could not inspect positions: {e}")
 
     return results
 
@@ -121,6 +150,7 @@ def run_phase_a():
     print(f"  min_p_win={PROD_MIN_P_WIN}  max_cost={PROD_MAX_COST}c  sell_target={PROD_SELL_TARGET}c")
     print(f"  catalog : {CATALOG_FULL}")
     print(f"  events  : {CLIMATE_EVENTS}")
+    print(f"  signals : {MODEL_SIGNALS}")
     print("=" * 80)
 
     if not CATALOG_FULL.exists():
@@ -131,6 +161,11 @@ def run_phase_a():
     if not CLIMATE_EVENTS.exists():
         print(f"ERROR: climate_events.parquet not found at {CLIMATE_EVENTS}")
         print("  Run: uv run python scripts/build_calibration_dataset.py  (in kalshi-weather)")
+        return
+
+    if not MODEL_SIGNALS.exists():
+        print(f"ERROR: model_signals.parquet not found at {MODEL_SIGNALS}")
+        print("  Run: uv run python scripts/precompute_signals.py")
         return
 
     strategy_config = {
@@ -145,6 +180,7 @@ def run_phase_a():
             catalog_path=CATALOG_FULL,
             starting_balance_usd=100,
             strategy_config=strategy_config,
+            model_signals_path=MODEL_SIGNALS,
         )
     except Exception as e:
         print(f"\nERROR: run_backtest() raised an exception:")
@@ -167,13 +203,20 @@ def run_phase_a():
 
     print("\n--- Orders ---")
     print(f"  Total orders          : {r['orders']}")
-    print(f"  Filled orders         : {r['fills']}")
+    print(f"  Filled buys           : {r['buys']}")
+    print(f"  Filled sells          : {r['sells']}")
+
+    print("\n--- Positions ---")
+    print(f"  Open                  : {r['positions_open']}")
+    print(f"  Closed                : {r['positions_closed']}")
+    print(f"  Realized PnL          : ${r['realized_pnl']:.2f}")
+    print(f"  Unrealized cost       : ${r['unrealized_cost']:.2f}")
 
     print("\n--- Account ---")
     if r["balance"] is not None:
-        print(f"  Final balance         : ${r['balance']:.2f}")
+        print(f"  Margin balance        : ${r['balance']:.2f}")
     else:
-        print("  Final balance         : (unavailable)")
+        print("  Margin balance        : (unavailable)")
 
     diagnosis = _diagnose(r)
     print(f"\n--- Diagnosis ---")
@@ -216,7 +259,7 @@ def run_phase_b():
         print(f"ERROR: No catalog found at {catalog}")
         return
 
-    header = f"{'min_pw':>8}  {'max_cost':>8}  {'events':>7}  {'signals':>8}  {'orders':>7}  {'fills':>6}  {'balance':>10}"
+    header = f"{'min_pw':>8}  {'max_cost':>8}  {'signals':>8}  {'buys':>5}  {'sells':>5}  {'open':>5}  {'closed':>6}  {'real_pnl':>9}  {'balance':>10}"
     sep = "-" * len(header)
     print(f"\n{header}")
     print(sep)
@@ -234,13 +277,16 @@ def run_phase_b():
                     catalog_path=catalog,
                     starting_balance_usd=100,
                     strategy_config=strategy_config,
+                    model_signals_path=MODEL_SIGNALS,
                 )
                 r = _extract_results(engine)
+                pnl = f"${r['realized_pnl']:+.2f}"
                 bal = f"${r['balance']:.2f}" if r["balance"] is not None else "N/A"
                 print(
                     f"{min_pw:>8.2f}  {max_cost:>8}  "
-                    f"{r['events_received']:>7,}  {r['signals']:>8,}  "
-                    f"{r['orders']:>7}  {r['fills']:>6}  {bal:>10}"
+                    f"{r['signals']:>8,}  {r['buys']:>5}  {r['sells']:>5}  "
+                    f"{r['positions_open']:>5}  {r['positions_closed']:>6}  "
+                    f"{pnl:>9}  {bal:>10}"
                 )
             except Exception as e:
                 print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {e}")

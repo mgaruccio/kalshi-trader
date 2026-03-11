@@ -32,6 +32,7 @@ from adapter import KALSHI_VENUE
 from data_types import ClimateEvent
 
 CLIMATE_CLIENT = ClientId("CLIMATE")
+SIGNAL_CLIENT = ClientId("SIGNAL")
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,37 @@ def load_climate_events(parquet_path: Path) -> list[ClimateEvent]:
     return events
 
 
+def load_model_signals(parquet_path: Path) -> list:
+    """Load pre-computed ModelSignals from parquet."""
+    from data_types import ModelSignal
+
+    if not parquet_path.exists():
+        log.warning(f"No model signals at {parquet_path}")
+        return []
+
+    table = pq.read_table(str(parquet_path))
+    df = table.to_pandas()
+
+    signals = []
+    for _, row in df.iterrows():
+        model_scores = json.loads(row["model_scores"]) if isinstance(row["model_scores"], str) else row["model_scores"]
+        features = json.loads(row["features_snapshot"]) if isinstance(row["features_snapshot"], str) else row["features_snapshot"]
+        signals.append(ModelSignal(
+            city=str(row["city"]),
+            ticker=str(row["ticker"]),
+            side=str(row["side"]),
+            p_win=float(row["p_win"]),
+            model_scores={k: float(v) for k, v in model_scores.items()},
+            features_snapshot={k: float(v) for k, v in features.items()} if features else {},
+            ts_event=int(row["ts_event"]),
+            ts_init=int(row["ts_init"]),
+        ))
+
+    signals.sort(key=lambda s: s.ts_event)
+    log.info(f"Loaded {len(signals)} pre-computed model signals")
+    return signals
+
+
 # ---------------------------------------------------------------------------
 # High-level backtest via BacktestNode (streams from catalog)
 # ---------------------------------------------------------------------------
@@ -124,6 +156,7 @@ def run_backtest(
     end: str | None = None,
     strategy_config: dict | None = None,
     actor_config: dict | None = None,
+    model_signals_path: Path | None = None,
 ) -> BacktestEngine:
     """Run a backtest using BacktestNode streaming from ParquetDataCatalog.
 
@@ -168,19 +201,24 @@ def run_backtest(
 
     venue_config = BacktestVenueConfig(
         name="KALSHI",
-        oms_type="HEDGING",
+        oms_type="NETTING",
         account_type="MARGIN",
         base_currency="USD",
         starting_balances=[f"{starting_balance_usd} USD"],
     )
 
-    # Actor and strategy configs — these are importable so BacktestNode
-    # can instantiate them
+    # When using pre-computed signals, disable the model timer in FeatureActor
+    # (it still receives ClimateEvents for exit rule checks, but no inference)
+    effective_actor_config = dict(actor_config or {})
+    if model_signals_path:
+        effective_actor_config["model_cycle_seconds"] = 999_999  # effectively disabled
+        effective_actor_config["scan_opportunities"] = False
+
     actor_configs = [
         ImportableActorConfig(
             actor_path="feature_actor:FeatureActor",
             config_path="feature_actor:FeatureActorConfig",
-            config=actor_config or {},
+            config=effective_actor_config,
         ),
     ]
 
@@ -256,6 +294,15 @@ def run_backtest(
         wrapped = [CustomData(DataType(ClimateEvent), e) for e in climate_events]
         engine.add_data(wrapped, client_id=CLIMATE_CLIENT)
         log.info(f"Injected {len(climate_events)} climate events")
+
+    # Inject pre-computed model signals (bypasses FeatureActor inference)
+    if model_signals_path:
+        from data_types import ModelSignal
+        signals = load_model_signals(model_signals_path)
+        if signals:
+            wrapped = [CustomData(DataType(ModelSignal), s) for s in signals]
+            engine.add_data(wrapped, client_id=SIGNAL_CLIENT)
+            log.info(f"Injected {len(signals)} pre-computed model signals")
 
     # Wire FeatureActor → WeatherStrategy
     actors = engine.trader.actors()
