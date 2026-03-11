@@ -93,47 +93,54 @@ class FeatureActor(Actor):
         self._load_models()
 
     def _load_models(self):
-        """Load ensemble models from kalshi-weather data/models directory."""
+        """Load ensemble models from config (ensemble_models + ensemble_weights)."""
         try:
-            from kalshi_weather_ml.config import load_config
             from kalshi_weather_ml.models.emos import EMOSModel
             from kalshi_weather_ml.models.ngboost_model import NGBoostModel
-            
-            # Paths relative to kalshi-weather repo
+            from kalshi_weather_ml.models.drn_model import DRNModel
+
             kw_root = Path("/home/mike/code/altmarkets/kalshi-weather")
             models_dir = kw_root / "data" / "models"
-            calibration_path = kw_root / "data" / "calibration_dataset.parquet"
 
-            # Default to EMOS + NGBoost for the ensemble
-            emos_path = models_dir / "emos_normal.json"
-            ngb_path = models_dir / "ngboost_normal.pkl"
+            model_loaders = {
+                "emos":           lambda: EMOSModel.load(models_dir / "emos_normal.json"),
+                "ngboost":        lambda: NGBoostModel.load(models_dir / "ngboost_normal.pkl"),
+                "ngboost_spread": lambda: NGBoostModel.load(models_dir / "ngboost_normal_wx_spread.pkl"),
+                "drn":            lambda: DRNModel.load(models_dir / "drn_normal"),
+                "drn_spread":     lambda: DRNModel.load(models_dir / "drn_normal_wx_spread"),
+            }
 
-            if emos_path.exists():
-                emos = EMOSModel.load(emos_path)
-                self.ensemble_models.append(emos)
-                self.ensemble_names.append("emos")
-                self.ensemble_weights.append(1.0)
-            
-            if ngb_path.exists():
-                ngb = NGBoostModel.load(ngb_path, calibration_path=calibration_path)
-                self.ensemble_models.append(ngb)
-                self.ensemble_names.append("ngboost")
-                self.ensemble_weights.append(1.0)
+            # Determine which models to load from config (fallback: emos + ngboost)
+            model_names = ["emos", "ngboost"]
+            config_weights = {}
+            if self._kw_config and hasattr(self._kw_config, "ensemble_models"):
+                model_names = self._kw_config.ensemble_models or model_names
+            if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
+                config_weights = self._kw_config.ensemble_weights or {}
+
+            for name in model_names:
+                loader = model_loaders.get(name)
+                if loader is None:
+                    self.log.error(f"Unknown model name in ensemble_models: {name!r}")
+                    continue
+                try:
+                    model = loader()
+                    weight = config_weights.get(name, 1.0)
+                    self.ensemble_models.append(model)
+                    self.ensemble_names.append(name)
+                    self.ensemble_weights.append(weight)
+                    self.log.info(f"Loaded model {name!r} (weight={weight})")
+                except Exception as e:
+                    self.log.error(f"Failed to load model {name!r}: {e}")
 
             if self.ensemble_models:
                 self._models_loaded = True
-                # Load production weights from trader_config.json if available
-                if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
-                    config_weights = self._kw_config.ensemble_weights
-                    if config_weights:
-                        self.ensemble_weights = [
-                            config_weights.get(name, 1.0)
-                            for name in self.ensemble_names
-                        ]
-                        self.log.info(f"Loaded production weights: {dict(zip(self.ensemble_names, self.ensemble_weights))}")
-                self.log.info(f"Loaded {len(self.ensemble_models)} models for ensemble inference")
+                self.log.info(
+                    f"Ensemble ready: {len(self.ensemble_models)} models — "
+                    + ", ".join(f"{n}={w}" for n, w in zip(self.ensemble_names, self.ensemble_weights))
+                )
             else:
-                self.log.error("No models loaded — model files not found")
+                self.log.error("No models loaded — model files not found or all loaders failed")
         except Exception as e:
             self.log.error(f"Failed to load models in FeatureActor: {e}")
 
