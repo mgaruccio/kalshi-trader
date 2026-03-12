@@ -147,26 +147,9 @@ class WeatherStrategy(Strategy):
             self._evaluate_exit(data)
 
     def on_quote_tick(self, tick: QuoteTick):
-        """Track latest quotes for ladder pricing.
-
-        On first quote for an eligible ticker that hasn't had a ladder deployed,
-        trigger deployment. This handles the case where signals arrive before
-        quotes (e.g., BacktestNode chunk boundary ordering).
-        """
+        """Track latest quotes for ladder pricing."""
         key = tick.instrument_id.value
         self._latest_quotes[key] = tick
-
-        # On first NO quote for an eligible ticker without a deployed ladder,
-        # trigger deployment. Handles signal-before-quote ordering in backtest.
-        # The bid idempotency check inside _deploy_ladder prevents duplicates.
-        if "-NO." not in key:
-            return
-        ticker = key.split("-NO.")[0]
-        if ticker in self._last_ladder_bid or ticker in self._danger_exited:
-            return
-        signal = self._eligible_signals.get(ticker)
-        if signal is not None:
-            self._deploy_ladder(ticker, signal)
 
     def _quote_key(self, ticker: str, side: str) -> str:
         """Build the canonical quote cache key matching on_quote_tick storage."""
@@ -256,11 +239,8 @@ class WeatherStrategy(Strategy):
             )
             return
 
-        # Store qualifying signal for periodic refresh
+        # Store qualifying signal for periodic refresh (deployment on _on_refresh)
         self._eligible_signals[signal.ticker] = signal
-
-        # Deploy Phase 2 ladder
-        self._deploy_ladder(signal.ticker, signal)
 
     def _deploy_open_spread(self, signal: ModelSignal):
         """Place Phase 1 spread orders at fixed price levels."""
@@ -342,10 +322,6 @@ class WeatherStrategy(Strategy):
             return
 
         bid_cents = int(round(quote.bid_price.as_double() * 100))
-
-        # Idempotent: skip if bid unchanged since last deployment
-        if self._last_ladder_bid.get(ticker) == bid_cents:
-            return
 
         instrument_id = InstrumentId(
             Symbol(f"{ticker}-{signal.side.upper()}"),
@@ -637,31 +613,38 @@ class WeatherStrategy(Strategy):
         )
 
     def _on_refresh(self, event=None):
-        """Periodic ladder refresh. Handles back-off and capital redeployment.
+        """Periodic global rebalance: cancel all → sort cheapest → redeploy.
 
-        Idempotent: skips tickers whose bid hasn't changed since last
-        deployment, avoiding churn during BacktestNode timer bursts.
+        Ensures capital flows to the cheapest available contracts rather than
+        being locked into whichever tickers were scored first.
         """
         if self._is_backoff_window():
             self.log.info("Back-off window: cancelling all resting buy orders")
             self._cancel_all_resting_buys()
             return
 
+        # 1. Cancel ALL existing ladder buy orders
+        for ticker in list(self._ladder_orders.keys()):
+            self._cancel_ladder_orders(ticker)
+        self._last_ladder_bid.clear()
+
+        # 2. Collect candidates with current bids
+        candidates = []
         for ticker, signal in list(self._eligible_signals.items()):
             if ticker in self._danger_exited:
                 continue
-
-            # Skip if bid unchanged since last deployment (avoids expensive
-            # cache.orders_open() call during BacktestNode timer bursts)
             quote_key = self._quote_key(ticker, signal.side)
             quote = self._latest_quotes.get(quote_key)
-            if quote is not None:
-                bid_cents = int(round(quote.bid_price.as_double() * 100))
-                if self._last_ladder_bid.get(ticker) == bid_cents:
-                    continue
+            if quote is None:
+                continue
+            bid_cents = int(round(quote.bid_price.as_double() * 100))
+            candidates.append((bid_cents, ticker, signal))
 
-            # Bid changed (or no quote yet) — cancel old orders and redeploy
-            self._cancel_ladder_orders(ticker)
+        # 3. Sort cheapest first — capital flows to best-value contracts
+        candidates.sort(key=lambda x: x[0])
+
+        # 4. Deploy in order — _deploy_ladder handles capital budget internally
+        for bid_cents, ticker, signal in candidates:
             self._deploy_ladder(ticker, signal)
 
     def _cancel_ladder_orders(self, ticker: str):

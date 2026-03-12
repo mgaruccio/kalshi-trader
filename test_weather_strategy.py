@@ -216,8 +216,8 @@ class TestNoOnlyFilter:
     def test_no_signal_proceeds(self):
         """NO signal with valid quote and instrument proceeds to order placement."""
         strategy = _make_strategy(open_spread_enabled=False)
-        # Set clock to today (contract settles today)
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        # Set clock to today (contract settles today), outside backoff window
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
 
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(bid_cents=85, ask_cents=87)
@@ -227,6 +227,7 @@ class TestNoOnlyFilter:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
 
@@ -245,7 +246,7 @@ class TestDangerExitedGuard:
         strategy = _make_strategy(open_spread_enabled=False)
         strategy._danger_exited.add("KXHIGHCHI-26MAR15-T60")  # different ticker
 
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
         strategy.cache.instrument.return_value = _mock_instrument()
@@ -254,6 +255,7 @@ class TestDangerExitedGuard:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
 
@@ -362,8 +364,11 @@ class TestPhase1OpenSpread:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97, ts_event=late_ts))
 
-        # Should fall through to Phase 2 ladder (not Phase 1 spread)
+        # Should fall through to Phase 2 (signal stored, not Phase 1 spread)
         assert "KXHIGHCHI-26MAR15-T55" not in strategy._open_spread_placed
+        # Advance clock outside backoff window for refresh to deploy
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
     def test_phase1_sets_cancel_timer(self):
@@ -391,8 +396,11 @@ class TestPhase1OpenSpread:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97, ts_event=1_000_000_000))
 
-        # Should use Phase 2 instead
+        # Should use Phase 2 instead (signal stored, deploy on refresh)
         assert "KXHIGHCHI-26MAR15-T55" not in strategy._open_spread_placed
+        # Advance clock outside backoff window for refresh to deploy
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
     def test_phase1_today_contract_skips_to_phase2(self):
@@ -401,8 +409,8 @@ class TestPhase1OpenSpread:
             open_spread_enabled=True,
             stable_min_p_win=0.95,
         )
-        # Clock says today is 2026-03-15 — same as settlement date
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        # Clock says today is 2026-03-15 — same as settlement date, outside backoff
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
         strategy.cache.instrument.return_value = _mock_instrument()
@@ -412,6 +420,7 @@ class TestPhase1OpenSpread:
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
         assert "KXHIGHCHI-26MAR15-T55" not in strategy._open_spread_placed
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
     def test_phase1_stores_order_ids(self):
@@ -442,7 +451,8 @@ class TestPhase2StableLadder:
         )
         defaults.update(kwargs)
         strategy = _make_strategy(**defaults)
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        # 15:00 UTC is outside backoff window [7, 14) — needed for _on_refresh tests
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
@@ -456,6 +466,7 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # 3 offsets → 3 orders
         assert strategy.submit_order.call_count == 3
 
@@ -471,6 +482,7 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         prices_called = [c.args[0] for c in mock_inst.make_price.call_args_list]
         assert 0.80 in prices_called   # bid - 0
         assert 0.77 in prices_called   # bid - 3c
@@ -488,6 +500,7 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         prices_called = [c.args[0] for c in mock_inst.make_price.call_args_list]
         # All prices should be >= 0.01
         assert all(p >= 0.01 for p in prices_called)
@@ -565,6 +578,7 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         assert "KXHIGHCHI-26MAR15-T55" in strategy._ladder_orders
         assert len(strategy._ladder_orders["KXHIGHCHI-26MAR15-T55"]) == 2
 
@@ -577,7 +591,7 @@ class TestPhase2StableLadder:
             stable_size=5,
             max_position_per_ticker=6,
         )
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
@@ -594,6 +608,7 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # With 4 pending and max 6, only 2 contracts of capacity remain.
         # stable_size=5 per level but capacity=2, so only 1 ladder level fits (size=2).
         orders_placed = strategy.submit_order.call_count
@@ -611,7 +626,7 @@ class TestCostCeiling:
         )
         defaults.update(kwargs)
         strategy = _make_strategy(**defaults)
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
@@ -625,6 +640,7 @@ class TestCostCeiling:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # bid=95, offsets=(0,2,5) → prices 95,93,90
         # 95 > 92 → skip, 93 > 92 → skip, 90 <= 92 → place
         assert strategy.submit_order.call_count == 1
@@ -642,6 +658,7 @@ class TestCostCeiling:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # bid=97, offsets=(0,1,2) → prices 97,96,95 — all > 92
         strategy.submit_order.assert_not_called()
 
@@ -655,6 +672,7 @@ class TestCostCeiling:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # bid=80, offsets=(0,2,5) → prices 80,78,75 — all <= 92
         assert strategy.submit_order.call_count == 3
 
@@ -973,10 +991,10 @@ class TestBackoffWindow:
 
 
 # ---------------------------------------------------------------------------
-# Idempotent Refresh
+# Global Rebalance (replaces idempotent refresh)
 # ---------------------------------------------------------------------------
 
-class TestIdempotentRefresh:
+class TestGlobalRebalance:
     def _make_refresh_strategy(self, **kwargs):
         defaults = dict(
             open_spread_enabled=False,
@@ -992,8 +1010,8 @@ class TestIdempotentRefresh:
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
-    def test_refresh_skips_when_bid_unchanged(self):
-        """No orders or cache queries when bid hasn't moved."""
+    def test_refresh_always_redeploys(self):
+        """Refresh always cancels and redeploys, even when bid is unchanged."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
@@ -1002,8 +1020,7 @@ class TestIdempotentRefresh:
 
         strategy._on_refresh()
 
-        strategy.submit_order.assert_not_called()
-        strategy.cache.orders_open.assert_not_called()
+        strategy.submit_order.assert_called()
 
     def test_refresh_redeploys_when_bid_changes(self):
         """Refresh should cancel and redeploy when bid has moved."""
@@ -1018,19 +1035,76 @@ class TestIdempotentRefresh:
         strategy.submit_order.assert_called()
         assert strategy._last_ladder_bid[ticker] == 88
 
-    def test_burst_refreshes_are_noop(self):
-        """100 consecutive refreshes at same bid should produce zero orders."""
+    def test_cheapest_first(self):
+        """On refresh, cheapest contracts get laddered before expensive ones."""
+        strategy = self._make_refresh_strategy(
+            stable_ladder_offsets_cents=(0,),
+            stable_size=2,
+            max_cost_cents=95,
+            max_total_deployed_cents=5000,
+        )
+
+        # Two signals: SFO cheap (80c), NY expensive (90c)
+        strategy._eligible_signals["KXHIGHSFO-26MAR15-T71"] = _make_signal(
+            ticker="KXHIGHSFO-26MAR15-T71", p_win=0.97)
+        strategy._eligible_signals["KXHIGHNY-26MAR15-T52"] = _make_signal(
+            ticker="KXHIGHNY-26MAR15-T52", p_win=0.97)
+        strategy._latest_quotes["KXHIGHSFO-26MAR15-T71-NO.KALSHI"] = _mock_quote(80, 82)
+        strategy._latest_quotes["KXHIGHNY-26MAR15-T52-NO.KALSHI"] = _mock_quote(90, 92)
+
+        strategy._on_refresh()
+
+        # Both should get ladders (budget permits)
+        assert "KXHIGHSFO-26MAR15-T71" in strategy._ladder_orders
+        assert "KXHIGHNY-26MAR15-T52" in strategy._ladder_orders
+
+    def test_budget_exhaustion_skips_expensive(self):
+        """When budget fits only cheapest contracts, expensive ones are skipped."""
+        strategy = self._make_refresh_strategy(
+            stable_ladder_offsets_cents=(0,),
+            stable_size=1,
+            max_cost_cents=95,
+            max_total_deployed_cents=160,
+        )
+
+        # Two signals: SFO=80c, NY=90c
+        strategy._eligible_signals["KXHIGHSFO-26MAR15-T71"] = _make_signal(
+            ticker="KXHIGHSFO-26MAR15-T71", p_win=0.97)
+        strategy._eligible_signals["KXHIGHNY-26MAR15-T52"] = _make_signal(
+            ticker="KXHIGHNY-26MAR15-T52", p_win=0.97)
+        strategy._latest_quotes["KXHIGHSFO-26MAR15-T71-NO.KALSHI"] = _mock_quote(80, 82)
+        strategy._latest_quotes["KXHIGHNY-26MAR15-T52-NO.KALSHI"] = _mock_quote(90, 92)
+
+        # Mock _total_capital_at_risk to simulate budget being consumed:
+        # First call (SFO deploy): 0c at risk → deploys 80c
+        # Second call (NY deploy): 80c at risk → 80c remaining < 90c → skip
+        call_count = [0]
+        def mock_at_risk():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 0
+            return 80
+        strategy._total_capital_at_risk = mock_at_risk
+
+        strategy._on_refresh()
+
+        # SFO deployed (cheapest first), NY skipped (budget exhausted)
+        assert "KXHIGHSFO-26MAR15-T71" in strategy._ladder_orders
+        assert "KXHIGHNY-26MAR15-T52" not in strategy._ladder_orders
+
+    def test_evaluate_entry_stores_only(self):
+        """_evaluate_entry stores signal but does not place orders."""
         strategy = self._make_refresh_strategy()
-        ticker = "KXHIGHCHI-26MAR15-T55"
-        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
-        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
-        strategy._last_ladder_bid[ticker] = 85
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
 
-        for _ in range(100):
-            strategy._on_refresh()
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        # Signal stored, but no orders placed until refresh
+        assert "KXHIGHCHI-26MAR15-T55" in strategy._eligible_signals
         strategy.submit_order.assert_not_called()
-        strategy.cache.orders_open.assert_not_called()
 
     def test_backoff_clears_last_ladder_bid(self):
         """Back-off should clear _last_ladder_bid so ladders redeploy after resume."""
@@ -1460,7 +1534,7 @@ class TestCapitalCap:
             stable_size=2,
             # max_total_deployed_cents defaults to 0
         )
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
@@ -1469,6 +1543,7 @@ class TestCapitalCap:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         strategy.submit_order.assert_called()
 
     def test_capital_cap_blocks_ladder_when_full(self):
@@ -1481,7 +1556,7 @@ class TestCapitalCap:
             max_cost_cents=92,
             max_total_deployed_cents=200,
         )
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
@@ -1495,6 +1570,7 @@ class TestCapitalCap:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         strategy.submit_order.assert_not_called()
 
     def test_capital_cap_blocks_spread_when_full(self):
@@ -1534,7 +1610,7 @@ class TestCapitalCap:
             max_cost_cents=92,
             max_total_deployed_cents=500,
         )
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(80, 82)
@@ -1548,6 +1624,7 @@ class TestCapitalCap:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # Should have placed orders (2 offsets)
         assert strategy.submit_order.call_count == 2
 
@@ -1625,7 +1702,7 @@ class TestCapitalCap:
             max_cost_cents=92,
             max_total_deployed_cents=300,
         )
-        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(80, 82)
@@ -1637,5 +1714,6 @@ class TestCapitalCap:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
+        strategy._on_refresh()
         # Only 1 rung should place (160c fits in 300c, 156c doesn't fit in 140c)
         assert strategy.submit_order.call_count == 1

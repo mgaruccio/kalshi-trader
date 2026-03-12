@@ -89,8 +89,8 @@ def main():
         max_cost_cents=94,
         sell_target_cents=97,
         stable_size=3,
-        max_position_per_ticker=20,
-        max_total_deployed_cents=2500,  # $25 cap on $30 account
+        max_position_per_ticker=30,
+        max_total_deployed_cents=3000,  # $30 cap
         open_spread_enabled=False,
     )
     if args.dry_run:
