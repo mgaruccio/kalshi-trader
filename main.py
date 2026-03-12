@@ -85,7 +85,7 @@ def main():
 
     # 4. Add WeatherStrategy
     strategy_kwargs = dict(
-        stable_min_p_win=0.95,
+        stable_min_p_win=0.90,
         max_cost_cents=94,
         sell_target_cents=97,
         stable_size=3,
