@@ -822,30 +822,23 @@ class TestPeriodicRefresh:
         # Should have placed ladder orders
         strategy.submit_order.assert_called()
 
-    def test_refresh_cancels_old_ladder_before_redeploying(self):
-        """_on_refresh() should cancel existing ladder orders before placing new ones."""
+    def test_refresh_keeps_existing_ladder(self):
+        """_on_refresh() should NOT cancel+redeploy existing ladders."""
         strategy = self._make_refresh_strategy()
 
-        # Set up existing ladder order in cache
-        old_order_id = MagicMock()
-        old_order_id.__eq__ = lambda self, other: self is other
         ticker = "KXHIGHCHI-26MAR15-T55"
-        strategy._ladder_orders[ticker] = [old_order_id]
-
-        mock_open_order = MagicMock()
-        mock_open_order.client_order_id = old_order_id
-        mock_open_order.side = OrderSide.BUY
-        strategy.cache.orders_open.return_value = [mock_open_order]
+        strategy._ladder_orders[ticker] = [MagicMock()]
+        strategy._last_ladder_bid[ticker] = 85
 
         signal = _make_signal(p_win=0.97)
         strategy._eligible_signals[ticker] = signal
-        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
-        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
 
         strategy._on_refresh()
 
-        # cancel_order should have been called for old order
-        strategy.cancel_order.assert_called_with(mock_open_order)
+        # No cancel, no new orders — existing ladder left alone
+        strategy.cancel_order.assert_not_called()
+        strategy.submit_order.assert_not_called()
 
     def test_refresh_skips_danger_exited_tickers(self):
         """_on_refresh() should not redeploy for danger-exited tickers."""
@@ -858,42 +851,26 @@ class TestPeriodicRefresh:
         strategy._on_refresh()
         strategy.submit_order.assert_not_called()
 
-    def test_refresh_clears_ladder_orders_dict(self):
-        """After cancellation, old order IDs should be cancelled and new ones deployed."""
+    def test_refresh_cancels_non_eligible_tickers(self):
+        """Tickers no longer eligible should have their ladders cancelled."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
 
-        # Set up two old order IDs in ladder_orders
-        old_id_1 = MagicMock()
-        old_id_2 = MagicMock()
-        strategy._ladder_orders[ticker] = [old_id_1, old_id_2]
+        old_id = MagicMock()
+        strategy._ladder_orders[ticker] = [old_id]
+        strategy._last_ladder_bid[ticker] = 85
 
-        # Make cache.orders_open return open orders matching the old IDs
-        mock_order_1 = MagicMock()
-        mock_order_1.client_order_id = old_id_1
-        mock_order_1.side = OrderSide.BUY
-        mock_order_2 = MagicMock()
-        mock_order_2.client_order_id = old_id_2
-        mock_order_2.side = OrderSide.BUY
-        strategy.cache.orders_open.return_value = [mock_order_1, mock_order_2]
+        mock_open_order = MagicMock()
+        mock_open_order.client_order_id = old_id
+        mock_open_order.side = OrderSide.BUY
+        strategy.cache.orders_open.return_value = [mock_open_order]
 
-        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
-        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
-        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
-
+        # Ticker NOT in _eligible_signals → no longer eligible
         strategy._on_refresh()
 
-        # Old orders should have been cancelled
-        strategy.cancel_order.assert_any_call(mock_order_1)
-        strategy.cancel_order.assert_any_call(mock_order_2)
-
-        # New orders should have been deployed (ladder redeployment)
-        strategy.submit_order.assert_called()
-
-        # The ladder_orders dict should contain only the new order IDs (not old ones)
-        new_order_ids = set(strategy._ladder_orders.get(ticker, []))
-        assert old_id_1 not in new_order_ids
-        assert old_id_2 not in new_order_ids
+        # Should cancel the stale ladder
+        strategy.cancel_order.assert_called_with(mock_open_order)
+        assert ticker not in strategy._ladder_orders
 
 
 # ---------------------------------------------------------------------------
@@ -1010,30 +987,33 @@ class TestGlobalRebalance:
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
-    def test_refresh_skips_unchanged_bid(self):
-        """Refresh is idempotent — skips tickers whose bid hasn't changed."""
+    def test_refresh_skips_existing_ladder(self):
+        """Refresh skips tickers that already have a deployed ladder."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+        strategy._ladder_orders[ticker] = [MagicMock()]  # has existing ladder
         strategy._last_ladder_bid[ticker] = 85
 
         strategy._on_refresh()
 
         strategy.submit_order.assert_not_called()
 
-    def test_refresh_redeploys_when_bid_changes(self):
-        """Refresh should cancel and redeploy when bid has moved."""
+    def test_refresh_skips_even_when_bid_changes(self):
+        """Existing ladder is kept even when bid moves — no cancel+redeploy."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(88, 90)
+        strategy._ladder_orders[ticker] = [MagicMock()]  # has existing ladder
         strategy._last_ladder_bid[ticker] = 85  # old bid was 85, now 88
 
         strategy._on_refresh()
 
-        strategy.submit_order.assert_called()
-        assert strategy._last_ladder_bid[ticker] == 88
+        # No new orders — ladder stays as-is
+        strategy.submit_order.assert_not_called()
+        strategy.cancel_order.assert_not_called()
 
     def test_cheapest_first(self):
         """On refresh, cheapest contracts get laddered before expensive ones."""
@@ -1085,7 +1065,7 @@ class TestGlobalRebalance:
         assert "KXHIGHNY-26MAR15-T52" not in strategy._ladder_orders
 
     def test_repeated_refresh_no_order_accumulation(self):
-        """Multiple refreshes at same bid must NOT accumulate orders."""
+        """Multiple refreshes must NOT accumulate orders — ladder deployed once."""
         strategy = self._make_refresh_strategy(
             stable_ladder_offsets_cents=(0, 2),
             stable_size=2,
@@ -1099,11 +1079,12 @@ class TestGlobalRebalance:
         first_count = strategy.submit_order.call_count
         assert first_count == 2
 
-        # Second refresh: bid unchanged → idempotent, zero new orders
+        # Second refresh: ladder exists → skip, zero new orders
         strategy._on_refresh()
         assert strategy.submit_order.call_count == first_count
 
-        # Third refresh: still unchanged
+        # Third refresh: bid changes but ladder exists → still skip
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(90, 92)
         strategy._on_refresh()
         assert strategy.submit_order.call_count == first_count
 

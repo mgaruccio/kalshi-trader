@@ -335,13 +335,13 @@ class WeatherStrategy(Strategy):
 
         bid_cents = int(round(quote.bid_price.as_double() * 100))
 
-        # Idempotent: skip if bid unchanged since last deployment
-        if self._last_ladder_bid.get(ticker) == bid_cents:
-            return 0
-
-        # Bid changed — cancel old ladder for THIS ticker before redeploying
+        # Already has a deployed ladder — leave it alone. Cancel+redeploy
+        # is incompatible with async order management (old orders stay live
+        # until exchange confirms cancel, causing duplicate exposure).
+        # The ladder's offset range (0-10c) absorbs normal bid movement.
+        # Fresh deployment happens after backoff window cancels everything.
         if ticker in self._ladder_orders:
-            self._cancel_ladder_orders(ticker)
+            return 0
 
         instrument_id = InstrumentId(
             Symbol(f"{ticker}-{signal.side.upper()}"),
@@ -673,25 +673,23 @@ class WeatherStrategy(Strategy):
         # 3. Sort cheapest first (matters for initial budget allocation)
         candidates.sort(key=lambda x: x[0])
 
-        # 4. Compute budget: positions + existing kept ladders (bid unchanged)
-        #    are already deployed. Only new/changed deployments consume budget.
+        # 4. Compute budget for new deployments
         if self._cfg.max_total_deployed_cents > 0:
             position_cost = sum(
                 info.get("contracts", 0) * self._cfg.max_cost_cents
                 for info in self._positions_info.values()
             )
-            # Estimate cost of ladders we're keeping (bid unchanged → idempotent skip)
-            kept_cost = 0
-            for bid_cents, ticker, signal in candidates:
-                if self._last_ladder_bid.get(ticker) == bid_cents:
-                    order_count = len(self._ladder_orders.get(ticker, []))
-                    kept_cost += order_count * bid_cents * self._cfg.stable_size
-            remaining_budget = self._cfg.max_total_deployed_cents - position_cost - kept_cost
+            # Existing ladders: estimate cost from tracked order count
+            ladder_cost = 0
+            for ticker, order_ids in self._ladder_orders.items():
+                last_bid = self._last_ladder_bid.get(ticker, 0)
+                ladder_cost += len(order_ids) * last_bid * self._cfg.stable_size
+            remaining_budget = self._cfg.max_total_deployed_cents - position_cost - ladder_cost
         else:
             remaining_budget = None  # disabled
 
-        # 5. Deploy cheapest first — _deploy_ladder handles idempotency
-        #    (skips unchanged bids, cancels per-ticker on bid change)
+        # 5. Deploy cheapest first — _deploy_ladder skips tickers that
+        #    already have a ladder (no cancel+redeploy, avoids async issues)
         for bid_cents, ticker, signal in candidates:
             if remaining_budget is not None and remaining_budget <= 0:
                 break
