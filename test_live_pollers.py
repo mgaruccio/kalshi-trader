@@ -115,7 +115,7 @@ class TestLivePollers:
     @patch("feature_actor.get_forecast")
     def test_poll_forecasts_publishes_event(self, mock_fc, mock_wx, mock_parse):
         """Forecast poll should publish ClimateEvent with forecast features."""
-        mock_fc.side_effect = [55.0, 54.0]  # ecmwf, gfs
+        mock_fc.side_effect = [55.0, 54.0, 53.0]  # ecmwf, gfs, icon
         mock_wx.return_value = {"wind_speed_max": 12.0}
         mock_parse.return_value = {"series": "KXHIGHCHI", "threshold": 55, "settlement_date": "2026-03-12"}
         actor = self._make_actor()
@@ -128,13 +128,16 @@ class TestLivePollers:
         assert events[0].features["gfs_high"] == 54.0
         assert events[0].features["forecast_high"] == 55.0  # max
         assert events[0].features["wind_speed_max"] == 12.0
+        assert "model_std" in events[0].features
+        assert "model_range" in events[0].features
+        assert "wind_dir_offshore" in events[0].features
 
     @patch("feature_actor.parse_ticker")
     @patch("feature_actor.get_weather_features")
     @patch("feature_actor.get_forecast")
     def test_poll_forecasts_partial_data(self, mock_fc, mock_wx, mock_parse):
         """Forecast poll should handle partial data (only ecmwf)."""
-        mock_fc.side_effect = [55.0, None]  # ecmwf ok, gfs unavailable
+        mock_fc.side_effect = [55.0, None, None]  # ecmwf ok, gfs unavailable, icon unavailable
         mock_wx.return_value = {}
         mock_parse.return_value = {"series": "KXHIGHCHI", "threshold": 55, "settlement_date": "2026-03-12"}
         actor = self._make_actor()

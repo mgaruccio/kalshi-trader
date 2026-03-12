@@ -65,6 +65,61 @@ except ImportError:
     load_config = None
 
 
+_COAST_NORMAL = {
+    "los_angeles": 240, "san_francisco": 270, "miami": 90,
+    "new_york": 150, "boston": 90, "seattle": 270,
+    "houston": 150, "new_orleans": 180, "philadelphia": 135,
+    "washington_dc": 135,
+}
+
+
+def _build_extra_features(
+    ecmwf: float | None,
+    gfs: float | None,
+    icon: float | None,
+    city: str,
+    date: str,
+    wx: dict | None,
+) -> dict:
+    """Compute all features needed for spread models: forecasts + model spread + wind_dir_offshore.
+
+    Mirrors quantdesk_adapter._compute_extra_features so the NT path
+    produces the same feature set as the standalone trader.
+    """
+    import numpy as np
+
+    features: dict[str, float] = {}
+
+    if ecmwf is not None:
+        features["ecmwf_high"] = ecmwf
+    if gfs is not None:
+        features["gfs_high"] = gfs
+    if ecmwf is not None and gfs is not None:
+        features["forecast_high"] = max(ecmwf, gfs)
+
+    # Model spread (3-model when ICON available, 2-model fallback)
+    temps = [t for t in (ecmwf, gfs, icon) if t is not None]
+    if len(temps) >= 2:
+        arr = np.array(temps)
+        features["model_std"] = float(np.std(arr, ddof=0))
+        features["model_range"] = float(np.ptp(arr))
+
+    # Weather features from ECMWF forecast
+    if wx:
+        features.update(wx)
+
+    # Derive wind_dir_offshore from wind_dir_afternoon + coast geometry
+    coast_normal = _COAST_NORMAL.get(city)
+    wind_dir = (wx or {}).get("wind_dir_afternoon")
+    if coast_normal is not None and wind_dir is not None:
+        angle_diff = (wind_dir - coast_normal) * np.pi / 180
+        features["wind_dir_offshore"] = float(np.cos(angle_diff))
+    else:
+        features["wind_dir_offshore"] = 0.0
+
+    return features
+
+
 class FeatureActorConfig(ActorConfig):
     model_cycle_seconds: int = 300    # 5 min between model runs
     danger_check_enabled: bool = True  # check exit rules on each event
@@ -366,22 +421,18 @@ class FeatureActor(Actor):
             ecmwf = features.get("ecmwf_high")
             gfs = features.get("gfs_high")
 
-            # Bootstrap: fetch forecasts if not yet accumulated from pollers
+            # Bootstrap: fetch forecasts + derived features if not yet accumulated
             if (ecmwf is None or gfs is None) and get_forecast is not None:
                 try:
                     ecmwf = ecmwf or get_forecast(city, sd, PRIMARY_MODEL)
                     gfs = gfs or get_forecast(city, sd, CONSENSUS_MODEL)
+                    icon = get_forecast(city, sd, "icon_seamless")
                     wx = get_weather_features(city, sd) if get_weather_features else {}
-                    # Hydrate feature store so subsequent cycles don't re-fetch
+
                     if ecmwf is not None or gfs is not None:
-                        bootstrap = {}
-                        if ecmwf is not None:
-                            bootstrap["ecmwf_high"] = ecmwf
-                        if gfs is not None:
-                            bootstrap["gfs_high"] = gfs
-                        if ecmwf is not None and gfs is not None:
-                            bootstrap["forecast_high"] = max(ecmwf, gfs)
-                        bootstrap.update(wx)
+                        bootstrap = _build_extra_features(
+                            ecmwf, gfs, icon, city, sd, wx,
+                        )
                         key = (city, sd)
                         s = self._city_features.setdefault(key, CityFeatureState())
                         s.update("bootstrap_forecast", bootstrap)
@@ -572,16 +623,10 @@ class FeatureActor(Actor):
             try:
                 ecmwf = get_forecast(city, sd, PRIMARY_MODEL)
                 gfs = get_forecast(city, sd, CONSENSUS_MODEL)
+                icon = get_forecast(city, sd, "icon_seamless")
                 wx = get_weather_features(city, sd) if get_weather_features else {}
 
-                features = {}
-                if ecmwf is not None:
-                    features["ecmwf_high"] = ecmwf
-                if gfs is not None:
-                    features["gfs_high"] = gfs
-                if ecmwf is not None and gfs is not None:
-                    features["forecast_high"] = max(ecmwf, gfs)
-                features.update(wx)
+                features = _build_extra_features(ecmwf, gfs, icon, city, sd, wx)
 
                 if features:
                     evt = ClimateEvent(
