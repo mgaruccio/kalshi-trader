@@ -456,13 +456,24 @@ class KalshiExecutionClient(LiveExecutionClient):
                 self._executor, self._fetch_resting_orders
             )
             ts = self._clock.timestamp_ns()
-            for order in getattr(resp, "orders", []):
+            for order in getattr(resp, "orders", None) or []:
                 instrument_id = InstrumentId(
                     Symbol(f"{order.ticker}-{order.side.upper()}"), KALSHI_VENUE
                 )
                 instrument = self._instrument_provider.find(instrument_id)
                 if not instrument:
                     continue
+
+                count = getattr(order, "remaining_count", None) or getattr(order, "count", None) or 0
+                if count <= 0:
+                    continue
+
+                # Resolve price: NO orders have no_price, YES orders have yes_price
+                price = None
+                if order.side == "yes" and getattr(order, "yes_price", None):
+                    price = instrument.make_price(order.yes_price / 100.0)
+                elif order.side == "no" and getattr(order, "no_price", None):
+                    price = instrument.make_price(order.no_price / 100.0)
 
                 reports.append(
                     OrderStatusReport(
@@ -477,7 +488,7 @@ class KalshiExecutionClient(LiveExecutionClient):
                         else OrderType.MARKET,
                         time_in_force=TimeInForce.GTC,
                         order_status=OrderStatus.ACCEPTED,
-                        quantity=instrument.make_qty(order.count),
+                        quantity=instrument.make_qty(count),
                         filled_qty=instrument.make_qty(0),
                         report_id=UUID4(),
                         ts_accepted=ts,
@@ -486,13 +497,7 @@ class KalshiExecutionClient(LiveExecutionClient):
                         client_order_id=ClientOrderId(order.client_order_id)
                         if order.client_order_id
                         else None,
-                        price=instrument.make_price(order.yes_price / 100.0)
-                        if order.side == "yes" and order.yes_price
-                        else (
-                            instrument.make_price(order.no_price / 100.0)
-                            if order.side == "no" and order.no_price
-                            else None
-                        ),
+                        price=price,
                     )
                 )
         except Exception as e:
