@@ -712,6 +712,11 @@ class KalshiInstrumentProvider(InstrumentProvider):
                         for m in getattr(resp, "markets", None) or []:
                             if m.status not in ("active", "open", "unopened"):
                                 continue
+                            # Only load T (threshold) contracts, skip B (bracket)
+                            ticker = getattr(m, "ticker", "")
+                            parts = ticker.split("-")
+                            if not any(p.startswith("T") and len(p) > 1 for p in parts):
+                                continue
                             self.add(self._build_instrument(m, "YES"))
                             self.add(self._build_instrument(m, "NO"))
 
