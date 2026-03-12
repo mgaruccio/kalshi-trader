@@ -4,8 +4,9 @@
 Phase A — Validation Run: single run with production defaults, full catalog.
 Reports signals, orders, fills, balance and diagnoses failures at each stage.
 
-Phase B — Parameter Sweep: 12-combo grid over min_p_win × max_cost_cents,
+Phase B — Parameter Sweep: 12-combo grid over stable_min_p_win × stable_size,
 using pre-computed signals for speed (no ML inference during backtest).
+Phase 1 (open spread) is disabled — no meaningful "tomorrow" concept with 2-day data.
 
 Usage:
     cd ~/code/kalshi-trader
@@ -34,12 +35,11 @@ MODEL_SIGNALS = Path.home() / "code/kalshi-trader/data/model_signals.parquet"
 
 # Production defaults
 PROD_MIN_P_WIN = 0.95
-PROD_MAX_COST = 92
 PROD_SELL_TARGET = 97
 
 # Sweep grid
-SWEEP_MIN_P_WIN = [0.90, 0.93, 0.95, 0.97]
-SWEEP_MAX_COST = [88, 92, 96]
+SWEEP_MIN_P_WIN = [0.90, 0.93, 0.95, 0.97]  # maps to stable_min_p_win
+SWEEP_STABLE_SIZE = [5, 10, 20]  # replaces max_cost grid (cost is bid-relative now)
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -215,7 +215,7 @@ def _diagnose(results: dict) -> str:
     if results["orders"] == 0:
         return "FAIL: No orders placed — signals emitted but no quote ticks matched; check catalog contains NO-side instruments"
     if results["fills"] == 0:
-        return "FAIL: Orders placed but none filled — ask price exceeded max_cost_cents, or FOK/GTC matching issue"
+        return "FAIL: Orders placed but none filled — ladder prices may not match any asks, or FOK/GTC matching issue"
     return "OK"
 
 
@@ -226,7 +226,8 @@ def _diagnose(results: dict) -> str:
 def run_phase_a():
     print("=" * 80)
     print("PHASE A: VALIDATION RUN")
-    print(f"  min_p_win={PROD_MIN_P_WIN}  max_cost={PROD_MAX_COST}c  sell_target={PROD_SELL_TARGET}c")
+    print(f"  stable_min_p_win={PROD_MIN_P_WIN}  sell_target={PROD_SELL_TARGET}c  stable_size=20")
+    print(f"  open_spread_enabled=False (no tomorrow concept with 2-day data)")
     print(f"  catalog : {CATALOG_FULL}")
     print(f"  events  : {CLIMATE_EVENTS}")
     print(f"  signals : {MODEL_SIGNALS}")
@@ -248,10 +249,10 @@ def run_phase_a():
         return
 
     strategy_config = {
-        "min_p_win": PROD_MIN_P_WIN,
-        "max_cost_cents": PROD_MAX_COST,
+        "stable_min_p_win": PROD_MIN_P_WIN,
         "sell_target_cents": PROD_SELL_TARGET,
-        "trade_size": 20,
+        "stable_size": 20,
+        "open_spread_enabled": False,  # disable Phase 1 in backtest (no "tomorrow" concept with 2-day data)
     }
 
     try:
@@ -325,7 +326,7 @@ def run_phase_a():
 # Phase B: Parameter sweep
 # ---------------------------------------------------------------------------
 
-def _run_single_combo(catalog, min_pw, max_cost, sell_target):
+def _run_single_combo(catalog, min_pw, stable_size, sell_target):
     """Run one backtest combo in a subprocess (NT Rust logger can't reinitialize)."""
     import subprocess, json as _json
     # Use the exp05 module path so subprocess can import _settle_position
@@ -342,7 +343,7 @@ engine = run_backtest(
     climate_events_path=Path('{CLIMATE_EVENTS}'),
     catalog_path=Path('{catalog}'),
     starting_balance_usd=100,
-    strategy_config={{"min_p_win": {min_pw}, "max_cost_cents": {max_cost}, "sell_target_cents": {sell_target}, "trade_size": 20}},
+    strategy_config={{"stable_min_p_win": {min_pw}, "sell_target_cents": {sell_target}, "stable_size": {stable_size}, "open_spread_enabled": False}},
     model_signals_path=Path('{MODEL_SIGNALS}'),
 )
 
@@ -407,7 +408,8 @@ print("RESULT:" + json.dumps(r))
 def run_phase_b():
     print("\n" + "=" * 80)
     print("PHASE B: PARAMETER SWEEP")
-    print(f"  min_p_win x max_cost grid ({len(SWEEP_MIN_P_WIN)} x {len(SWEEP_MAX_COST)} = {len(SWEEP_MIN_P_WIN) * len(SWEEP_MAX_COST)} combos)")
+    print(f"  stable_min_p_win x stable_size grid ({len(SWEEP_MIN_P_WIN)} x {len(SWEEP_STABLE_SIZE)} = {len(SWEEP_MIN_P_WIN) * len(SWEEP_STABLE_SIZE)} combos)")
+    print(f"  open_spread_enabled=False (no tomorrow concept with 2-day data)")
 
     # Use thin catalog if available, else fall back to full
     catalog = CATALOG_THIN if CATALOG_THIN.exists() else CATALOG_FULL
@@ -420,28 +422,28 @@ def run_phase_b():
         print(f"ERROR: No catalog found at {catalog}")
         return
 
-    header = f"{'min_pw':>8}  {'max_cost':>8}  {'buys':>5}  {'W':>3}  {'L':>3}  {'total_pnl':>10}  {'exit_pnl':>9}  {'settle_pnl':>10}"
+    header = f"{'min_pw':>8}  {'stbl_sz':>7}  {'buys':>5}  {'W':>3}  {'L':>3}  {'total_pnl':>10}  {'exit_pnl':>9}  {'settle_pnl':>10}"
     sep = "-" * len(header)
     print(f"\n{header}")
     print(sep)
 
     for min_pw in SWEEP_MIN_P_WIN:
-        for max_cost in SWEEP_MAX_COST:
+        for stable_size in SWEEP_STABLE_SIZE:
             try:
-                r = _run_single_combo(catalog, min_pw, max_cost, PROD_SELL_TARGET)
+                r = _run_single_combo(catalog, min_pw, stable_size, PROD_SELL_TARGET)
                 if "error" in r:
-                    print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {r['error'][:60]}")
+                    print(f"{min_pw:>8.2f}  {stable_size:>7}  ERROR: {r['error'][:60]}")
                     continue
                 total = f"${r['total_pnl']:+.2f}"
                 exits = f"${r['realized_pnl']:+.2f}"
                 settle = f"${r['settlement_pnl']:+.2f}"
                 print(
-                    f"{min_pw:>8.2f}  {max_cost:>8}  "
+                    f"{min_pw:>8.2f}  {stable_size:>7}  "
                     f"{r['buys']:>5}  {r['wins']:>3}  {r['losses']:>3}  "
                     f"{total:>10}  {exits:>9}  {settle:>10}"
                 )
             except Exception as e:
-                print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {e}")
+                print(f"{min_pw:>8.2f}  {stable_size:>7}  ERROR: {e}")
 
     print(sep)
 
