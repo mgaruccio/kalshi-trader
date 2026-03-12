@@ -144,63 +144,58 @@ class FeatureActor(Actor):
         self._models_loaded = False
         self._kw_config = None
         if load_config:
-            try:
-                self._kw_config = load_config()
-            except Exception as e:
-                self.log.error(f"Config load failed: {e}")
+            self._kw_config = load_config()
         self._load_models()
 
     def _load_models(self):
-        """Load ensemble models from config (ensemble_models + ensemble_weights)."""
-        try:
-            from kalshi_weather_ml.models.emos import EMOSModel
-            from kalshi_weather_ml.models.ngboost_model import NGBoostModel
-            from kalshi_weather_ml.models.drn_model import DRNModel
+        """Load ensemble models from config (ensemble_models + ensemble_weights).
 
-            kw_root = Path(_KW_ROOT)
-            models_dir = kw_root / "data" / "models"
+        All-or-nothing: if ANY configured model fails to load, crash.
+        """
+        from kalshi_weather_ml.models.emos import EMOSModel
+        from kalshi_weather_ml.models.ngboost_model import NGBoostModel
+        from kalshi_weather_ml.models.drn_model import DRNModel
 
-            model_loaders = {
-                "emos":           lambda: EMOSModel.load(models_dir / "emos_normal.json"),
-                "ngboost":        lambda: NGBoostModel.load(models_dir / "ngboost_normal.pkl"),
-                "ngboost_spread": lambda: NGBoostModel.load(models_dir / "ngboost_normal_wx_spread.pkl"),
-                "drn":            lambda: DRNModel.load(models_dir / "drn_normal"),
-                "drn_spread":     lambda: DRNModel.load(models_dir / "drn_normal_wx_spread"),
-            }
+        kw_root = Path(_KW_ROOT)
+        models_dir = kw_root / "data" / "models"
 
-            # Determine which models to load from config (fallback: emos + ngboost)
-            model_names = ["emos", "ngboost"]
-            config_weights = {}
-            if self._kw_config and hasattr(self._kw_config, "ensemble_models"):
-                model_names = self._kw_config.ensemble_models or model_names
-            if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
-                config_weights = self._kw_config.ensemble_weights or {}
+        model_loaders = {
+            "emos":           lambda: EMOSModel.load(models_dir / "emos_normal.json"),
+            "ngboost":        lambda: NGBoostModel.load(models_dir / "ngboost_normal.pkl"),
+            "ngboost_spread": lambda: NGBoostModel.load(models_dir / "ngboost_normal_wx_spread.pkl"),
+            "drn":            lambda: DRNModel.load(models_dir / "drn_normal"),
+            "drn_spread":     lambda: DRNModel.load(models_dir / "drn_normal_wx_spread"),
+        }
 
-            for name in model_names:
-                loader = model_loaders.get(name)
-                if loader is None:
-                    self.log.error(f"Unknown model name in ensemble_models: {name!r}")
-                    continue
-                try:
-                    model = loader()
-                    weight = config_weights.get(name, 1.0)
-                    self.ensemble_models.append(model)
-                    self.ensemble_names.append(name)
-                    self.ensemble_weights.append(weight)
-                    self.log.info(f"Loaded model {name!r} (weight={weight})")
-                except Exception as e:
-                    self.log.error(f"Failed to load model {name!r}: {e}")
+        # Determine which models to load from config (fallback: emos + ngboost)
+        model_names = ["emos", "ngboost"]
+        config_weights = {}
+        if self._kw_config and hasattr(self._kw_config, "ensemble_models"):
+            model_names = self._kw_config.ensemble_models or model_names
+        if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
+            config_weights = self._kw_config.ensemble_weights or {}
 
-            if self.ensemble_models:
-                self._models_loaded = True
-                self.log.info(
-                    f"Ensemble ready: {len(self.ensemble_models)} models — "
-                    + ", ".join(f"{n}={w}" for n, w in zip(self.ensemble_names, self.ensemble_weights))
-                )
-            else:
-                self.log.error("No models loaded — model files not found or all loaders failed")
-        except Exception as e:
-            self.log.error(f"Failed to load models in FeatureActor: {e}")
+        for name in model_names:
+            loader = model_loaders.get(name)
+            if loader is None:
+                raise ValueError(f"Unknown model name in ensemble_models: {name!r}")
+            model = loader()  # crash if load fails
+            weight = config_weights.get(name, 1.0)
+            self.ensemble_models.append(model)
+            self.ensemble_names.append(name)
+            self.ensemble_weights.append(weight)
+            self.log.info(f"Loaded model {name!r} (weight={weight})")
+
+        if len(self.ensemble_models) != len(model_names):
+            raise RuntimeError(
+                f"Model load incomplete: loaded {len(self.ensemble_models)}/{len(model_names)} "
+                f"(got {self.ensemble_names}, expected {model_names})"
+            )
+        self._models_loaded = True
+        self.log.info(
+            f"Ensemble ready: {len(self.ensemble_models)} models — "
+            + ", ".join(f"{n}={w}" for n, w in zip(self.ensemble_names, self.ensemble_weights))
+        )
 
     def on_start(self):
         """Subscribe to climate events and start model cycle timer."""
@@ -327,32 +322,55 @@ class FeatureActor(Actor):
                     evaluated_tickers.add(ticker)
                     pos_info = self._positions[ticker]
 
+                    if not (score_opportunities and parse_ticker and self.ensemble_models):
+                        continue  # no scoring available — skip, don't emit zero signal
+
+                    parsed = parse_ticker(ticker)
+                    if not parsed:
+                        continue
+
+                    if self._cfg.live_mode:
+                        try:
+                            scores = score_opportunities(
+                                ticker=ticker, city=city, direction="above",
+                                threshold=float(parsed["threshold"]),
+                                settlement_date=parsed["settlement_date"],
+                                ecmwf=ecmwf, gfs=gfs,
+                                models=self.ensemble_models,
+                                model_names=self.ensemble_names,
+                                model_weights=self.ensemble_weights,
+                                now=now_dt,
+                                extra_features=features,
+                            )
+                        except Exception as e:
+                            self.log.error(f"Score eval failed for {ticker}: {e}")
+                            continue  # skip ticker — do NOT emit zero signal
+                    else:
+                        # Backtest: crash on inference failure
+                        scores = score_opportunities(
+                            ticker=ticker, city=city, direction="above",
+                            threshold=float(parsed["threshold"]),
+                            settlement_date=parsed["settlement_date"],
+                            ecmwf=ecmwf, gfs=gfs,
+                            models=self.ensemble_models,
+                            model_names=self.ensemble_names,
+                            model_weights=self.ensemble_weights,
+                            now=now_dt,
+                            extra_features=features,
+                        )
+
                     p_win = 0.0
                     model_scores = {}
+                    side = pos_info.get("side", "no").lower()
+                    for s in scores:
+                        if s.side == side:
+                            p_win = s.p_win
+                            model_scores = s.model_scores
+                            break
 
-                    if score_opportunities and parse_ticker and self.ensemble_models:
-                        parsed = parse_ticker(ticker)
-                        if parsed:
-                            try:
-                                scores = score_opportunities(
-                                    ticker=ticker, city=city, direction="above",
-                                    threshold=float(parsed["threshold"]),
-                                    settlement_date=parsed["settlement_date"],
-                                    ecmwf=ecmwf, gfs=gfs,
-                                    models=self.ensemble_models,
-                                    model_names=self.ensemble_names,
-                                    model_weights=self.ensemble_weights,
-                                    now=now_dt,
-                                    extra_features=features,
-                                )
-                                side = pos_info.get("side", "no").lower()
-                                for s in scores:
-                                    if s.side == side:
-                                        p_win = s.p_win
-                                        model_scores = s.model_scores
-                                        break
-                            except Exception as e:
-                                self.log.warning(f"Score eval failed for {ticker}: {e}")
+                    if p_win <= 0.0:
+                        self.log.warning(f"No valid p_win for {ticker} (side={side}), skipping signal")
+                        continue
 
                     signal = ModelSignal(
                         city=city,
@@ -421,8 +439,9 @@ class FeatureActor(Actor):
             ecmwf = features.get("ecmwf_high")
             gfs = features.get("gfs_high")
 
-            # Bootstrap: fetch forecasts + derived features if not yet accumulated
-            if (ecmwf is None or gfs is None) and get_forecast is not None:
+            # Bootstrap: fetch forecasts if not yet accumulated (live mode only —
+            # in backtest, climate events must supply all features)
+            if (ecmwf is None or gfs is None) and self._cfg.live_mode and get_forecast is not None:
                 try:
                     ecmwf = ecmwf or get_forecast(city, sd, PRIMARY_MODEL)
                     gfs = gfs or get_forecast(city, sd, CONSENSUS_MODEL)
@@ -438,7 +457,8 @@ class FeatureActor(Actor):
                         s.update("bootstrap_forecast", bootstrap)
                         features = s.snapshot()
                 except Exception as e:
-                    self.log.warning(f"Bootstrap forecast fetch failed for {city}/{sd}: {e}")
+                    self.log.error(f"Live forecast fetch failed for {city}/{sd}: {e}")
+                    continue  # will retry next timer cycle
 
             if ecmwf is None or gfs is None:
                 continue
@@ -455,7 +475,24 @@ class FeatureActor(Actor):
                     "yes_bid": 50,
                     "yes_ask": 51,
                 }
-                try:
+                if self._cfg.live_mode:
+                    try:
+                        scored = score_and_filter(
+                            ticker=ticker, city=city, direction="above",
+                            threshold=float(parsed["threshold"]),
+                            settlement_date=parsed["settlement_date"],
+                            ecmwf=ecmwf, gfs=gfs, config=self._kw_config,
+                            models=self.ensemble_models,
+                            model_names=self.ensemble_names,
+                            model_weights=self.ensemble_weights,
+                            now=now_dt,
+                            extra_features=features,
+                        )
+                    except Exception as e:
+                        self.log.error(f"Scan eval failed for {ticker}: {e}")
+                        continue
+                else:
+                    # Backtest: crash on inference failure
                     scored = score_and_filter(
                         ticker=ticker, city=city, direction="above",
                         threshold=float(parsed["threshold"]),
@@ -467,20 +504,18 @@ class FeatureActor(Actor):
                         now=now_dt,
                         extra_features=features,
                     )
-                    for s in scored:
-                        signal = ModelSignal(
-                            city=city,
-                            ticker=ticker,
-                            side=s.side,
-                            p_win=s.p_win,
-                            model_scores=s.model_scores,
-                            features_snapshot=features,
-                            ts_event=ts,
-                            ts_init=ts,
-                        )
-                        self.publish_data(DataType(ModelSignal), signal)
-                except Exception as e:
-                    self.log.warning(f"Scan eval failed for {ticker}: {e}")
+                for s in scored:
+                    signal = ModelSignal(
+                        city=city,
+                        ticker=ticker,
+                        side=s.side,
+                        p_win=s.p_win,
+                        model_scores=s.model_scores,
+                        features_snapshot=features,
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(ModelSignal), signal)
 
     def _check_danger(self, city: str):
         """Run exit rules for a city and publish DangerAlert if triggered."""

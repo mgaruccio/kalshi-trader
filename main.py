@@ -78,10 +78,12 @@ def main():
     # 4. Add WeatherStrategy
     strategy_kwargs = dict(
         stable_min_p_win=0.95,
-        max_cost_cents=92,
+        max_cost_cents=94,
         sell_target_cents=97,
         stable_size=3,
         max_position_per_ticker=20,
+        max_total_deployed_cents=2500,  # $25 cap on $30 account
+        open_spread_enabled=False,
     )
     if args.dry_run:
         strategy_kwargs["max_position_per_ticker"] = 0

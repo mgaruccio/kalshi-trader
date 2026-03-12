@@ -72,6 +72,8 @@ class _TestableWeatherStrategy:
         # Counters
         self._signals_received: int = 0
         self._alerts_received: int = 0
+        self._spread_orders_placed: int = 0
+        self._stable_orders_placed: int = 0
         self._feature_actor = None
         # NT mocks
         self.log = MagicMock()
@@ -113,6 +115,7 @@ class _TestableWeatherStrategy:
     _cancel_all_buys_for_ticker = WeatherStrategy._cancel_all_buys_for_ticker
     _cancel_resting_sells_for_ticker = WeatherStrategy._cancel_resting_sells_for_ticker
     _cleanup_ticker_state = WeatherStrategy._cleanup_ticker_state
+    _total_capital_at_risk = WeatherStrategy._total_capital_at_risk
     _cancel_all_resting_buys = WeatherStrategy._cancel_all_resting_buys
     _place_resting_sell = WeatherStrategy._place_resting_sell
     _on_refresh = WeatherStrategy._on_refresh
@@ -193,6 +196,11 @@ class TestWeatherStrategyConfig:
         """max_cost_cents should default to 92."""
         cfg = WeatherStrategyConfig()
         assert cfg.max_cost_cents == 92
+
+    def test_max_total_deployed_default(self):
+        """max_total_deployed_cents should default to 0 (disabled)."""
+        cfg = WeatherStrategyConfig()
+        assert cfg.max_total_deployed_cents == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1436,3 +1444,198 @@ class TestStateCleanupOnClose:
         assert ticker not in strategy._open_spread_placed
         assert ticker not in strategy._first_tick_time
         assert ticker not in strategy._last_ladder_bid
+
+
+# ---------------------------------------------------------------------------
+# Capital Cap (max_total_deployed_cents)
+# ---------------------------------------------------------------------------
+
+class TestCapitalCap:
+    def test_capital_cap_default_disabled(self):
+        """Default config (max_total_deployed_cents=0) doesn't block orders."""
+        strategy = _make_strategy(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0,),
+            stable_size=2,
+            # max_total_deployed_cents defaults to 0
+        )
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        strategy.submit_order.assert_called()
+
+    def test_capital_cap_blocks_ladder_when_full(self):
+        """With max_total_deployed_cents=200, positions using 200c+ blocks ladder."""
+        strategy = _make_strategy(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0, 2),
+            stable_size=2,
+            max_cost_cents=92,
+            max_total_deployed_cents=200,
+        )
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
+
+        # Existing positions that consume all budget: 3 contracts * 92c = 276c > 200c
+        strategy._positions_info["KXHIGHCHI-26MAR14-T50"] = {
+            "side": "no", "contracts": 3, "city": "chicago", "threshold": 50,
+        }
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        strategy.submit_order.assert_not_called()
+
+    def test_capital_cap_blocks_spread_when_full(self):
+        """With max_total_deployed_cents=200, positions using 200c+ blocks Phase 1 spread."""
+        strategy = _make_strategy(
+            open_spread_enabled=True,
+            open_spread_prices_cents=(45, 50, 55),
+            open_spread_size=3,
+            open_spread_min_p_win=0.90,
+            max_cost_cents=92,
+            max_total_deployed_cents=200,
+        )
+        # Clock says today is 2026-03-14 → contract 2026-03-15 is tomorrow
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        strategy.clock.set_time_alert_ns = MagicMock()
+        strategy.clock.timestamp_ns.return_value = 1_000_000_000
+
+        # Existing positions consuming budget: 3 * 92 = 276c > 200c
+        strategy._positions_info["KXHIGHCHI-26MAR14-T50"] = {
+            "side": "no", "contracts": 3, "city": "chicago", "threshold": 50,
+        }
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.95, ts_event=1_000_000_000))
+
+        strategy.submit_order.assert_not_called()
+
+    def test_capital_cap_allows_within_budget(self):
+        """With max_total_deployed_cents=500 and only 100c deployed, orders ARE placed."""
+        strategy = _make_strategy(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0, 2),
+            stable_size=2,
+            max_cost_cents=92,
+            max_total_deployed_cents=500,
+        )
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(80, 82)
+
+        # Only 1 contract at 92c = 92c deployed, well under 500c cap
+        strategy._positions_info["KXHIGHCHI-26MAR14-T50"] = {
+            "side": "no", "contracts": 1, "city": "chicago", "threshold": 50,
+        }
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        # Should have placed orders (2 offsets)
+        assert strategy.submit_order.call_count == 2
+
+    def test_capital_at_risk_counts_pending_buys(self):
+        """_total_capital_at_risk sums pending BUY orders correctly."""
+        strategy = _make_strategy(max_cost_cents=92, max_total_deployed_cents=1000)
+
+        mock_order1 = MagicMock()
+        mock_order1.side = OrderSide.BUY
+        mock_order1.price.as_double.return_value = 0.85
+        mock_order1.leaves_qty.as_double.return_value = 3.0
+
+        mock_order2 = MagicMock()
+        mock_order2.side = OrderSide.BUY
+        mock_order2.price.as_double.return_value = 0.80
+        mock_order2.leaves_qty.as_double.return_value = 2.0
+
+        # SELL orders should be ignored
+        mock_sell = MagicMock()
+        mock_sell.side = OrderSide.SELL
+        mock_sell.price.as_double.return_value = 0.97
+        mock_sell.leaves_qty.as_double.return_value = 5.0
+
+        strategy.cache.orders_open.return_value = [mock_order1, mock_order2, mock_sell]
+
+        # No positions — only pending buys count
+        result = strategy._total_capital_at_risk()
+        # 85*3 + 80*2 = 255 + 160 = 415
+        assert result == 415
+
+    def test_capital_at_risk_counts_positions(self):
+        """_total_capital_at_risk counts held positions at max_cost_cents."""
+        strategy = _make_strategy(max_cost_cents=92, max_total_deployed_cents=1000)
+
+        # No open orders
+        strategy.cache.orders_open.return_value = []
+
+        # Two held positions
+        strategy._positions_info["KXHIGHCHI-26MAR15-T55"] = {
+            "side": "no", "contracts": 5, "city": "chicago", "threshold": 55,
+        }
+        strategy._positions_info["KXHIGHCHI-26MAR15-T60"] = {
+            "side": "no", "contracts": 3, "city": "chicago", "threshold": 60,
+        }
+
+        result = strategy._total_capital_at_risk()
+        # 5*92 + 3*92 = 460 + 276 = 736
+        assert result == 736
+
+    def test_capital_at_risk_combined(self):
+        """_total_capital_at_risk sums both pending orders and held positions."""
+        strategy = _make_strategy(max_cost_cents=92, max_total_deployed_cents=2000)
+
+        mock_order = MagicMock()
+        mock_order.side = OrderSide.BUY
+        mock_order.price.as_double.return_value = 0.80
+        mock_order.leaves_qty.as_double.return_value = 2.0
+        strategy.cache.orders_open.return_value = [mock_order]
+
+        strategy._positions_info["KXHIGHCHI-26MAR15-T55"] = {
+            "side": "no", "contracts": 3, "city": "chicago", "threshold": 55,
+        }
+
+        result = strategy._total_capital_at_risk()
+        # Orders: 80*2 = 160. Positions: 3*92 = 276. Total = 436
+        assert result == 436
+
+    def test_capital_cap_ladder_partial_fill(self):
+        """Capital cap truncates ladder mid-loop when budget runs out."""
+        strategy = _make_strategy(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0, 2, 5),
+            stable_size=2,
+            max_cost_cents=92,
+            max_total_deployed_cents=300,
+        )
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(80, 82)
+
+        # No pending orders, no positions → 0c at risk
+        # Budget = 300c. Ladder offsets: 80*2=160c, 78*2=156c, 75*2=150c
+        # First rung: 160c → remaining 140c. Second rung: 156c > 140c → break.
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        # Only 1 rung should place (160c fits in 300c, 156c doesn't fit in 140c)
+        assert strategy.submit_order.call_count == 1

@@ -92,8 +92,10 @@ def convert_sessions(catalog_path: Path, session_ids: list[str] | None = None) -
 def load_climate_events(parquet_path: Path) -> list[ClimateEvent]:
     """Load climate events from parquet exported by kalshi-weather."""
     if not parquet_path.exists():
-        log.warning(f"No climate events at {parquet_path}")
-        return []
+        raise FileNotFoundError(
+            f"Climate events file not found: {parquet_path}. "
+            f"Run inject_live_forecasts.py to generate it."
+        )
 
     table = pq.read_table(str(parquet_path))
     df = table.to_pandas()
@@ -119,8 +121,7 @@ def load_model_signals(parquet_path: Path) -> list:
     from data_types import ModelSignal
 
     if not parquet_path.exists():
-        log.warning(f"No model signals at {parquet_path}")
-        return []
+        raise FileNotFoundError(f"Model signals file not found: {parquet_path}.")
 
     table = pq.read_table(str(parquet_path))
     df = table.to_pandas()

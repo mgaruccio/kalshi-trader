@@ -58,6 +58,9 @@ class WeatherStrategyConfig(StrategyConfig, frozen=True):
     # Cost ceiling
     max_cost_cents: int = 92              # never buy above this price
 
+    # Portfolio-level capital guard
+    max_total_deployed_cents: int = 0     # 0 = disabled; e.g. 2500 = $25 cap
+
     # Global (unchanged)
     max_position_per_ticker: int = 20
     danger_exit_enabled: bool = True
@@ -101,6 +104,8 @@ class WeatherStrategy(Strategy):
         # Counters
         self._signals_received: int = 0
         self._alerts_received: int = 0
+        self._spread_orders_placed: int = 0
+        self._stable_orders_placed: int = 0
         self._feature_actor = None  # set after construction
 
     def set_feature_actor(self, actor):
@@ -265,6 +270,17 @@ class WeatherStrategy(Strategy):
             self.log.warning(f"Instrument {instrument_id} not in cache, skipping Phase 1")
             return
 
+        # Capital cap check
+        if self._cfg.max_total_deployed_cents > 0:
+            at_risk = self._total_capital_at_risk()
+            spread_cost = sum(self._cfg.open_spread_prices_cents) * self._cfg.open_spread_size
+            if at_risk + spread_cost > self._cfg.max_total_deployed_cents:
+                self.log.info(
+                    f"Skip Phase1 {signal.ticker}: capital cap "
+                    f"({at_risk}c + {spread_cost}c > {self._cfg.max_total_deployed_cents}c)"
+                )
+                return
+
         order_ids = []
         for price_cents in self._cfg.open_spread_prices_cents:
             price = instrument.make_price(price_cents / 100.0)
@@ -278,6 +294,7 @@ class WeatherStrategy(Strategy):
             )
             self.submit_order(order)
             order_ids.append(order.client_order_id)
+            self._spread_orders_placed += 1
             self.log.info(
                 f"Phase1 spread: {signal.ticker} {signal.side} "
                 f"p_win={signal.p_win:.3f} price={price_cents}c qty={self._cfg.open_spread_size}"
@@ -348,6 +365,18 @@ class WeatherStrategy(Strategy):
             self.log.info(f"Skip ladder {ticker}: no capacity (pos={current_contracts}, pending={pending})")
             return
 
+        # Capital cap: compute remaining budget
+        if self._cfg.max_total_deployed_cents > 0:
+            at_risk = self._total_capital_at_risk()
+            remaining_budget = self._cfg.max_total_deployed_cents - at_risk
+            if remaining_budget <= 0:
+                self.log.info(
+                    f"Skip ladder {ticker}: capital cap reached ({at_risk}c >= {self._cfg.max_total_deployed_cents}c)"
+                )
+                return
+        else:
+            remaining_budget = float('inf')
+
         order_ids = []
         for offset in self._cfg.stable_ladder_offsets_cents:
             price_cents = max(1, bid_cents - offset)
@@ -357,6 +386,12 @@ class WeatherStrategy(Strategy):
             price = instrument.make_price(price_cents / 100.0)
             size = min(self._cfg.stable_size, max(0, capacity))
             if size <= 0:
+                break
+            order_cost = price_cents * size
+            if order_cost > remaining_budget:
+                self.log.info(
+                    f"Ladder cap: {ticker} budget={remaining_budget}c < order={order_cost}c"
+                )
                 break
             qty = instrument.make_qty(size)
             order = self.order_factory.limit(
@@ -368,15 +403,38 @@ class WeatherStrategy(Strategy):
             )
             self.submit_order(order)
             order_ids.append(order.client_order_id)
+            self._stable_orders_placed += 1
             self.log.info(
                 f"Phase2 ladder: {ticker} {signal.side} "
                 f"p_win={signal.p_win:.3f} bid={bid_cents}c offset={offset}c price={price_cents}c qty={size}"
             )
             capacity -= size
+            remaining_budget -= order_cost
 
         if order_ids:
             self._ladder_orders.setdefault(ticker, []).extend(order_ids)
             self._last_ladder_bid[ticker] = bid_cents
+
+    def _total_capital_at_risk(self) -> int:
+        """Conservative estimate of deployed capital in cents.
+
+        Sums:
+        - Pending buy orders: price_cents * leaves_qty for all open BUY orders
+        - Held positions: contracts * max_cost_cents (conservative, since we
+          don't track actual fill prices)
+        """
+        total = 0
+        # Pending buy orders
+        open_orders = self.cache.orders_open(strategy_id=self.id)
+        for order in open_orders:
+            if order.side == OrderSide.BUY:
+                price_cents = int(round(order.price.as_double() * 100))
+                leaves = int(order.leaves_qty.as_double())
+                total += price_cents * leaves
+        # Held positions
+        for info in self._positions_info.values():
+            total += info.get("contracts", 0) * self._cfg.max_cost_cents
+        return total
 
     def _count_pending_buys(self, instrument_id: InstrumentId) -> int:
         """Count contracts in outstanding BUY orders for an instrument."""

@@ -230,8 +230,12 @@ class TestFeatureActorLogic:
 
         assert len(actor._published) == 0
 
-    def test_model_timer_publishes_signals(self):
-        """Model timer should publish ModelSignal for cities with positions."""
+    def test_model_timer_no_models_no_signals(self):
+        """Model timer without scoring functions should not emit signals.
+
+        Previously this emitted p_win=0.0 signals. After the silent-failure
+        fix, no signal is emitted when scoring is unavailable.
+        """
         actor = self._make_actor()
         actor._city_features[("chicago", "2026-03-10")] = CityFeatureState()
         actor._city_features[("chicago", "2026-03-10")].update(
@@ -243,9 +247,7 @@ class TestFeatureActorLogic:
         actor._on_model_timer(MagicMock())
 
         signals = [s for s in actor._published if isinstance(s, ModelSignal)]
-        assert len(signals) == 1
-        assert signals[0].ticker == "KXHIGHCHI-26MAR10-T55"
-        assert signals[0].city == "chicago"
+        assert len(signals) == 0
 
     def test_model_timer_no_positions_no_signals(self):
         """No signals when no positions are held."""
@@ -303,8 +305,8 @@ class TestFeatureActorLogic:
         actor._on_model_timer(MagicMock())
         assert len(actor._published) == 0
 
-    def test_model_timer_multiple_tickers_same_city_date(self):
-        """Model timer should publish one signal per ticker."""
+    def test_model_timer_multiple_tickers_no_models_no_signals(self):
+        """Without scoring functions, no signals emitted even with multiple tickers."""
         actor = self._make_actor()
         actor._city_features[("chicago", "2026-03-10")] = CityFeatureState()
         actor._city_features[("chicago", "2026-03-10")].update(
@@ -317,9 +319,7 @@ class TestFeatureActorLogic:
         actor._on_model_timer(MagicMock())
 
         signals = [s for s in actor._published if isinstance(s, ModelSignal)]
-        assert len(signals) == 2
-        tickers = {s.ticker for s in signals}
-        assert tickers == {"KXHIGHCHI-26MAR10-T55", "KXHIGHCHI-26MAR10-T60"}
+        assert len(signals) == 0
 
     def test_non_climate_data_ignored(self):
         """on_data should ignore non-ClimateEvent data."""

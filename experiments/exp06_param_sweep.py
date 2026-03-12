@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path.home() / "code/kalshi-trader"))
 sys.path.insert(0, str(Path.home() / "code/altmarkets/kalshi-weather/src"))
 
 CLIMATE_EVENTS = Path.home() / "code/altmarkets/kalshi-weather/data/climate_events.parquet"
+MODEL_SIGNALS = Path.home() / "code/kalshi-trader/data/model_signals.parquet"
 CATALOG_FULL = Path.home() / "code/kalshi-trader/kalshi_data_catalog"
 CATALOG_THIN = Path.home() / "code/kalshi-trader/kalshi_data_catalog_thin"
 RESULTS_PATH = Path.home() / "code/kalshi-trader/data/sweep_results.json"
@@ -50,6 +51,7 @@ def run_single(args: dict) -> dict:
             starting_balance_usd=args["balance"],
             strategy_config=args["strategy_config"],
             actor_config=args["actor_config"],
+            model_signals_path=args.get("model_signals_path"),
         )
         elapsed = time.monotonic() - t0
 
@@ -140,34 +142,39 @@ def run_batch(args: dict) -> list[dict]:
 def build_grid(full: bool = False, catalog_path: Path = CATALOG_THIN) -> list[dict]:
     """Build the parameter grid.
 
-    Phase 1 (default): 27 configs — sweep entry thresholds with fixed sell_target=97.
+    Default: 27 configs — sweep p_win threshold, cost ceiling, and position size.
     Full: 81 configs — also sweep sell_target_cents.
+
+    All configs disable Phase 1 (open spread) and enforce $25 capital cap
+    on a $30 account.
     """
-    spread_min_pw_values = [0.90, 0.93, 0.95]
-    stable_min_pw_values = [0.93, 0.95, 0.97]
-    stable_max_cost_values = [94, 96, 98]
+    stable_min_pw_values = [0.90, 0.93, 0.95]
+    max_cost_values = [94, 96, 98]
+    stable_size_values = [1, 3, 5]
     sell_target_values = [96, 97, 98] if full else [97]
 
     grid = []
-    for spread_pw, stable_pw, max_cost, sell_tgt in product(
-        spread_min_pw_values,
+    for stable_pw, max_cost, size, sell_tgt in product(
         stable_min_pw_values,
-        stable_max_cost_values,
+        max_cost_values,
+        stable_size_values,
         sell_target_values,
     ):
         strategy_config = {
-            "open_spread_min_p_win": spread_pw,
             "stable_min_p_win": stable_pw,
-            "stable_max_cost_cents": max_cost,
+            "max_cost_cents": max_cost,
+            "stable_size": size,
             "sell_target_cents": sell_tgt,
-            "no_only": True,
+            "open_spread_enabled": False,
+            "max_total_deployed_cents": 2500,
         }
-        label = f"sp{spread_pw:.2f}_st{stable_pw:.2f}_mc{max_cost}_st{sell_tgt}"
+        label = f"pw{stable_pw:.2f}_mc{max_cost}_sz{size}_st{sell_tgt}"
         grid.append({
             "label": label,
             "climate_events_path": CLIMATE_EVENTS,
+            "model_signals_path": MODEL_SIGNALS if MODEL_SIGNALS.exists() else None,
             "catalog_path": catalog_path,
-            "balance": 100,
+            "balance": 30,
             "strategy_config": strategy_config,
             "actor_config": {"model_cycle_seconds": 900},
         })
@@ -180,23 +187,24 @@ def print_results_table(results: list[dict]) -> None:
     results.sort(key=lambda r: r.get("expected_pnl", r["pnl"]), reverse=True)
 
     header = (
-        f"{'spread_pw':>10} {'stable_pw':>10} {'max_cost':>9} {'sell_tgt':>9} | "
+        f"{'min_pw':>8} {'max_cost':>9} {'size':>5} {'sell_tgt':>9} | "
         f"{'Cash':>8} {'E[PnL]':>8} {'Cost':>7} {'Ctrs':>5} {'Fills':>6} {'Time':>6}"
     )
-    print("\n" + "=" * 95)
+    print("\n" + "=" * 85)
     print("SWEEP RESULTS (sorted by expected PnL)")
     print("  Cash = realized cash P&L | E[PnL] = expected if all open NO settle at $1")
-    print("=" * 95)
+    print(f"  Balance: $30 | Capital cap: $25 | Phase 1 disabled")
+    print("=" * 85)
     print(header)
-    print("-" * 95)
+    print("-" * 85)
 
     for r in results:
         if r["error"]:
             cfg = r["strategy_config"]
             print(
-                f"{cfg.get('open_spread_min_p_win', '?'):>10} "
-                f"{cfg.get('stable_min_p_win', '?'):>10} "
-                f"{cfg.get('stable_max_cost_cents', '?'):>9} "
+                f"{cfg.get('stable_min_p_win', '?'):>8} "
+                f"{cfg.get('max_cost_cents', '?'):>9} "
+                f"{cfg.get('stable_size', '?'):>5} "
                 f"{cfg.get('sell_target_cents', '?'):>9} | "
                 f"{'ERROR':>8}"
             )
@@ -204,9 +212,9 @@ def print_results_table(results: list[dict]) -> None:
 
         cfg = r["strategy_config"]
         print(
-            f"{cfg['open_spread_min_p_win']:>10.2f} "
-            f"{cfg['stable_min_p_win']:>10.2f} "
-            f"{cfg['stable_max_cost_cents']:>9} "
+            f"{cfg['stable_min_p_win']:>8.2f} "
+            f"{cfg['max_cost_cents']:>9} "
+            f"{cfg['stable_size']:>5} "
             f"{cfg['sell_target_cents']:>9} | "
             f"{r['pnl']:>8.2f} {r.get('expected_pnl', 0):>8.2f} "
             f"{r.get('total_cost', 0):>7.2f} {r.get('total_contracts', 0):>5} "
@@ -254,7 +262,7 @@ def main():
     print(f"Parameter sweep: {len(grid)} configs, {args.workers} workers, {tick_mode}")
     print(f"Climate events: {CLIMATE_EVENTS}")
     print(f"Catalog: {catalog_path}")
-    print(f"Starting balance: $100")
+    print(f"Starting balance: $30")
 
     if args.dry_run:
         for g in grid:

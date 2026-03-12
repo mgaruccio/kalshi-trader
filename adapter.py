@@ -90,8 +90,10 @@ def _get_ticker_and_side(instrument_id: InstrumentId):
     elif val.endswith("-NO"):
         return val[:-3], "no"
     else:
-        log.error(f"Cannot parse side from {val}, defaulting YES — THIS IS DANGEROUS")
-        return val, "yes"  # fallback
+        raise ValueError(
+            f"Cannot parse side from instrument {val!r}. "
+            f"Expected suffix '-YES' or '-NO'."
+        )
 
 
 class KalshiDataClient(LiveMarketDataClient):
