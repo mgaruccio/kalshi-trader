@@ -94,6 +94,7 @@ class WeatherStrategy(Strategy):
         self._resting_sells: dict[str, list] = {}  # ticker -> list of ClientOrderId
         self._eligible_signals: dict[str, ModelSignal] = {}  # ticker -> qualifying signal
         self._ladder_deployed: set[str] = set()  # tickers with at least one successful ladder
+        self._ticks_since_refresh: int = 0  # quote ticks received since last refresh
 
         # Counters
         self._signals_received: int = 0
@@ -144,6 +145,7 @@ class WeatherStrategy(Strategy):
         """
         key = tick.instrument_id.value
         self._latest_quotes[key] = tick
+        self._ticks_since_refresh += 1
 
         # Extract ticker from instrument ID (e.g. "KXHIGHCHI-26MAR10-T64-NO.KALSHI" -> "KXHIGHCHI-26MAR10-T64")
         # Only check NO instruments (we're NO-only)
@@ -534,6 +536,12 @@ class WeatherStrategy(Strategy):
             self.log.info("Back-off window: cancelling all resting buy orders")
             self._cancel_all_resting_buys()
             return
+
+        # Skip refresh if no new ticks since last refresh — prevents
+        # churn during BacktestNode timer bursts at chunk boundaries
+        if self._ticks_since_refresh == 0:
+            return
+        self._ticks_since_refresh = 0
 
         # Refresh ladder for each eligible signal
         for ticker, signal in list(self._eligible_signals.items()):

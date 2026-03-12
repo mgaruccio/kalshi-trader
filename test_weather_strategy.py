@@ -69,6 +69,7 @@ class _TestableWeatherStrategy:
         self._resting_sells: dict = {}
         self._eligible_signals: dict = {}
         self._ladder_deployed: set = set()
+        self._ticks_since_refresh: int = 0
         # Counters
         self._signals_received: int = 0
         self._alerts_received: int = 0
@@ -713,6 +714,8 @@ class TestPeriodicRefresh:
         # Active trading hour: 15 UTC (outside back-off window [7, 14))
         strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
+        # Simulate ticks having arrived so refresh doesn't skip
+        strategy._ticks_since_refresh = 1
         return strategy
 
     def test_refresh_redeploys_ladder_for_eligible_signals(self):
@@ -862,6 +865,7 @@ class TestBackoffWindow:
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(ticker=ticker, p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+        strategy._ticks_since_refresh = 1
 
         strategy._on_refresh()
         strategy.submit_order.assert_called()
