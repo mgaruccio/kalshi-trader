@@ -1010,8 +1010,8 @@ class TestGlobalRebalance:
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
-    def test_refresh_always_redeploys(self):
-        """Refresh always cancels and redeploys, even when bid is unchanged."""
+    def test_refresh_skips_unchanged_bid(self):
+        """Refresh is idempotent — skips tickers whose bid hasn't changed."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
@@ -1020,7 +1020,7 @@ class TestGlobalRebalance:
 
         strategy._on_refresh()
 
-        strategy.submit_order.assert_called()
+        strategy.submit_order.assert_not_called()
 
     def test_refresh_redeploys_when_bid_changes(self):
         """Refresh should cancel and redeploy when bid has moved."""
@@ -1083,6 +1083,29 @@ class TestGlobalRebalance:
 
         assert "KXHIGHSFO-26MAR15-T71" in strategy._ladder_orders
         assert "KXHIGHNY-26MAR15-T52" not in strategy._ladder_orders
+
+    def test_repeated_refresh_no_order_accumulation(self):
+        """Multiple refreshes at same bid must NOT accumulate orders."""
+        strategy = self._make_refresh_strategy(
+            stable_ladder_offsets_cents=(0, 2),
+            stable_size=2,
+        )
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+
+        # First refresh: deploys ladder (2 offsets → 2 orders)
+        strategy._on_refresh()
+        first_count = strategy.submit_order.call_count
+        assert first_count == 2
+
+        # Second refresh: bid unchanged → idempotent, zero new orders
+        strategy._on_refresh()
+        assert strategy.submit_order.call_count == first_count
+
+        # Third refresh: still unchanged
+        strategy._on_refresh()
+        assert strategy.submit_order.call_count == first_count
 
     def test_evaluate_entry_stores_only(self):
         """_evaluate_entry stores signal but does not place orders."""

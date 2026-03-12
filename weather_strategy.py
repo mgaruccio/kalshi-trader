@@ -317,10 +317,12 @@ class WeatherStrategy(Strategy):
                        budget_remaining: int | None = None) -> int:
         """Place Phase 2 ladder buy orders relative to current bid.
 
+        Idempotent: skips if bid unchanged since last deployment. If bid
+        changed, cancels old ladder for this ticker before redeploying.
+
         Args:
-            budget_remaining: If provided, use this instead of querying
-                cache.orders_open() for capital/capacity checks. Used by
-                _on_refresh to avoid counting async-cancelled orders.
+            budget_remaining: If provided, use this for capital cap instead
+                of querying cache (avoids async lag on recently-cancelled orders).
 
         Returns:
             Total cents deployed (for caller budget tracking).
@@ -333,6 +335,14 @@ class WeatherStrategy(Strategy):
 
         bid_cents = int(round(quote.bid_price.as_double() * 100))
 
+        # Idempotent: skip if bid unchanged since last deployment
+        if self._last_ladder_bid.get(ticker) == bid_cents:
+            return 0
+
+        # Bid changed — cancel old ladder for THIS ticker before redeploying
+        if ticker in self._ladder_orders:
+            self._cancel_ladder_orders(ticker)
+
         instrument_id = InstrumentId(
             Symbol(f"{ticker}-{signal.side.upper()}"),
             KALSHI_VENUE,
@@ -342,17 +352,11 @@ class WeatherStrategy(Strategy):
             self.log.warning(f"Instrument {instrument_id} not in cache, skipping Phase 2")
             return 0
 
-        # Check remaining capacity
+        # Check remaining capacity (positions only — pending buys for this
+        # ticker were just cancelled, others are tracked via budget_remaining)
         existing = self._positions_info.get(ticker, {})
         current_contracts = existing.get("contracts", 0)
         capacity = self._cfg.max_position_per_ticker - current_contracts
-
-        if budget_remaining is None:
-            # Standalone call — query cache for pending orders
-            pending = self._count_pending_buys(instrument_id)
-            capacity -= pending
-        # else: rebalance mode — all buys just cancelled, skip cache query
-
         if capacity <= 0:
             self.log.info(f"Skip ladder {ticker}: no capacity (pos={current_contracts})")
             return 0
@@ -633,23 +637,22 @@ class WeatherStrategy(Strategy):
         )
 
     def _on_refresh(self, event=None):
-        """Periodic global rebalance: cancel all → sort cheapest → redeploy.
+        """Periodic refresh: sort cheapest-first, deploy idempotently.
 
-        Ensures capital flows to the cheapest available contracts rather than
-        being locked into whichever tickers were scored first.
+        First refresh after signals arrive deploys cheapest contracts first.
+        Subsequent refreshes are idempotent — _deploy_ladder skips tickers
+        whose bid hasn't changed, only cancelling+redeploying per-ticker
+        when the bid moves. No mass cancel-all (async cancel lag causes
+        phantom order accumulation in live trading).
         """
         if self._is_backoff_window():
             self.log.info("Back-off window: cancelling all resting buy orders")
             self._cancel_all_resting_buys()
             return
 
-        # 1. Cancel ALL existing ladder buy orders
-        for ticker in list(self._ladder_orders.keys()):
-            self._cancel_ladder_orders(ticker)
-        self._last_ladder_bid.clear()
-
-        # 2. Collect candidates with current bids
+        # 1. Collect candidates with current bids
         candidates = []
+        desired_tickers = set()
         for ticker, signal in list(self._eligible_signals.items()):
             if ticker in self._danger_exited:
                 continue
@@ -659,25 +662,38 @@ class WeatherStrategy(Strategy):
                 continue
             bid_cents = int(round(quote.bid_price.as_double() * 100))
             candidates.append((bid_cents, ticker, signal))
+            desired_tickers.add(ticker)
 
-        # 3. Sort cheapest first — capital flows to best-value contracts
+        # 2. Cancel ladders for tickers no longer eligible
+        for ticker in list(self._ladder_orders.keys()):
+            if ticker not in desired_tickers:
+                self._cancel_ladder_orders(ticker)
+                self._last_ladder_bid.pop(ticker, None)
+
+        # 3. Sort cheapest first (matters for initial budget allocation)
         candidates.sort(key=lambda x: x[0])
 
-        # 4. Compute budget from positions only (all buy orders are being cancelled,
-        #    but cache still shows them until exchange confirms — don't query cache)
+        # 4. Compute budget: positions + existing kept ladders (bid unchanged)
+        #    are already deployed. Only new/changed deployments consume budget.
         if self._cfg.max_total_deployed_cents > 0:
             position_cost = sum(
                 info.get("contracts", 0) * self._cfg.max_cost_cents
                 for info in self._positions_info.values()
             )
-            remaining_budget = self._cfg.max_total_deployed_cents - position_cost
+            # Estimate cost of ladders we're keeping (bid unchanged → idempotent skip)
+            kept_cost = 0
+            for bid_cents, ticker, signal in candidates:
+                if self._last_ladder_bid.get(ticker) == bid_cents:
+                    order_count = len(self._ladder_orders.get(ticker, []))
+                    kept_cost += order_count * bid_cents * self._cfg.stable_size
+            remaining_budget = self._cfg.max_total_deployed_cents - position_cost - kept_cost
         else:
             remaining_budget = None  # disabled
 
-        # 5. Deploy in order, tracking budget ourselves
+        # 5. Deploy cheapest first — _deploy_ladder handles idempotency
+        #    (skips unchanged bids, cancels per-ticker on bid change)
         for bid_cents, ticker, signal in candidates:
             if remaining_budget is not None and remaining_budget <= 0:
-                self.log.info(f"Rebalance budget exhausted, {len(candidates)} candidates remaining")
                 break
             deployed = self._deploy_ladder(ticker, signal, budget_remaining=remaining_budget)
             if remaining_budget is not None:
