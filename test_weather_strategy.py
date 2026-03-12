@@ -68,6 +68,7 @@ class _TestableWeatherStrategy:
         self._ladder_orders: dict = {}
         self._resting_sells: dict = {}
         self._eligible_signals: dict = {}
+        self._ladder_deployed: set = set()
         # Counters
         self._signals_received: int = 0
         self._alerts_received: int = 0

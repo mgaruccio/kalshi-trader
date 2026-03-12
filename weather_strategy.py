@@ -93,6 +93,7 @@ class WeatherStrategy(Strategy):
         self._ladder_orders: dict[str, list] = {}  # ticker -> list of ClientOrderId
         self._resting_sells: dict[str, list] = {}  # ticker -> list of ClientOrderId
         self._eligible_signals: dict[str, ModelSignal] = {}  # ticker -> qualifying signal
+        self._ladder_deployed: set[str] = set()  # tickers with at least one successful ladder
 
         # Counters
         self._signals_received: int = 0
@@ -135,8 +136,25 @@ class WeatherStrategy(Strategy):
             self._evaluate_exit(data)
 
     def on_quote_tick(self, tick: QuoteTick):
-        """Track latest quotes for ladder pricing."""
-        self._latest_quotes[tick.instrument_id.value] = tick
+        """Track latest quotes for ladder pricing.
+
+        On first quote for an eligible ticker that hasn't had a ladder deployed,
+        trigger deployment. This handles the case where signals arrive before
+        quotes (e.g., BacktestNode chunk boundary ordering).
+        """
+        key = tick.instrument_id.value
+        self._latest_quotes[key] = tick
+
+        # Extract ticker from instrument ID (e.g. "KXHIGHCHI-26MAR10-T64-NO.KALSHI" -> "KXHIGHCHI-26MAR10-T64")
+        # Only check NO instruments (we're NO-only)
+        if "-NO." not in key:
+            return
+        ticker = key.split("-NO.")[0]
+        if ticker in self._ladder_deployed or ticker in self._danger_exited:
+            return
+        signal = self._eligible_signals.get(ticker)
+        if signal is not None:
+            self._deploy_ladder(ticker, signal)
 
     def _quote_key(self, ticker: str, side: str) -> str:
         """Build the canonical quote cache key matching on_quote_tick storage."""
@@ -341,6 +359,7 @@ class WeatherStrategy(Strategy):
 
         if order_ids:
             self._ladder_orders.setdefault(ticker, []).extend(order_ids)
+            self._ladder_deployed.add(ticker)
 
     def _count_pending_buys(self, instrument_id: InstrumentId) -> int:
         """Count contracts in outstanding BUY orders for an instrument."""
