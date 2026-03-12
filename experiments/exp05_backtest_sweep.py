@@ -44,6 +44,66 @@ SWEEP_MAX_COST = [88, 92, 96]
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
+# Observed high temps (Open-Meteo archive, °F) for settlement simulation
+OBSERVED_HIGHS = {
+    ("chicago", "2026-03-10"): 61, ("chicago", "2026-03-11"): 44,
+    ("phoenix", "2026-03-10"): 75, ("phoenix", "2026-03-11"): 82,
+    ("los_angeles", "2026-03-10"): 65, ("los_angeles", "2026-03-11"): 68,
+    ("san_francisco", "2026-03-10"): 60, ("san_francisco", "2026-03-11"): 72,
+    ("new_york", "2026-03-10"): 76, ("new_york", "2026-03-11"): 73,
+    ("oklahoma_city", "2026-03-10"): 79, ("oklahoma_city", "2026-03-11"): 68,
+    ("houston", "2026-03-10"): 82, ("houston", "2026-03-11"): 78,
+    ("minneapolis", "2026-03-10"): 42, ("minneapolis", "2026-03-11"): 37,
+    ("denver", "2026-03-10"): 68, ("denver", "2026-03-11"): 48,
+    ("miami", "2026-03-10"): 84, ("miami", "2026-03-11"): 84,
+    ("philadelphia", "2026-03-10"): 78, ("philadelphia", "2026-03-11"): 76,
+    ("austin", "2026-03-10"): 80, ("austin", "2026-03-11"): 80,
+}
+
+
+def _settle_position(inst_str: str, avg_open: float) -> float | None:
+    """Compute settlement PnL for an open position.
+
+    Returns PnL in dollars, or None if we can't determine settlement.
+    For KXHIGH above-threshold contracts:
+    - YES settles at $1.00 if observed >= threshold, else $0.00
+    - NO settles at $1.00 if observed < threshold, else $0.00
+    """
+    from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
+
+    # Parse "KXHIGHCHI-26MAR10-T64-NO.KALSHI" → ticker + side
+    clean = inst_str.replace(".KALSHI", "")
+    if clean.endswith("-YES"):
+        ticker, side = clean[:-4], "yes"
+    elif clean.endswith("-NO"):
+        ticker, side = clean[:-3], "no"
+    else:
+        return None
+
+    parsed = parse_ticker(ticker)
+    if not parsed:
+        return None
+
+    series_to_city = {s: c for s, c in SERIES_CONFIG}
+    city = series_to_city.get(parsed["series"], "")
+    threshold = parsed["threshold"]
+    settle_date = parsed["settlement_date"]
+
+    observed = OBSERVED_HIGHS.get((city, settle_date))
+    if observed is None:
+        return None
+
+    # Did temp exceed threshold?
+    exceeded = observed >= threshold
+
+    # Settlement value
+    if side == "yes":
+        settle_price = 1.0 if exceeded else 0.0
+    else:
+        settle_price = 0.0 if exceeded else 1.0
+
+    return settle_price - avg_open
+
 
 # ---------------------------------------------------------------------------
 # Result extraction helpers
@@ -67,6 +127,10 @@ def _extract_results(engine) -> dict:
         "balance": None,
         "realized_pnl": 0.0,
         "unrealized_cost": 0.0,
+        "settlement_pnl": 0.0,
+        "total_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
     }
 
     strategies = list(engine.trader.strategies())
@@ -114,9 +178,24 @@ def _extract_results(engine) -> dict:
         results["realized_pnl"] = realized
 
         cost = 0.0
+        settlement = 0.0
+        wins = 0
+        losses = 0
         for p in opened:
             cost += p.avg_px_open * abs(p.signed_qty)
+            # Simulate settlement for open positions
+            pnl = _settle_position(str(p.instrument_id), p.avg_px_open)
+            if pnl is not None:
+                settlement += pnl * abs(p.signed_qty)
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
         results["unrealized_cost"] = cost
+        results["settlement_pnl"] = settlement
+        results["total_pnl"] = realized + settlement
+        results["wins"] = len(closed) + wins  # profit-target exits are wins
+        results["losses"] = losses
     except Exception as e:
         log.warning(f"Could not inspect positions: {e}")
 
@@ -209,8 +288,10 @@ def run_phase_a():
     print("\n--- Positions ---")
     print(f"  Open                  : {r['positions_open']}")
     print(f"  Closed                : {r['positions_closed']}")
-    print(f"  Realized PnL          : ${r['realized_pnl']:.2f}")
-    print(f"  Unrealized cost       : ${r['unrealized_cost']:.2f}")
+    print(f"  Realized PnL (exits)  : ${r['realized_pnl']:.2f}")
+    print(f"  Settlement PnL (sim)  : ${r['settlement_pnl']:.2f}")
+    print(f"  Total PnL             : ${r['total_pnl']:.2f}")
+    print(f"  Wins / Losses         : {r['wins']} / {r['losses']}")
 
     print("\n--- Account ---")
     if r["balance"] is not None:
@@ -246,9 +327,12 @@ def run_phase_a():
 def _run_single_combo(catalog, min_pw, max_cost, sell_target):
     """Run one backtest combo in a subprocess (NT Rust logger can't reinitialize)."""
     import subprocess, json as _json
+    # Use the exp05 module path so subprocess can import _settle_position
+    exp05_path = str(Path(__file__).resolve())
     script = f"""
 import sys, json, logging
 sys.path.insert(0, '.')
+sys.path.insert(0, '{Path(__file__).resolve().parent}')
 logging.basicConfig(level=logging.WARNING)
 from pathlib import Path
 from backtest_runner import run_backtest
@@ -261,8 +345,15 @@ engine = run_backtest(
     model_signals_path=Path('{MODEL_SIGNALS}'),
 )
 
-# Extract results inline
-r = {{"signals": 0, "buys": 0, "sells": 0, "positions_open": 0, "positions_closed": 0, "realized_pnl": 0.0, "balance": None}}
+# Import settlement from the sweep module
+import importlib.util
+spec = importlib.util.spec_from_file_location("exp05", "{exp05_path}")
+exp05 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(exp05)
+
+r = {{"signals": 0, "buys": 0, "sells": 0, "positions_open": 0, "positions_closed": 0,
+      "realized_pnl": 0.0, "settlement_pnl": 0.0, "total_pnl": 0.0,
+      "wins": 0, "losses": 0, "balance": None}}
 strats = list(engine.trader.strategies())
 if strats:
     r["signals"] = getattr(strats[0], "signals_received", 0)
@@ -281,8 +372,21 @@ try:
     closed = [p for p in positions if p.is_closed]
     opened = [p for p in positions if p.is_open]
     r["positions_closed"] = len(closed)
-    r["positions_open"] = len(opened)
-    r["realized_pnl"] = sum(p.realized_pnl.as_double() for p in closed)
+    realized = sum(p.realized_pnl.as_double() for p in closed)
+    r["realized_pnl"] = realized
+    settlement = 0.0
+    wins = 0
+    losses = 0
+    for p in opened:
+        pnl = exp05._settle_position(str(p.instrument_id), p.avg_px_open)
+        if pnl is not None:
+            settlement += pnl * abs(p.signed_qty)
+            if pnl > 0: wins += 1
+            elif pnl < 0: losses += 1
+    r["settlement_pnl"] = settlement
+    r["total_pnl"] = realized + settlement
+    r["wins"] = len(closed) + wins
+    r["losses"] = losses
 except: pass
 print("RESULT:" + json.dumps(r))
 """
@@ -315,7 +419,7 @@ def run_phase_b():
         print(f"ERROR: No catalog found at {catalog}")
         return
 
-    header = f"{'min_pw':>8}  {'max_cost':>8}  {'signals':>8}  {'buys':>5}  {'sells':>5}  {'open':>5}  {'closed':>6}  {'real_pnl':>9}  {'balance':>10}"
+    header = f"{'min_pw':>8}  {'max_cost':>8}  {'buys':>5}  {'W':>3}  {'L':>3}  {'total_pnl':>10}  {'exit_pnl':>9}  {'settle_pnl':>10}"
     sep = "-" * len(header)
     print(f"\n{header}")
     print(sep)
@@ -327,13 +431,13 @@ def run_phase_b():
                 if "error" in r:
                     print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {r['error'][:60]}")
                     continue
-                pnl = f"${r['realized_pnl']:+.2f}"
-                bal = f"${r['balance']:.2f}" if r.get("balance") is not None else "N/A"
+                total = f"${r['total_pnl']:+.2f}"
+                exits = f"${r['realized_pnl']:+.2f}"
+                settle = f"${r['settlement_pnl']:+.2f}"
                 print(
                     f"{min_pw:>8.2f}  {max_cost:>8}  "
-                    f"{r['signals']:>8,}  {r['buys']:>5}  {r['sells']:>5}  "
-                    f"{r['positions_open']:>5}  {r['positions_closed']:>6}  "
-                    f"{pnl:>9}  {bal:>10}"
+                    f"{r['buys']:>5}  {r['wins']:>3}  {r['losses']:>3}  "
+                    f"{total:>10}  {exits:>9}  {settle:>10}"
                 )
             except Exception as e:
                 print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {e}")

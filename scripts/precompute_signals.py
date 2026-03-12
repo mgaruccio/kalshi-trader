@@ -103,6 +103,31 @@ def get_first_tick_ns(catalog_path: Path) -> int | None:
     return None
 
 
+def get_per_instrument_first_tick(catalog_path: Path) -> dict[str, int]:
+    """Get first tick timestamp per instrument directory.
+
+    Returns {instrument_dir_name: first_tick_ns}.
+    Signals must arrive AFTER the instrument's first quote tick,
+    otherwise the strategy has no price to evaluate against.
+    """
+    qt_dir = catalog_path / "data" / "quote_tick"
+    result = {}
+    if not qt_dir.exists():
+        return result
+    for inst_dir in sorted(qt_dir.iterdir()):
+        if not inst_dir.is_dir():
+            continue
+        for f in sorted(inst_dir.glob("*.parquet")):
+            try:
+                col = pq.read_table(str(f), columns=["ts_event"]).column("ts_event")
+                if len(col) > 0:
+                    result[inst_dir.name] = int(col[0].as_py())
+                    break
+            except Exception:
+                continue
+    return result
+
+
 def load_city_features(climate_events_path: Path, cutoff_ns: int | None) -> dict[str, dict]:
     """Load climate events and merge features per city.
 
@@ -138,6 +163,10 @@ def main():
     first_ns = get_first_tick_ns(CATALOG_DIR)
     log.info(f"First tick ns: {first_ns}")
 
+    # Per-instrument first tick: signals must arrive AFTER quotes exist
+    inst_first_tick = get_per_instrument_first_tick(CATALOG_DIR)
+    log.info(f"Per-instrument first ticks: {len(inst_first_tick)} instruments")
+
     city_features = load_city_features(CLIMATE_EVENTS, first_ns)
     log.info(f"Loaded features for {len(city_features)} cities")
 
@@ -148,6 +177,7 @@ def main():
     n_accept = 0
     n_reject = 0
     n_skip = 0
+    SIGNAL_OFFSET_NS = 5_000_000_000  # 5 seconds after first quote
 
     for ticker in tickers:
         parsed = parse_ticker(ticker)
@@ -185,10 +215,16 @@ def main():
             n_skip += 1
             continue
 
-        # Offset signals 5 seconds after first tick so quotes are cached first
-        base_ts = (first_ns or 0) + 5_000_000_000
-
         for s in scores:
+            # Timestamp signal AFTER the instrument's first quote tick
+            # so the strategy has a price to evaluate against
+            inst_key = f"{ticker}-{s.side.upper()}.KALSHI"
+            inst_first = inst_first_tick.get(inst_key)
+            if inst_first is None:
+                n_skip += 1
+                continue
+            signal_ts = inst_first + SIGNAL_OFFSET_NS
+
             model_scores = {n: s.model_scores.get(n, 0.0) for n in names}
             rows.append({
                 "city": city,
@@ -197,8 +233,8 @@ def main():
                 "p_win": s.p_win,
                 "model_scores": json.dumps(model_scores),
                 "features_snapshot": json.dumps({}),  # not needed for backtest
-                "ts_event": base_ts,
-                "ts_init": base_ts,
+                "ts_event": signal_ts,
+                "ts_init": signal_ts,
             })
             if s.p_win >= 0.95:
                 n_accept += 1
