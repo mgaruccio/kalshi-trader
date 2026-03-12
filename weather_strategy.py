@@ -22,7 +22,7 @@ from datetime import date, timedelta, datetime, timezone
 
 from nautilus_trader.model.data import QuoteTick, DataType
 from nautilus_trader.model.events import OrderFilled
-from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
+from nautilus_trader.model.identifiers import InstrumentId, Symbol
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
@@ -30,8 +30,6 @@ from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
 
 from adapter import KALSHI_VENUE
 from data_types import ModelSignal, DangerAlert
-
-INTERNAL_CLIENT = ClientId("INTERNAL")
 
 log = logging.getLogger(__name__)
 
@@ -114,8 +112,13 @@ class WeatherStrategy(Strategy):
 
     def on_start(self):
         """Subscribe to ModelSignal, DangerAlert, and quote ticks. Start refresh timer."""
-        self.subscribe_data(DataType(ModelSignal), client_id=INTERNAL_CLIENT)
-        self.subscribe_data(DataType(DangerAlert), client_id=INTERNAL_CLIENT)
+        # Subscribe via msgbus directly — subscribe_data() requires client_id
+        # which doesn't exist for internal pub/sub in live TradingNode.
+        for dtype in (ModelSignal, DangerAlert):
+            self.msgbus.subscribe(
+                topic=f"data.{DataType(dtype).topic}",
+                handler=self.handle_data,
+            )
 
         # Subscribe to all cached instruments for quote ticks
         instruments = self.cache.instruments()

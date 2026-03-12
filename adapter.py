@@ -509,7 +509,7 @@ class KalshiExecutionClient(LiveExecutionClient):
                 self._executor, self._fetch_positions
             )
             ts = self._clock.timestamp_ns()
-            for pos in getattr(resp, "positions", []):
+            for pos in getattr(resp, "positions", None) or []:
                 if pos.position == 0:
                     continue
                 side = "YES" if pos.position > 0 else "NO"

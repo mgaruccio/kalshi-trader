@@ -22,8 +22,6 @@ sys.path.insert(0, f"{_KW_ROOT}/src")
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.model.data import DataType
-from nautilus_trader.model.identifiers import ClientId
-
 from data_types import ClimateEvent, ModelSignal, DangerAlert
 from exit_rules import CityFeatureState, check_exit_rules, should_exit
 
@@ -199,7 +197,13 @@ class FeatureActor(Actor):
 
     def on_start(self):
         """Subscribe to climate events and start model cycle timer."""
-        self.subscribe_data(DataType(ClimateEvent), client_id=ClientId("INTERNAL"))
+        # Subscribe via msgbus directly — subscribe_data() requires client_id
+        # which doesn't exist for internal pub/sub in live TradingNode.
+        # publish_data() publishes to "data.{DataType.topic}", so we match that.
+        self.msgbus.subscribe(
+            topic=f"data.{DataType(ClimateEvent).topic}",
+            handler=self.handle_data,
+        )
         self.clock.set_timer(
             "model_cycle",
             interval=timedelta(seconds=self._cfg.model_cycle_seconds),
