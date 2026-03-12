@@ -6,7 +6,15 @@ live TradingNode with Kalshi data + execution clients.
 """
 import argparse
 import logging
+import os
 import sys
+
+# kalshi_weather_ml is imported by weather_strategy and feature_actor at module
+# level. On the droplet, it's not pip-installed — it lives at $KALSHI_WEATHER_ROOT/src.
+# This must run before any imports that touch kalshi_weather_ml.
+_kw_root = os.environ.get("KALSHI_WEATHER_ROOT", "")
+if _kw_root:
+    sys.path.insert(0, f"{_kw_root}/src")
 
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.live.config import TradingNodeConfig, LiveDataClientConfig, LiveExecClientConfig
