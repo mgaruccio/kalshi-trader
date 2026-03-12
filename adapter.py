@@ -74,8 +74,8 @@ def _parse_ts(ts_raw, fallback_ns: int) -> int:
 class KalshiConfig(BaseSettings):
     api_key_id: str = ""
     private_key_path: str = ""
-    rest_host: str = "https://trading-api.kalshi.com/trade-api/v2"
-    ws_host: str = "wss://trading-api.kalshi.com/trade-api/ws/v2"
+    rest_host: str = "https://api.elections.kalshi.com/trade-api/v2"
+    ws_host: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     environment: str = "production"
 
     model_config = SettingsConfigDict(
@@ -701,22 +701,23 @@ class KalshiInstrumentProvider(InstrumentProvider):
                 pass
 
         try:
-            for st in series_tickers:
-                cursor = None
-                while True:
-                    resp = self.k_api.get_markets(
-                        limit=200, cursor=cursor, status="open",
-                        series_ticker=st,
-                    )
-                    for m in getattr(resp, "markets", None) or []:
-                        if m.status not in ("active", "open"):
-                            continue
-                        self.add(self._build_instrument(m, "YES"))
-                        self.add(self._build_instrument(m, "NO"))
+            for status in ("open", "unopened"):
+                for st in series_tickers:
+                    cursor = None
+                    while True:
+                        resp = self.k_api.get_markets(
+                            limit=200, cursor=cursor, status=status,
+                            series_ticker=st,
+                        )
+                        for m in getattr(resp, "markets", None) or []:
+                            if m.status not in ("active", "open", "unopened"):
+                                continue
+                            self.add(self._build_instrument(m, "YES"))
+                            self.add(self._build_instrument(m, "NO"))
 
-                    cursor = getattr(resp, "cursor", None)
-                    if not cursor:
-                        break
+                        cursor = getattr(resp, "cursor", None)
+                        if not cursor:
+                            break
         except Exception as e:
             self._api_healthy = False
             log.error(f"API failure during load_all — returning empty instrument list: {e}")

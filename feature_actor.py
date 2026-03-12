@@ -149,7 +149,7 @@ class FeatureActor(Actor):
 
     def on_start(self):
         """Subscribe to climate events and start model cycle timer."""
-        self.subscribe_data(DataType(ClimateEvent), client_id=ClientId("CLIMATE"))
+        self.subscribe_data(DataType(ClimateEvent), client_id=ClientId("INTERNAL"))
         self.clock.set_timer(
             "model_cycle",
             interval=timedelta(seconds=self._cfg.model_cycle_seconds),

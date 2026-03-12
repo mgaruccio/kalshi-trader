@@ -31,7 +31,7 @@ from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
 from adapter import KALSHI_VENUE
 from data_types import ModelSignal, DangerAlert
 
-CLIMATE_CLIENT = ClientId("CLIMATE")
+INTERNAL_CLIENT = ClientId("INTERNAL")
 
 log = logging.getLogger(__name__)
 
@@ -109,8 +109,8 @@ class WeatherStrategy(Strategy):
 
     def on_start(self):
         """Subscribe to ModelSignal, DangerAlert, and quote ticks. Start refresh timer."""
-        self.subscribe_data(DataType(ModelSignal), client_id=CLIMATE_CLIENT)
-        self.subscribe_data(DataType(DangerAlert), client_id=CLIMATE_CLIENT)
+        self.subscribe_data(DataType(ModelSignal), client_id=INTERNAL_CLIENT)
+        self.subscribe_data(DataType(DangerAlert), client_id=INTERNAL_CLIENT)
 
         # Subscribe to all cached instruments for quote ticks
         instruments = self.cache.instruments()
