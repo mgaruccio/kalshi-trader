@@ -22,8 +22,8 @@ from datetime import date, timedelta, datetime, timezone
 
 from nautilus_trader.model.data import QuoteTick, DataType
 from nautilus_trader.model.events import OrderFilled
-from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol, ClientOrderId
-from nautilus_trader.model.enums import OrderSide, TimeInForce, OrderStatus
+from nautilus_trader.model.identifiers import ClientId, InstrumentId, Symbol
+from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
@@ -144,12 +144,10 @@ class WeatherStrategy(Strategy):
 
     def _utc_now(self) -> datetime:
         """Return current UTC datetime from the strategy clock."""
-        ns = self.clock.utc_now()
-        # clock.utc_now() returns a datetime in NT; normalise to UTC-aware
-        if hasattr(ns, 'tzinfo') and ns.tzinfo is not None:
-            return ns.astimezone(timezone.utc)
-        # Fallback: treat as naive UTC
-        return ns.replace(tzinfo=timezone.utc) if hasattr(ns, 'replace') else datetime.now(timezone.utc)
+        dt = self.clock.utc_now()
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _today(self) -> date:
         """Return today's date in UTC."""
@@ -280,13 +278,12 @@ class WeatherStrategy(Strategy):
 
     def _cancel_spread_orders(self, ticker: str):
         """Cancel all outstanding Phase 1 spread buy orders for a ticker."""
-        order_ids = self._open_spread_orders.pop(ticker, [])
-        for oid in order_ids:
-            open_orders = self.cache.orders_open(strategy_id=self.id)
-            for order in open_orders:
-                if order.client_order_id == oid and order.side == OrderSide.BUY:
-                    self.cancel_order(order)
-                    self.log.info(f"Phase1 spread cancel: {ticker} order {oid}")
+        order_ids = set(self._open_spread_orders.pop(ticker, []))
+        open_orders = self.cache.orders_open(strategy_id=self.id)
+        for order in open_orders:
+            if order.client_order_id in order_ids and order.side == OrderSide.BUY:
+                self.cancel_order(order)
+                self.log.info(f"Phase1 spread cancel: {ticker} order {order.client_order_id}")
 
     def _deploy_ladder(self, ticker: str, signal: ModelSignal):
         """Place Phase 2 ladder buy orders relative to current bid."""

@@ -556,7 +556,7 @@ class TestPhase2StableLadder:
         strategy = _make_strategy(
             open_spread_enabled=False,
             stable_min_p_win=0.95,
-            stable_ladder_offsets_cents=(0, 2),
+            stable_ladder_offsets_cents=(0, 2, 5),
             stable_size=5,
             max_position_per_ticker=6,
         )
@@ -565,10 +565,10 @@ class TestPhase2StableLadder:
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
 
-        # Simulate 4 contracts already in pending buy orders
+        # Simulate 4 contracts already in a pending buy order for this instrument
+        # instrument_id.value must equal the string the production code compares against
         mock_open_order = MagicMock()
-        mock_open_order.instrument_id = MagicMock()
-        mock_open_order.instrument_id.__eq__ = lambda self, other: True
+        mock_open_order.instrument_id.value = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         mock_open_order.side = OrderSide.BUY
         mock_open_order.quantity.as_double.return_value = 4.0
         strategy.cache.orders_open.return_value = [mock_open_order]
@@ -577,10 +577,10 @@ class TestPhase2StableLadder:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._evaluate_entry(_make_signal(p_win=0.97))
 
-        # With 4 pending and max 6, only 2 contracts of capacity remain
-        # Phase 2 ladder would be limited
+        # With 4 pending and max 6, only 2 contracts of capacity remain.
+        # stable_size=5 per level but capacity=2, so only 1 ladder level fits (size=2).
         orders_placed = strategy.submit_order.call_count
-        assert orders_placed <= 2  # at most 2 left
+        assert orders_placed <= 2  # capped by remaining capacity
 
 
 # ---------------------------------------------------------------------------
@@ -759,25 +759,47 @@ class TestPeriodicRefresh:
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._danger_exited.add(ticker)
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
-        strategy._latest_quotes[self._make_refresh_strategy._quote_key if False else "KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
 
         strategy._on_refresh()
         strategy.submit_order.assert_not_called()
 
     def test_refresh_clears_ladder_orders_dict(self):
-        """After cancellation, _ladder_orders[ticker] should be cleared."""
+        """After cancellation, old order IDs should be cancelled and new ones deployed."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
-        strategy._ladder_orders[ticker] = [MagicMock(), MagicMock()]
+
+        # Set up two old order IDs in ladder_orders
+        old_id_1 = MagicMock()
+        old_id_2 = MagicMock()
+        strategy._ladder_orders[ticker] = [old_id_1, old_id_2]
+
+        # Make cache.orders_open return open orders matching the old IDs
+        mock_order_1 = MagicMock()
+        mock_order_1.client_order_id = old_id_1
+        mock_order_1.side = OrderSide.BUY
+        mock_order_2 = MagicMock()
+        mock_order_2.client_order_id = old_id_2
+        mock_order_2.side = OrderSide.BUY
+        strategy.cache.orders_open.return_value = [mock_order_1, mock_order_2]
+
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
         quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
 
         strategy._on_refresh()
 
-        # After refresh, old orders list was popped and new one set
-        # The new orders list should contain the just-placed orders
-        assert ticker in strategy._ladder_orders or True  # new orders or empty if capacity full
+        # Old orders should have been cancelled
+        strategy.cancel_order.assert_any_call(mock_order_1)
+        strategy.cancel_order.assert_any_call(mock_order_2)
+
+        # New orders should have been deployed (ladder redeployment)
+        strategy.submit_order.assert_called()
+
+        # The ladder_orders dict should contain only the new order IDs (not old ones)
+        new_order_ids = set(strategy._ladder_orders.get(ticker, []))
+        assert old_id_1 not in new_order_ids
+        assert old_id_2 not in new_order_ids
 
 
 # ---------------------------------------------------------------------------
