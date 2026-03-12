@@ -68,8 +68,7 @@ class _TestableWeatherStrategy:
         self._ladder_orders: dict = {}
         self._resting_sells: dict = {}
         self._eligible_signals: dict = {}
-        self._ladder_deployed: set = set()
-        self._ticks_since_refresh: int = 0
+        self._last_ladder_bid: dict = {}
         # Counters
         self._signals_received: int = 0
         self._alerts_received: int = 0
@@ -112,6 +111,8 @@ class _TestableWeatherStrategy:
     _count_pending_buys = WeatherStrategy._count_pending_buys
     _cancel_ladder_orders = WeatherStrategy._cancel_ladder_orders
     _cancel_all_buys_for_ticker = WeatherStrategy._cancel_all_buys_for_ticker
+    _cancel_resting_sells_for_ticker = WeatherStrategy._cancel_resting_sells_for_ticker
+    _cleanup_ticker_state = WeatherStrategy._cleanup_ticker_state
     _cancel_all_resting_buys = WeatherStrategy._cancel_all_resting_buys
     _place_resting_sell = WeatherStrategy._place_resting_sell
     _on_refresh = WeatherStrategy._on_refresh
@@ -183,11 +184,15 @@ class TestWeatherStrategyConfig:
         assert cfg.sell_target_cents == 95
 
     def test_no_legacy_fields(self):
-        """Old config fields (min_p_win, max_cost_cents, trade_size) must not exist."""
+        """Old config fields (min_p_win, trade_size) must not exist."""
         cfg = WeatherStrategyConfig()
         assert not hasattr(cfg, "min_p_win")
-        assert not hasattr(cfg, "max_cost_cents")
         assert not hasattr(cfg, "trade_size")
+
+    def test_max_cost_default(self):
+        """max_cost_cents should default to 92."""
+        cfg = WeatherStrategyConfig()
+        assert cfg.max_cost_cents == 92
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +320,8 @@ class TestPhase1OpenSpread:
 
         # Second call should not place more spread orders (ticker already in _open_spread_placed)
         assert count_after_second == count_after_first
+        # Guard fired — ticker should NOT have been stored as eligible for Phase 2
+        assert signal.ticker not in strategy._eligible_signals
 
     def test_phase1_below_min_p_win_skips_spread(self):
         """Signal below open_spread_min_p_win should not place spread."""
@@ -572,7 +579,7 @@ class TestPhase2StableLadder:
         mock_open_order = MagicMock()
         mock_open_order.instrument_id.value = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
         mock_open_order.side = OrderSide.BUY
-        mock_open_order.quantity.as_double.return_value = 4.0
+        mock_open_order.leaves_qty.as_double.return_value = 4.0
         strategy.cache.orders_open.return_value = [mock_open_order]
 
         with patch("weather_strategy.parse_ticker") as mock_parse:
@@ -583,6 +590,65 @@ class TestPhase2StableLadder:
         # stable_size=5 per level but capacity=2, so only 1 ladder level fits (size=2).
         orders_placed = strategy.submit_order.call_count
         assert orders_placed <= 2  # capped by remaining capacity
+
+
+class TestCostCeiling:
+    def _setup_strategy(self, **kwargs):
+        defaults = dict(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0, 2, 5),
+            stable_size=2,
+            max_cost_cents=92,
+        )
+        defaults.update(kwargs)
+        strategy = _make_strategy(**defaults)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        return strategy
+
+    def test_ladder_skips_rungs_above_max_cost(self):
+        """Ladder rungs priced above max_cost_cents should be skipped."""
+        strategy = self._setup_strategy(max_cost_cents=92)
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(bid_cents=95, ask_cents=97)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        # bid=95, offsets=(0,2,5) → prices 95,93,90
+        # 95 > 92 → skip, 93 > 92 → skip, 90 <= 92 → place
+        assert strategy.submit_order.call_count == 1
+        mock_inst = strategy.cache.instrument.return_value
+        prices_called = [c.args[0] for c in mock_inst.make_price.call_args_list]
+        assert 0.90 in prices_called
+
+    def test_ladder_all_rungs_above_max_cost_no_orders(self):
+        """When all ladder rungs exceed max_cost, no orders should be placed."""
+        strategy = self._setup_strategy(max_cost_cents=92, stable_ladder_offsets_cents=(0, 1, 2))
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(bid_cents=97, ask_cents=99)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        # bid=97, offsets=(0,1,2) → prices 97,96,95 — all > 92
+        strategy.submit_order.assert_not_called()
+
+    def test_ladder_below_max_cost_places_normally(self):
+        """When bid is well below max_cost, all rungs should place."""
+        strategy = self._setup_strategy(max_cost_cents=92)
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(bid_cents=80, ask_cents=82)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._evaluate_entry(_make_signal(p_win=0.97))
+
+        # bid=80, offsets=(0,2,5) → prices 80,78,75 — all <= 92
+        assert strategy.submit_order.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -714,8 +780,6 @@ class TestPeriodicRefresh:
         # Active trading hour: 15 UTC (outside back-off window [7, 14))
         strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
         strategy.cache.instrument.return_value = _mock_instrument()
-        # Simulate ticks having arrived so refresh doesn't skip
-        strategy._ticks_since_refresh = 1
         return strategy
 
     def test_refresh_redeploys_ladder_for_eligible_signals(self):
@@ -865,7 +929,6 @@ class TestBackoffWindow:
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(ticker=ticker, p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
-        strategy._ticks_since_refresh = 1
 
         strategy._on_refresh()
         strategy.submit_order.assert_called()
@@ -899,6 +962,98 @@ class TestBackoffWindow:
 
         assert len(strategy._open_spread_orders) == 0
         assert len(strategy._ladder_orders) == 0
+
+
+# ---------------------------------------------------------------------------
+# Idempotent Refresh
+# ---------------------------------------------------------------------------
+
+class TestIdempotentRefresh:
+    def _make_refresh_strategy(self, **kwargs):
+        defaults = dict(
+            open_spread_enabled=False,
+            stable_min_p_win=0.95,
+            stable_ladder_offsets_cents=(0, 2),
+            stable_size=2,
+            backoff_hour_utc=7,
+            resume_hour_utc=14,
+        )
+        defaults.update(kwargs)
+        strategy = _make_strategy(**defaults)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        return strategy
+
+    def test_refresh_skips_when_bid_unchanged(self):
+        """No orders or cache queries when bid hasn't moved."""
+        strategy = self._make_refresh_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+        strategy._last_ladder_bid[ticker] = 85
+
+        strategy._on_refresh()
+
+        strategy.submit_order.assert_not_called()
+        strategy.cache.orders_open.assert_not_called()
+
+    def test_refresh_redeploys_when_bid_changes(self):
+        """Refresh should cancel and redeploy when bid has moved."""
+        strategy = self._make_refresh_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(88, 90)
+        strategy._last_ladder_bid[ticker] = 85  # old bid was 85, now 88
+
+        strategy._on_refresh()
+
+        strategy.submit_order.assert_called()
+        assert strategy._last_ladder_bid[ticker] == 88
+
+    def test_burst_refreshes_are_noop(self):
+        """100 consecutive refreshes at same bid should produce zero orders."""
+        strategy = self._make_refresh_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
+        strategy._last_ladder_bid[ticker] = 85
+
+        for _ in range(100):
+            strategy._on_refresh()
+
+        strategy.submit_order.assert_not_called()
+        strategy.cache.orders_open.assert_not_called()
+
+    def test_backoff_clears_last_ladder_bid(self):
+        """Back-off should clear _last_ladder_bid so ladders redeploy after resume."""
+        strategy = self._make_refresh_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._last_ladder_bid[ticker] = 85
+        strategy._ladder_orders[ticker] = [MagicMock()]
+
+        # Enter back-off
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 8, 0, tzinfo=timezone.utc)
+        strategy.cache.orders_open.return_value = []
+        strategy._on_refresh()
+
+        assert len(strategy._last_ladder_bid) == 0
+
+    def test_danger_exit_clears_last_ladder_bid(self):
+        """Danger exit should remove ticker from _last_ladder_bid."""
+        strategy = self._make_refresh_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._last_ladder_bid[ticker] = 85
+        strategy._positions_info[ticker] = {
+            "side": "no", "threshold": 55.0, "city": "chicago", "contracts": 5
+        }
+        strategy.cache.instrument.return_value = _mock_instrument()
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(88, 90)
+        strategy.cache.orders_open.return_value = []
+
+        alert = _make_alert(ticker=ticker, level="CRITICAL")
+        strategy._evaluate_exit(alert)
+
+        assert ticker not in strategy._last_ladder_bid
 
 
 # ---------------------------------------------------------------------------
@@ -1131,3 +1286,153 @@ class TestParseTickerFailure:
             strategy._evaluate_entry(_make_signal(p_win=0.99))
 
         strategy.submit_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Danger exit cancels resting sells
+# ---------------------------------------------------------------------------
+
+class TestDangerExitCancelsRestingSells:
+    def test_danger_exit_cancels_resting_sells(self):
+        """CRITICAL exit should cancel resting sell orders before submitting emergency sell."""
+        strategy = _make_strategy()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+        strategy._positions_info[ticker] = {
+            "side": "no", "threshold": 55.0, "city": "chicago", "contracts": 5,
+        }
+        mock_inst = _mock_instrument()
+        strategy.cache.instrument.return_value = mock_inst
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(88, 90)
+
+        # Simulate a resting sell order from a prior buy fill
+        resting_sell_id = MagicMock()
+        strategy._resting_sells[ticker] = [resting_sell_id]
+
+        mock_resting_sell = MagicMock()
+        mock_resting_sell.client_order_id = resting_sell_id
+        mock_resting_sell.side = OrderSide.SELL
+        strategy.cache.orders_open.return_value = [mock_resting_sell]
+
+        strategy._evaluate_exit(_make_alert(ticker=ticker, level="CRITICAL"))
+
+        # Resting sell should have been cancelled
+        strategy.cancel_order.assert_any_call(mock_resting_sell)
+        # Emergency sell should still be submitted
+        strategy.submit_order.assert_called_once()
+        # Resting sells dict should be cleaned up
+        assert ticker not in strategy._resting_sells
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Phase 1→2 fall-through guard
+# ---------------------------------------------------------------------------
+
+class TestPhase1Phase2Guard:
+    def _setup_tomorrow_strategy(self, **kwargs):
+        defaults = dict(
+            open_spread_enabled=True,
+            open_spread_prices_cents=(45, 50, 55),
+            open_spread_size=3,
+            open_spread_min_p_win=0.90,
+            open_spread_window_minutes=30,
+            stable_min_p_win=0.95,
+        )
+        defaults.update(kwargs)
+        strategy = _make_strategy(**defaults)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        strategy.clock.set_time_alert_ns = MagicMock()
+        strategy.clock.timestamp_ns.return_value = 1_000_000_000
+        return strategy
+
+    def test_phase1_active_blocks_phase2(self):
+        """Second signal during active Phase 1 window should NOT deploy Phase 2 ladder."""
+        strategy = self._setup_tomorrow_strategy()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {
+                "settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI",
+            }
+            # First signal: deploys Phase 1 spread
+            strategy._evaluate_entry(_make_signal(p_win=0.95, ts_event=1_000_000_000))
+            first_count = strategy.submit_order.call_count
+            assert first_count == 3  # 3 spread levels
+
+            # Second signal: Phase 1 still active (timer hasn't fired)
+            strategy._evaluate_entry(_make_signal(p_win=0.97, ts_event=2_000_000_000))
+            second_count = strategy.submit_order.call_count
+
+        # No additional orders — guard blocked Phase 2
+        assert second_count == first_count
+        # Ticker should NOT be in eligible_signals (Phase 2 never reached)
+        assert "KXHIGHCHI-26MAR15-T55" not in strategy._eligible_signals
+
+    def test_phase1_expired_allows_phase2(self):
+        """After timer fires and clears spread orders, signal should proceed to Phase 2."""
+        strategy = self._setup_tomorrow_strategy()
+        quote_key = "KXHIGHCHI-26MAR15-T55-NO.KALSHI"
+        strategy._latest_quotes[quote_key] = _mock_quote(85, 87)
+        ticker = "KXHIGHCHI-26MAR15-T55"
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {
+                "settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI",
+            }
+            # First signal: deploys Phase 1
+            strategy._evaluate_entry(_make_signal(p_win=0.95, ts_event=1_000_000_000))
+
+            # Simulate timer firing: cancels spread orders (pops from _open_spread_orders)
+            strategy._cancel_spread_orders(ticker)
+            assert ticker not in strategy._open_spread_orders
+
+            # Third signal after window: should proceed to Phase 2
+            window_ns = 30 * 60 * 1_000_000_000
+            late_ts = 1_000_000_000 + window_ns + 1
+            strategy._evaluate_entry(_make_signal(p_win=0.97, ts_event=late_ts))
+
+        # Phase 2 should have deployed (eligible signal stored)
+        assert ticker in strategy._eligible_signals
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: State cleanup on position close
+# ---------------------------------------------------------------------------
+
+class TestStateCleanupOnClose:
+    def _make_fill_event(self, inst_str="KXHIGHCHI-26MAR15-T55-NO", qty=3, side=OrderSide.BUY):
+        event = MagicMock()
+        event.instrument_id = MagicMock()
+        event.instrument_id.symbol.value = inst_str
+        event.last_qty.as_double.return_value = float(qty)
+        event.order_side = side
+        return event
+
+    def test_position_close_cleans_up_state(self):
+        """Selling to 0 contracts should remove all tracking state for the ticker."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = _mock_instrument()
+        ticker = "KXHIGHCHI-26MAR15-T55"
+
+        # Set up state that should be cleaned
+        strategy._positions_info[ticker] = {"side": "no", "contracts": 3, "city": "", "threshold": 0}
+        strategy._resting_sells[ticker] = [MagicMock()]
+        strategy._eligible_signals[ticker] = _make_signal()
+        strategy._danger_exited.add(ticker)
+        strategy._open_spread_placed.add(ticker)
+        strategy._first_tick_time[ticker] = 1_000_000_000
+        strategy._last_ladder_bid[ticker] = 85
+
+        # Sell all 3 contracts
+        event = self._make_fill_event(qty=3, side=OrderSide.SELL)
+        strategy.on_order_filled(event)
+
+        # Everything should be cleaned up
+        assert ticker not in strategy._positions_info
+        assert ticker not in strategy._resting_sells
+        assert ticker not in strategy._eligible_signals
+        assert ticker not in strategy._danger_exited
+        assert ticker not in strategy._open_spread_placed
+        assert ticker not in strategy._first_tick_time
+        assert ticker not in strategy._last_ladder_bid

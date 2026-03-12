@@ -63,6 +63,7 @@ class TestLoadClimateEvents:
         assert len(events) == 2
         assert events[0].source == "ndbc_buoy_sst"
         assert events[0].city == "chicago"
+        assert events[0].date == "2026-03-08"
         assert events[0].features["sst_value"] == 42.3
         assert events[0].ts_event == 1_000_000_000
 

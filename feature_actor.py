@@ -10,12 +10,14 @@ kalshi_weather_ml and publish ClimateEvents on the same bus path
 used by backtest replay.
 """
 import logging
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add kalshi-weather package to path
-sys.path.append("/home/mike/code/altmarkets/kalshi-weather/src")
+_KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
+sys.path.insert(0, f"{_KW_ROOT}/src")
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
@@ -76,7 +78,7 @@ class FeatureActor(Actor):
     def __init__(self, config: FeatureActorConfig):
         super().__init__(config)
         self._cfg = config
-        self._city_features: dict[str, CityFeatureState] = {}
+        self._city_features: dict[tuple[str, str], CityFeatureState] = {}
         self._positions: dict[str, dict] = {}  # ticker -> {side, threshold, city}
         self._events_received: int = 0
         
@@ -100,7 +102,7 @@ class FeatureActor(Actor):
             from kalshi_weather_ml.models.ngboost_model import NGBoostModel
             from kalshi_weather_ml.models.drn_model import DRNModel
 
-            kw_root = Path("/home/mike/code/altmarkets/kalshi-weather")
+            kw_root = Path(_KW_ROOT)
             models_dir = kw_root / "data" / "models"
 
             model_loaders = {
@@ -162,12 +164,63 @@ class FeatureActor(Actor):
             f"live={self._cfg.live_mode})"
         )
 
+    def _active_dates_for_city(self, city: str) -> list[str]:
+        """Return settlement dates with instruments in cache or positions for a city."""
+        dates: set[str] = set()
+        # From positions
+        for ticker, info in self._positions.items():
+            if info.get("city") != city:
+                continue
+            if parse_ticker:
+                parsed = parse_ticker(ticker)
+                if parsed:
+                    dates.add(parsed["settlement_date"])
+        # From cached instruments
+        if parse_ticker:
+            from kalshi_weather_ml.markets import SERIES_CONFIG
+            series_to_city = {s: c for s, c in SERIES_CONFIG}
+            for inst in self.cache.instruments():
+                sym = inst.id.symbol.value
+                if not (sym.endswith("-YES") or sym.endswith("-NO")):
+                    continue
+                ticker = sym.rsplit("-", 1)[0]
+                parsed = parse_ticker(ticker)
+                if parsed and series_to_city.get(parsed["series"]) == city:
+                    dates.add(parsed["settlement_date"])
+        return sorted(dates)
+
     def on_data(self, data):
-        """Handle incoming ClimateEvent -- accumulate features, check danger."""
+        """Handle incoming ClimateEvent -- accumulate features, check danger.
+
+        Date-specific events (date != "") route to exact (city, date) bucket.
+        City-level events (date == "") fan out to all active (city, date) buckets.
+        """
         if isinstance(data, ClimateEvent):
             self._events_received += 1
-            state = self._city_features.setdefault(data.city, CityFeatureState())
-            state.update(data.source, data.features)
+
+            if data.date:
+                # Date-specific (forecast): exact (city, date) bucket
+                key = (data.city, data.date)
+                if key not in self._city_features:
+                    # Seed from city-level fallback if it exists
+                    fallback = self._city_features.get((data.city, ""))
+                    state = CityFeatureState()
+                    if fallback:
+                        state.update("_fallback", fallback.snapshot())
+                    self._city_features[key] = state
+                self._city_features[key].update(data.source, data.features)
+            else:
+                # City-level (AFD, METAR, SST): fan out to all active dates
+                active_dates = self._active_dates_for_city(data.city)
+                for dt in active_dates:
+                    key = (data.city, dt)
+                    state = self._city_features.setdefault(key, CityFeatureState())
+                    state.update(data.source, data.features)
+                if not active_dates:
+                    # No active dates yet -- store in fallback bucket
+                    key = (data.city, "")
+                    state = self._city_features.setdefault(key, CityFeatureState())
+                    state.update(data.source, data.features)
 
             if self._cfg.danger_check_enabled and self._positions:
                 self._check_danger(data.city)
@@ -186,13 +239,19 @@ class FeatureActor(Actor):
 
         # --- Position monitoring: re-evaluate held positions ---
         if self._positions:
-            cities_with_positions: dict[str, list[str]] = {}
+            # Group positions by (city, settlement_date)
+            cd_positions: dict[tuple[str, str], list[str]] = {}
             for ticker, info in self._positions.items():
                 city = info.get("city", "")
-                cities_with_positions.setdefault(city, []).append(ticker)
+                sd = ""
+                if parse_ticker:
+                    parsed = parse_ticker(ticker)
+                    if parsed:
+                        sd = parsed["settlement_date"]
+                cd_positions.setdefault((city, sd), []).append(ticker)
 
-            for city, tickers in cities_with_positions.items():
-                state = self._city_features.get(city)
+            for (city, sd), tickers in cd_positions.items():
+                state = self._city_features.get((city, sd))
                 if state is None:
                     continue
 
@@ -278,8 +337,8 @@ class FeatureActor(Actor):
 
         series_to_city = {s: c for s, c in SERIES_CONFIG}
 
-        # Group instruments by city, dedup tickers
-        city_tickers: dict[str, list[dict]] = {}
+        # Group instruments by (city, settlement_date), dedup tickers
+        cd_tickers: dict[tuple[str, str], list[dict]] = {}
         seen_tickers: set[str] = set()
         for inst in instruments:
             sym = inst.id.symbol.value  # "KXHIGHCHI-26MAR01-T55-NO"
@@ -294,13 +353,14 @@ class FeatureActor(Actor):
             if not parsed:
                 continue
             city = series_to_city.get(parsed["series"], "")
+            sd = parsed["settlement_date"]
             if city:
-                city_tickers.setdefault(city, []).append(
+                cd_tickers.setdefault((city, sd), []).append(
                     {"ticker": ticker, "parsed": parsed}
                 )
 
-        for city, ticker_list in city_tickers.items():
-            state = self._city_features.get(city)
+        for (city, sd), ticker_list in cd_tickers.items():
+            state = self._city_features.get((city, sd))
             if state is None:
                 continue
             features = state.snapshot()
@@ -350,40 +410,60 @@ class FeatureActor(Actor):
 
     def _check_danger(self, city: str):
         """Run exit rules for a city and publish DangerAlert if triggered."""
-        state = self._city_features.get(city)
-        if state is None:
-            self.log.warning(f"No feature state for {city}, skipping danger check")
-            return
-
-        features = state.snapshot()
-        alerts = check_exit_rules(city, features, self._positions)
-
-        if not alerts:
-            return
+        # Find all (city, date) keys for this city
+        relevant_keys = [(c, d) for (c, d) in self._city_features if c == city and d != ""]
+        if not relevant_keys:
+            # Try fallback
+            if (city, "") in self._city_features:
+                relevant_keys = [(city, "")]
 
         ts = self.clock.timestamp_ns()
 
-        for alert_dict in alerts:
-            # Determine composite alert level
-            if should_exit(alerts):
-                level = "CRITICAL"
-            elif alert_dict["alert_level"] == "CRITICAL":
-                level = "CRITICAL"
-            else:
-                level = alert_dict["alert_level"]
+        for key in relevant_keys:
+            state = self._city_features[key]
+            features = state.snapshot()
+            _, sd = key
 
-            for ticker in alert_dict.get("tickers", []):
-                danger = DangerAlert(
-                    ticker=ticker,
-                    city=city,
-                    alert_level=level,
-                    rule_name=alert_dict["rule_name"],
-                    reason=alert_dict["reason"],
-                    features=alert_dict.get("features", {}),
-                    ts_event=ts,
-                    ts_init=ts,
-                )
-                self.publish_data(DataType(DangerAlert), danger)
+            # Filter positions to this settlement date
+            filtered_positions: dict[str, dict] = {}
+            for ticker, info in self._positions.items():
+                if info.get("city") != city:
+                    continue
+                if sd == "":
+                    filtered_positions[ticker] = info  # fallback: all tickers
+                elif parse_ticker:
+                    parsed = parse_ticker(ticker)
+                    if parsed and parsed["settlement_date"] == sd:
+                        filtered_positions[ticker] = info
+
+            if not filtered_positions:
+                continue
+
+            alerts = check_exit_rules(city, features, filtered_positions)
+            if not alerts:
+                continue
+
+            for alert_dict in alerts:
+                # Determine composite alert level
+                if should_exit(alerts):
+                    level = "CRITICAL"
+                elif alert_dict["alert_level"] == "CRITICAL":
+                    level = "CRITICAL"
+                else:
+                    level = alert_dict["alert_level"]
+
+                for ticker in alert_dict.get("tickers", []):
+                    danger = DangerAlert(
+                        ticker=ticker,
+                        city=city,
+                        alert_level=level,
+                        rule_name=alert_dict["rule_name"],
+                        reason=alert_dict["reason"],
+                        features=alert_dict.get("features", {}),
+                        ts_event=ts,
+                        ts_init=ts,
+                    )
+                    self.publish_data(DataType(DangerAlert), danger)
 
     def update_positions(self, positions: dict[str, dict]):
         """Called by strategy when positions change.
@@ -445,23 +525,31 @@ class FeatureActor(Actor):
                 self.log.warning(f"METAR poll failed for {city}: {e}")
 
     def _poll_forecasts(self, event):
-        """Poll ECMWF/GFS forecasts for cities with positions."""
+        """Poll ECMWF/GFS forecasts for cities with positions.
+
+        Fetches per (city, settlement_date) so each date gets its own forecast.
+        """
         if not self._positions:
             return
         if get_forecast is None:
             return
 
-        from datetime import date
+        # Build (city, settlement_date) pairs from positions
+        city_dates: set[tuple[str, str]] = set()
+        for ticker, info in self._positions.items():
+            city = info.get("city", "")
+            if parse_ticker and city:
+                parsed = parse_ticker(ticker)
+                if parsed:
+                    city_dates.add((city, parsed["settlement_date"]))
 
-        cities = {info["city"] for info in self._positions.values()}
-        today = date.today().isoformat()
         ts = self.clock.timestamp_ns()
 
-        for city in cities:
+        for city, sd in city_dates:
             try:
-                ecmwf = get_forecast(city, today, PRIMARY_MODEL)
-                gfs = get_forecast(city, today, CONSENSUS_MODEL)
-                wx = get_weather_features(city, today) if get_weather_features else {}
+                ecmwf = get_forecast(city, sd, PRIMARY_MODEL)
+                gfs = get_forecast(city, sd, CONSENSUS_MODEL)
+                wx = get_weather_features(city, sd) if get_weather_features else {}
 
                 features = {}
                 if ecmwf is not None:
@@ -479,11 +567,12 @@ class FeatureActor(Actor):
                         features=features,
                         ts_event=ts,
                         ts_init=ts,
+                        date=sd,
                     )
                     self.publish_data(DataType(ClimateEvent), evt)
                     self.on_data(evt)
             except Exception as e:
-                self.log.warning(f"Forecast poll failed for {city}: {e}")
+                self.log.warning(f"Forecast poll failed for {city}/{sd}: {e}")
 
     def _poll_sst(self, event):
         """Poll SST data for coastal cities with positions."""
@@ -526,5 +615,5 @@ class FeatureActor(Actor):
         return self._events_received
 
     @property
-    def city_features(self) -> dict[str, CityFeatureState]:
+    def city_features(self) -> dict[tuple[str, str], CityFeatureState]:
         return self._city_features

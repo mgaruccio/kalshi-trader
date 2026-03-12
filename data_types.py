@@ -25,9 +25,11 @@ class ClimateEvent(Data):
         features: dict[str, float],
         ts_event: int,
         ts_init: int,
+        date: str = "",
     ):
         self.source = source
         self.city = city
+        self.date = date
         self.features = features
         self._ts_event = ts_event
         self._ts_init = ts_init
@@ -43,7 +45,7 @@ class ClimateEvent(Data):
     def __repr__(self) -> str:
         return (
             f"ClimateEvent(source={self.source!r}, city={self.city!r}, "
-            f"features={len(self.features)} keys)"
+            f"date={self.date!r}, features={len(self.features)} keys)"
         )
 
 

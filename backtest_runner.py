@@ -107,6 +107,7 @@ def load_climate_events(parquet_path: Path) -> list[ClimateEvent]:
             features={k: float(v) for k, v in features.items()},
             ts_event=int(row["ts_event"]),
             ts_init=int(row["ts_init"]),
+            date=str(row.get("date", "")),
         ))
 
     events.sort(key=lambda e: e.ts_event)
@@ -353,6 +354,12 @@ if __name__ == "__main__":
         help="End time filter (ISO-8601)",
     )
     parser.add_argument(
+        "--model-signals",
+        type=Path,
+        default=None,
+        help="Path to pre-computed model signals parquet (skips live inference)",
+    )
+    parser.add_argument(
         "--convert",
         action="store_true",
         help="Convert streaming sessions to catalog format before running",
@@ -384,4 +391,5 @@ if __name__ == "__main__":
         starting_balance_usd=args.balance,
         start=args.start,
         end=args.end,
+        model_signals_path=args.model_signals,
     )

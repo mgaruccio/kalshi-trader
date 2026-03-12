@@ -128,10 +128,12 @@ def get_per_instrument_first_tick(catalog_path: Path) -> dict[str, int]:
     return result
 
 
-def load_city_features(climate_events_path: Path, cutoff_ns: int | None) -> dict[str, dict]:
-    """Load climate events and merge features per city.
+def load_city_features(climate_events_path: Path, cutoff_ns: int | None) -> dict[tuple[str, str], dict]:
+    """Load climate events and merge features per (city, date).
 
-    Returns {city: {feature_name: value}} with all features merged across sources.
+    Returns {(city, date): {feature_name: value}} with date-specific isolation.
+    Date-specific events go to exact (city, date) buckets.
+    City-level events (date=="") fan out to all known dates for that city.
     """
     table = pq.read_table(str(climate_events_path))
     df = table.to_pandas()
@@ -139,14 +141,33 @@ def load_city_features(climate_events_path: Path, cutoff_ns: int | None) -> dict
     if cutoff_ns is not None:
         df = df[df["ts_event"] >= cutoff_ns]
 
-    city_features: dict[str, dict] = {}
+    # First pass: collect all (city, date) pairs from date-specific events
+    city_dates: dict[str, set[str]] = {}
+    for _, row in df.iterrows():
+        date_val = str(row.get("date", ""))
+        if date_val:
+            city = str(row["city"])
+            city_dates.setdefault(city, set()).add(date_val)
+
+    # Second pass: route events to (city, date) buckets
+    cd_features: dict[tuple[str, str], dict] = {}
     for _, row in df.iterrows():
         city = str(row["city"])
+        date_val = str(row.get("date", ""))
         features = json.loads(row["features"]) if isinstance(row["features"], str) else row["features"]
-        state = city_features.setdefault(city, {})
-        state.update({k: float(v) for k, v in features.items()})
+        parsed_features = {k: float(v) for k, v in features.items()}
 
-    return city_features
+        if date_val:
+            # Date-specific: exact bucket
+            state = cd_features.setdefault((city, date_val), {})
+            state.update(parsed_features)
+        else:
+            # City-level: fan out to all known dates for this city
+            for dt in city_dates.get(city, set()):
+                state = cd_features.setdefault((city, dt), {})
+                state.update(parsed_features)
+
+    return cd_features
 
 
 def main():
@@ -190,7 +211,8 @@ def main():
             n_skip += 1
             continue
 
-        features = city_features.get(city)
+        sd = parsed["settlement_date"]
+        features = city_features.get((city, sd))
         if not features:
             n_skip += 1
             continue

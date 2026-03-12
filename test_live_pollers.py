@@ -19,7 +19,7 @@ class _TestableFeatureActor:
 
     def __init__(self, config=None):
         self._cfg = config or FeatureActorConfig(live_mode=True)
-        self._city_features: dict[str, CityFeatureState] = {}
+        self._city_features: dict[tuple[str, str], CityFeatureState] = {}
         self._positions: dict[str, dict] = {}
         self._events_received: int = 0
         self.log = MagicMock()
@@ -27,6 +27,8 @@ class _TestableFeatureActor:
         self.clock.timestamp_ns.return_value = 999
         self._published: list = []
         self.publish_data = lambda dt, data: self._published.append(data)
+        self.cache = MagicMock()
+        self.cache.instruments.return_value = []
 
     # Bind live poller methods from FeatureActor
     on_data = FeatureActor.on_data
@@ -35,6 +37,7 @@ class _TestableFeatureActor:
     _poll_forecasts = FeatureActor._poll_forecasts
     _poll_sst = FeatureActor._poll_sst
     _check_danger = FeatureActor._check_danger
+    _active_dates_for_city = FeatureActor._active_dates_for_city
 
     @property
     def poll_cities(self) -> set[str]:
@@ -77,8 +80,8 @@ class TestLivePollers:
         actor._poll_metar(MagicMock())
 
         assert actor._events_received == 1
-        assert "chicago" in actor._city_features
-        assert actor._city_features["chicago"].get("obs_temp") == 52.0
+        assert ("chicago", "") in actor._city_features
+        assert actor._city_features[("chicago", "")].get("obs_temp") == 52.0
 
     @patch("feature_actor.get_current_temp")
     def test_poll_metar_none_skipped(self, mock_temp):
@@ -107,12 +110,14 @@ class TestLivePollers:
         actor._poll_metar(MagicMock())
         assert len(actor._published) == 0
 
+    @patch("feature_actor.parse_ticker")
     @patch("feature_actor.get_weather_features")
     @patch("feature_actor.get_forecast")
-    def test_poll_forecasts_publishes_event(self, mock_fc, mock_wx):
+    def test_poll_forecasts_publishes_event(self, mock_fc, mock_wx, mock_parse):
         """Forecast poll should publish ClimateEvent with forecast features."""
         mock_fc.side_effect = [55.0, 54.0]  # ecmwf, gfs
         mock_wx.return_value = {"wind_speed_max": 12.0}
+        mock_parse.return_value = {"series": "KXHIGHCHI", "threshold": 55, "settlement_date": "2026-03-12"}
         actor = self._make_actor()
 
         actor._poll_forecasts(MagicMock())
@@ -124,12 +129,14 @@ class TestLivePollers:
         assert events[0].features["forecast_high"] == 55.0  # max
         assert events[0].features["wind_speed_max"] == 12.0
 
+    @patch("feature_actor.parse_ticker")
     @patch("feature_actor.get_weather_features")
     @patch("feature_actor.get_forecast")
-    def test_poll_forecasts_partial_data(self, mock_fc, mock_wx):
+    def test_poll_forecasts_partial_data(self, mock_fc, mock_wx, mock_parse):
         """Forecast poll should handle partial data (only ecmwf)."""
         mock_fc.side_effect = [55.0, None]  # ecmwf ok, gfs unavailable
         mock_wx.return_value = {}
+        mock_parse.return_value = {"series": "KXHIGHCHI", "threshold": 55, "settlement_date": "2026-03-12"}
         actor = self._make_actor()
 
         actor._poll_forecasts(MagicMock())
@@ -222,11 +229,13 @@ class TestLivePollers:
         actor._poll_metar(MagicMock())
         actor.log.warning.assert_called()
 
+    @patch("feature_actor.parse_ticker")
     @patch("feature_actor.get_weather_features")
     @patch("feature_actor.get_forecast")
-    def test_poll_forecasts_exception_handled(self, mock_fc, mock_wx):
+    def test_poll_forecasts_exception_handled(self, mock_fc, mock_wx, mock_parse):
         """Forecast poll failures should log warning, not crash."""
         mock_fc.side_effect = ConnectionError("network down")
+        mock_parse.return_value = {"series": "KXHIGHCHI", "threshold": 55, "settlement_date": "2026-03-12"}
         actor = self._make_actor()
 
         # Should not raise

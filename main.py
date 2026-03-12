@@ -4,6 +4,7 @@ Wires FeatureActor (climate data polling + ML signals) and
 WeatherStrategy (entry/exit execution) into a NautilusTrader
 live TradingNode with Kalshi data + execution clients.
 """
+import argparse
 import logging
 import sys
 
@@ -24,6 +25,11 @@ log = logging.getLogger(__name__)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Weather TradingNode")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Paper trade: evaluate signals but block all orders (max_position=0)")
+    args = parser.parse_args()
+
     try:
         config_obj = KalshiConfig()
     except Exception as e:
@@ -50,11 +56,12 @@ def main():
     config = TradingNodeConfig(
         trader_id=f"KALSHI-WEATHER-{config_obj.environment.upper()}",
         data_clients={"KALSHI": LiveDataClientConfig()},
-        exec_clients={"KALSHI": LiveExecClientConfig()},
+        exec_clients={} if args.dry_run else {"KALSHI": LiveExecClientConfig()},
     )
     node = TradingNode(config=config)
     node.add_data_client_factory("KALSHI", KalshiDataClientFactory)
-    node.add_exec_client_factory("KALSHI", KalshiExecutionClientFactory)
+    if not args.dry_run:
+        node.add_exec_client_factory("KALSHI", KalshiExecutionClientFactory)
     node.build()
 
     # Register instruments
@@ -69,12 +76,18 @@ def main():
     node.trader.add_actor(feature_actor)
 
     # 4. Add WeatherStrategy
-    weather_strategy = WeatherStrategy(WeatherStrategyConfig(
-        min_p_win=0.95,
+    strategy_kwargs = dict(
+        stable_min_p_win=0.95,
         max_cost_cents=92,
         sell_target_cents=97,
-        trade_size=1,
-    ))
+        stable_size=3,
+        max_position_per_ticker=20,
+    )
+    if args.dry_run:
+        strategy_kwargs["max_position_per_ticker"] = 0
+        log.info("DRY RUN: max_position_per_ticker=0, no orders will be placed")
+
+    weather_strategy = WeatherStrategy(WeatherStrategyConfig(**strategy_kwargs))
     weather_strategy.set_feature_actor(feature_actor)
     node.trader.add_strategy(weather_strategy)
 
