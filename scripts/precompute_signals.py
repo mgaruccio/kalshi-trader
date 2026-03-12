@@ -216,6 +216,8 @@ def main():
             continue
 
         for s in scores:
+            if s.side != "no":
+                continue
             # Timestamp signal AFTER the instrument's first quote tick
             # so the strategy has a price to evaluate against
             inst_key = f"{ticker}-{s.side.upper()}.KALSHI"

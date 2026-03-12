@@ -85,6 +85,10 @@ class WeatherStrategy(Strategy):
 
     def _evaluate_entry(self, signal: ModelSignal):
         """Evaluate a ModelSignal for potential entry."""
+        # NO-only strategy — reject YES signals (defense-in-depth)
+        if signal.side != "no":
+            return
+
         if signal.ticker in self._danger_exited:
             self.log.info(f"Skip {signal.ticker}: danger-exited")
             return
