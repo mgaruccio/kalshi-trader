@@ -687,24 +687,36 @@ class KalshiInstrumentProvider(InstrumentProvider):
     def load_all(self, filters: dict | None = None):
         self._api_healthy = True
         series_ticker = (filters or {}).get("series_ticker")
-        try:
-            cursor = None
-            while True:
-                resp = self.k_api.get_markets(
-                    limit=50, cursor=cursor, status="open",
-                    series_ticker=series_ticker,
-                )
-                for m in getattr(resp, "markets", None) or []:
-                    if m.status not in ("active", "open"):
-                        continue
-                    # Add YES contract
-                    self.add(self._build_instrument(m, "YES"))
-                    # Add NO contract
-                    self.add(self._build_instrument(m, "NO"))
 
-                cursor = getattr(resp, "cursor", None)
-                if not cursor:
-                    break
+        # Kalshi API series_ticker filter needs per-city series (e.g. "KXHIGHCHI"),
+        # not the umbrella prefix ("KXHIGH"). Expand via SERIES_CONFIG if available.
+        series_tickers = [series_ticker] if series_ticker else [None]
+        if series_ticker:
+            try:
+                from kalshi_weather_ml.markets import SERIES_CONFIG
+                expanded = [s for s, _ in SERIES_CONFIG if s.startswith(series_ticker)]
+                if expanded:
+                    series_tickers = expanded
+            except ImportError:
+                pass
+
+        try:
+            for st in series_tickers:
+                cursor = None
+                while True:
+                    resp = self.k_api.get_markets(
+                        limit=200, cursor=cursor, status="open",
+                        series_ticker=st,
+                    )
+                    for m in getattr(resp, "markets", None) or []:
+                        if m.status not in ("active", "open"):
+                            continue
+                        self.add(self._build_instrument(m, "YES"))
+                        self.add(self._build_instrument(m, "NO"))
+
+                    cursor = getattr(resp, "cursor", None)
+                    if not cursor:
+                        break
         except Exception as e:
             self._api_healthy = False
             log.error(f"API failure during load_all — returning empty instrument list: {e}")
