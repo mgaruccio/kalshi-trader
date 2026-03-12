@@ -251,6 +251,7 @@ def run_phase_a():
         "min_p_win": PROD_MIN_P_WIN,
         "max_cost_cents": PROD_MAX_COST,
         "sell_target_cents": PROD_SELL_TARGET,
+        "trade_size": 20,
     }
 
     try:
@@ -341,7 +342,7 @@ engine = run_backtest(
     climate_events_path=Path('{CLIMATE_EVENTS}'),
     catalog_path=Path('{catalog}'),
     starting_balance_usd=100,
-    strategy_config={{"min_p_win": {min_pw}, "max_cost_cents": {max_cost}, "sell_target_cents": {sell_target}}},
+    strategy_config={{"min_p_win": {min_pw}, "max_cost_cents": {max_cost}, "sell_target_cents": {sell_target}, "trade_size": 20}},
     model_signals_path=Path('{MODEL_SIGNALS}'),
 )
 
