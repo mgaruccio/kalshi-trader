@@ -313,13 +313,23 @@ class WeatherStrategy(Strategy):
         # Pop AFTER cancellation attempts
         self._open_spread_orders.pop(ticker, None)
 
-    def _deploy_ladder(self, ticker: str, signal: ModelSignal):
-        """Place Phase 2 ladder buy orders relative to current bid."""
+    def _deploy_ladder(self, ticker: str, signal: ModelSignal,
+                       budget_remaining: int | None = None) -> int:
+        """Place Phase 2 ladder buy orders relative to current bid.
+
+        Args:
+            budget_remaining: If provided, use this instead of querying
+                cache.orders_open() for capital/capacity checks. Used by
+                _on_refresh to avoid counting async-cancelled orders.
+
+        Returns:
+            Total cents deployed (for caller budget tracking).
+        """
         quote_key = self._quote_key(ticker, signal.side)
         quote = self._latest_quotes.get(quote_key)
         if quote is None:
             self.log.warning(f"No quote for {quote_key}, skipping Phase 2 ladder")
-            return
+            return 0
 
         bid_cents = int(round(quote.bid_price.as_double() * 100))
 
@@ -330,32 +340,39 @@ class WeatherStrategy(Strategy):
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
             self.log.warning(f"Instrument {instrument_id} not in cache, skipping Phase 2")
-            return
+            return 0
 
         # Check remaining capacity
         existing = self._positions_info.get(ticker, {})
         current_contracts = existing.get("contracts", 0)
         capacity = self._cfg.max_position_per_ticker - current_contracts
 
-        # Count pending buy order contracts
-        pending = self._count_pending_buys(instrument_id)
-        capacity -= pending
-        if capacity <= 0:
-            self.log.info(f"Skip ladder {ticker}: no capacity (pos={current_contracts}, pending={pending})")
-            return
+        if budget_remaining is None:
+            # Standalone call — query cache for pending orders
+            pending = self._count_pending_buys(instrument_id)
+            capacity -= pending
+        # else: rebalance mode — all buys just cancelled, skip cache query
 
-        # Capital cap: compute remaining budget
+        if capacity <= 0:
+            self.log.info(f"Skip ladder {ticker}: no capacity (pos={current_contracts})")
+            return 0
+
+        # Capital cap
         if self._cfg.max_total_deployed_cents > 0:
-            at_risk = self._total_capital_at_risk()
-            remaining_budget = self._cfg.max_total_deployed_cents - at_risk
+            if budget_remaining is not None:
+                remaining_budget = budget_remaining
+            else:
+                at_risk = self._total_capital_at_risk()
+                remaining_budget = self._cfg.max_total_deployed_cents - at_risk
             if remaining_budget <= 0:
                 self.log.info(
-                    f"Skip ladder {ticker}: capital cap reached ({at_risk}c >= {self._cfg.max_total_deployed_cents}c)"
+                    f"Skip ladder {ticker}: capital cap reached (budget={remaining_budget}c)"
                 )
-                return
+                return 0
         else:
             remaining_budget = float('inf')
 
+        total_deployed = 0
         order_ids = []
         for offset in self._cfg.stable_ladder_offsets_cents:
             price_cents = max(1, bid_cents - offset)
@@ -389,10 +406,13 @@ class WeatherStrategy(Strategy):
             )
             capacity -= size
             remaining_budget -= order_cost
+            total_deployed += order_cost
 
         if order_ids:
             self._ladder_orders.setdefault(ticker, []).extend(order_ids)
             self._last_ladder_bid[ticker] = bid_cents
+
+        return total_deployed
 
     def _total_capital_at_risk(self) -> int:
         """Conservative estimate of deployed capital in cents.
@@ -643,9 +663,25 @@ class WeatherStrategy(Strategy):
         # 3. Sort cheapest first — capital flows to best-value contracts
         candidates.sort(key=lambda x: x[0])
 
-        # 4. Deploy in order — _deploy_ladder handles capital budget internally
+        # 4. Compute budget from positions only (all buy orders are being cancelled,
+        #    but cache still shows them until exchange confirms — don't query cache)
+        if self._cfg.max_total_deployed_cents > 0:
+            position_cost = sum(
+                info.get("contracts", 0) * self._cfg.max_cost_cents
+                for info in self._positions_info.values()
+            )
+            remaining_budget = self._cfg.max_total_deployed_cents - position_cost
+        else:
+            remaining_budget = None  # disabled
+
+        # 5. Deploy in order, tracking budget ourselves
         for bid_cents, ticker, signal in candidates:
-            self._deploy_ladder(ticker, signal)
+            if remaining_budget is not None and remaining_budget <= 0:
+                self.log.info(f"Rebalance budget exhausted, {len(candidates)} candidates remaining")
+                break
+            deployed = self._deploy_ladder(ticker, signal, budget_remaining=remaining_budget)
+            if remaining_budget is not None:
+                remaining_budget -= deployed
 
     def _cancel_ladder_orders(self, ticker: str):
         """Cancel all Phase 2 ladder buy orders for a ticker."""

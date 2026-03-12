@@ -1075,20 +1075,12 @@ class TestGlobalRebalance:
         strategy._latest_quotes["KXHIGHSFO-26MAR15-T71-NO.KALSHI"] = _mock_quote(80, 82)
         strategy._latest_quotes["KXHIGHNY-26MAR15-T52-NO.KALSHI"] = _mock_quote(90, 92)
 
-        # Mock _total_capital_at_risk to simulate budget being consumed:
-        # First call (SFO deploy): 0c at risk → deploys 80c
-        # Second call (NY deploy): 80c at risk → 80c remaining < 90c → skip
-        call_count = [0]
-        def mock_at_risk():
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return 0
-            return 80
-        strategy._total_capital_at_risk = mock_at_risk
-
+        # Budget = 160c, no positions → remaining = 160c
+        # _on_refresh tracks budget manually (no cache dependency)
+        # SFO first (cheapest): 80c × 1 = 80c deployed → 80c remaining
+        # NY second: 90c × 1 = 90c > 80c remaining → skip
         strategy._on_refresh()
 
-        # SFO deployed (cheapest first), NY skipped (budget exhausted)
         assert "KXHIGHSFO-26MAR15-T71" in strategy._ladder_orders
         assert "KXHIGHNY-26MAR15-T52" not in strategy._ladder_orders
 
