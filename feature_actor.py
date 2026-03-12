@@ -361,11 +361,34 @@ class FeatureActor(Actor):
 
         for (city, sd), ticker_list in cd_tickers.items():
             state = self._city_features.get((city, sd))
-            if state is None:
-                continue
-            features = state.snapshot()
+            features = state.snapshot() if state else {}
+
             ecmwf = features.get("ecmwf_high")
             gfs = features.get("gfs_high")
+
+            # Bootstrap: fetch forecasts if not yet accumulated from pollers
+            if (ecmwf is None or gfs is None) and get_forecast is not None:
+                try:
+                    ecmwf = ecmwf or get_forecast(city, sd, PRIMARY_MODEL)
+                    gfs = gfs or get_forecast(city, sd, CONSENSUS_MODEL)
+                    wx = get_weather_features(city, sd) if get_weather_features else {}
+                    # Hydrate feature store so subsequent cycles don't re-fetch
+                    if ecmwf is not None or gfs is not None:
+                        bootstrap = {}
+                        if ecmwf is not None:
+                            bootstrap["ecmwf_high"] = ecmwf
+                        if gfs is not None:
+                            bootstrap["gfs_high"] = gfs
+                        if ecmwf is not None and gfs is not None:
+                            bootstrap["forecast_high"] = max(ecmwf, gfs)
+                        bootstrap.update(wx)
+                        key = (city, sd)
+                        s = self._city_features.setdefault(key, CityFeatureState())
+                        s.update("bootstrap_forecast", bootstrap)
+                        features = s.snapshot()
+                except Exception as e:
+                    self.log.warning(f"Bootstrap forecast fetch failed for {city}/{sd}: {e}")
+
             if ecmwf is None or gfs is None:
                 continue
 
