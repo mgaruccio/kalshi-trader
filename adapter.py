@@ -686,10 +686,14 @@ class KalshiInstrumentProvider(InstrumentProvider):
 
     def load_all(self, filters: dict | None = None):
         self._api_healthy = True
+        series_ticker = (filters or {}).get("series_ticker")
         try:
             cursor = None
             while True:
-                resp = self.k_api.get_markets(limit=50, cursor=cursor, status="open")
+                resp = self.k_api.get_markets(
+                    limit=50, cursor=cursor, status="open",
+                    series_ticker=series_ticker,
+                )
                 for m in getattr(resp, "markets", None) or []:
                     if m.status not in ("active", "open"):
                         continue
