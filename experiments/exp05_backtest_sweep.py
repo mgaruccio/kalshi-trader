@@ -243,6 +243,62 @@ def run_phase_a():
 # Phase B: Parameter sweep
 # ---------------------------------------------------------------------------
 
+def _run_single_combo(catalog, min_pw, max_cost, sell_target):
+    """Run one backtest combo in a subprocess (NT Rust logger can't reinitialize)."""
+    import subprocess, json as _json
+    script = f"""
+import sys, json, logging
+sys.path.insert(0, '.')
+logging.basicConfig(level=logging.WARNING)
+from pathlib import Path
+from backtest_runner import run_backtest
+
+engine = run_backtest(
+    climate_events_path=Path('{CLIMATE_EVENTS}'),
+    catalog_path=Path('{catalog}'),
+    starting_balance_usd=100,
+    strategy_config={{"min_p_win": {min_pw}, "max_cost_cents": {max_cost}, "sell_target_cents": {sell_target}}},
+    model_signals_path=Path('{MODEL_SIGNALS}'),
+)
+
+# Extract results inline
+r = {{"signals": 0, "buys": 0, "sells": 0, "positions_open": 0, "positions_closed": 0, "realized_pnl": 0.0, "balance": None}}
+strats = list(engine.trader.strategies())
+if strats:
+    r["signals"] = getattr(strats[0], "signals_received", 0)
+    r["positions_open"] = len(getattr(strats[0], "_positions_info", {{}}))
+try:
+    orders = engine.cache.orders()
+    r["buys"] = sum(1 for o in orders if o.side.value == 1 and o.filled_qty.as_double() > 0)
+    r["sells"] = sum(1 for o in orders if o.side.value == 2 and o.filled_qty.as_double() > 0)
+except: pass
+try:
+    accts = engine.cache.accounts()
+    if accts: r["balance"] = accts[0].balance_total().as_double()
+except: pass
+try:
+    positions = engine.cache.positions()
+    closed = [p for p in positions if p.is_closed]
+    opened = [p for p in positions if p.is_open]
+    r["positions_closed"] = len(closed)
+    r["positions_open"] = len(opened)
+    r["realized_pnl"] = sum(p.realized_pnl.as_double() for p in closed)
+except: pass
+print("RESULT:" + json.dumps(r))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("RESULT:"):
+            return _json.loads(line[7:])
+    # If no RESULT line, return error info
+    stderr_tail = result.stderr.strip().split('\n')[-3:] if result.stderr else []
+    return {"error": " | ".join(stderr_tail) or f"exit code {result.returncode}"}
+
+
 def run_phase_b():
     print("\n" + "=" * 80)
     print("PHASE B: PARAMETER SWEEP")
@@ -266,22 +322,13 @@ def run_phase_b():
 
     for min_pw in SWEEP_MIN_P_WIN:
         for max_cost in SWEEP_MAX_COST:
-            strategy_config = {
-                "min_p_win": min_pw,
-                "max_cost_cents": max_cost,
-                "sell_target_cents": PROD_SELL_TARGET,
-            }
             try:
-                engine = run_backtest(
-                    climate_events_path=CLIMATE_EVENTS,
-                    catalog_path=catalog,
-                    starting_balance_usd=100,
-                    strategy_config=strategy_config,
-                    model_signals_path=MODEL_SIGNALS,
-                )
-                r = _extract_results(engine)
+                r = _run_single_combo(catalog, min_pw, max_cost, PROD_SELL_TARGET)
+                if "error" in r:
+                    print(f"{min_pw:>8.2f}  {max_cost:>8}  ERROR: {r['error'][:60]}")
+                    continue
                 pnl = f"${r['realized_pnl']:+.2f}"
-                bal = f"${r['balance']:.2f}" if r["balance"] is not None else "N/A"
+                bal = f"${r['balance']:.2f}" if r.get("balance") is not None else "N/A"
                 print(
                     f"{min_pw:>8.2f}  {max_cost:>8}  "
                     f"{r['signals']:>8,}  {r['buys']:>5}  {r['sells']:>5}  "

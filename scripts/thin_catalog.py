@@ -45,7 +45,12 @@ def thin_catalog(
     total_original = 0
     total_thinned = 0
 
-    instruments = sorted(d for d in qt_source.iterdir() if d.is_dir())
+    all_instruments = sorted(d for d in qt_source.iterdir() if d.is_dir())
+    # Filter: KXHIGH T-style only (exclude KXLOWT, bracket B-style from early sessions)
+    instruments = [d for d in all_instruments if "KXHIGH" in d.name and "-B" not in d.name]
+    skipped = len(all_instruments) - len(instruments)
+    if skipped:
+        print(f"Skipped {skipped} non-KXHIGH-T instruments")
     for inst_dir in instruments:
         inst_name = inst_dir.name
         out_dir = qt_dest / inst_name
