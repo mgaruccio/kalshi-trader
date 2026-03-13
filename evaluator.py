@@ -175,10 +175,41 @@ def _get_filter_gate(score, config) -> str:
     return "pass"
 
 
+def _check_rolling_features_staleness(max_stale_hours: float = 36.0) -> bool:
+    """Return True if rolling features are fresh enough to trade on."""
+    mart_path = Path(_KW_ROOT) / "data" / "rolling_features.json"
+    if not mart_path.exists():
+        log.error("Rolling features mart not found — cannot generate orders")
+        return False
+    try:
+        mart = json.loads(mart_path.read_text())
+        built_at = mart.get("built_at")
+        if not built_at:
+            log.error("Rolling features mart has no built_at — cannot verify freshness")
+            return False
+        built_ts = datetime.fromisoformat(built_at)
+        age_hours = (datetime.now(timezone.utc) - built_ts).total_seconds() / 3600
+        if age_hours > max_stale_hours:
+            log.error(
+                "Rolling features are %.0fh stale (limit %.0fh) — "
+                "evaluations will run but NO orders will be generated. "
+                "Run collect_daily_obs.py to refresh.",
+                age_hours, max_stale_hours,
+            )
+            return False
+        return True
+    except Exception as e:
+        log.error(f"Failed to check rolling features staleness: {e}")
+        return False
+
+
 def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, config, stream_key):
     """One evaluation cycle: score all markets, write to DB, publish to Redis."""
     cycle_id = str(uuid.uuid4())[:8]
     cycle_ts = datetime.now(timezone.utc).isoformat()
+
+    # Gate: refuse to generate orders if rolling features are stale
+    features_fresh = _check_rolling_features_staleness()
 
     # 1. Fetch markets
     try:
@@ -309,6 +340,16 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
         write_evaluations(db_conn, all_evals)
 
     # 5. Compute desired orders for passing signals and publish to Redis
+    #    GATED on features_fresh — stale rolling features = no orders, no signals.
+    #    Evaluations are still written (step 4) for dashboard visibility.
+    if not features_fresh:
+        beat_heartbeat(db_conn, "evaluator", status="stale",
+                      message=f"cycle={cycle_id} evals={len(all_evals)} STALE — no orders generated")
+        log_event(db_conn, "evaluator", "error", "Rolling features stale — orders suppressed")
+        db_conn.commit()
+        log.warning(f"Cycle {cycle_id}: {len(all_evals)} evals, 0 orders (STALE features)")
+        return
+
     #    Sort cheapest-first (matches _on_refresh global rebalance logic)
     #    and track global budget across all tickers.
     max_budget = getattr(config, "max_total_deployed_cents", 4000)

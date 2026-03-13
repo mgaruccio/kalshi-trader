@@ -18,6 +18,13 @@ def tmp_db():
         yield db_path
 
 
+@pytest.fixture(autouse=True)
+def _fresh_rolling_features():
+    """All evaluate_cycle tests assume rolling features are fresh."""
+    with patch("evaluator._check_rolling_features_staleness", return_value=True):
+        yield
+
+
 class TestEvaluateCycle:
     """Test the core evaluation cycle."""
 
@@ -564,3 +571,72 @@ class TestComputeDesiredLadder:
         assert len(orders) == 2
         assert "offset=0" in orders[0]["reason"]
         assert "offset=2" in orders[1]["reason"]
+
+
+class TestStalenessGate:
+    """Test that stale rolling features suppress order generation."""
+
+    def test_stale_features_suppresses_orders(self, tmp_db):
+        """When features are stale, evaluations are written but no orders generated."""
+        from evaluator import evaluate_cycle
+        from db import get_heartbeats
+
+        conn = get_connection(tmp_db)
+
+        mock_markets = [
+            {
+                "ticker": "KXHIGHCHI-26MAR15-T55",
+                "city": "chicago",
+                "direction": "above",
+                "threshold": 55.0,
+                "settlement_date": "2026-03-15",
+                "yes_bid": 85,
+                "yes_ask": 87,
+            },
+        ]
+
+        mock_model = MagicMock()
+        mock_model.predict_bust_prob.return_value = 0.05
+
+        mock_config = MagicMock()
+        mock_config.min_p_win = 0.90
+        mock_config.above_no_enabled = True
+        mock_config.above_yes_enabled = True
+        mock_config.below_no_enabled = True
+        mock_config.below_yes_enabled = True
+        mock_config.min_models_scored = 1
+        mock_config.min_margin = None
+        mock_config.ensemble_require_unanimous = False
+        mock_config.max_no_cost_cents = 92
+        mock_config.max_total_deployed_cents = 4000
+        mock_config.max_contracts_per_ticker = 20
+
+        with patch("evaluator._check_rolling_features_staleness", return_value=False), \
+             patch("evaluator.fetch_open_markets", return_value=mock_markets), \
+             patch("evaluator.get_forecast", return_value=52.0), \
+             patch("evaluator.get_weather_features", return_value={}), \
+             patch("evaluator.get_forecast_icon", return_value=53.0):
+
+            evaluate_cycle(
+                db_conn=conn,
+                redis_client=MagicMock(),
+                models=[mock_model],
+                model_names=["emos"],
+                model_weights=[1.0],
+                config=mock_config,
+                stream_key="test-signals",
+            )
+
+        # Evaluations should still be written
+        evals = get_latest_evaluations(conn)
+        assert len(evals) > 0
+
+        # But no desired orders
+        orders = get_desired_orders(conn, status="pending")
+        assert len(orders) == 0
+
+        # Heartbeat should say STALE
+        heartbeats = get_heartbeats(conn)
+        hb = [h for h in heartbeats if h["process_name"] == "evaluator"][0]
+        assert hb["status"] == "stale"
+        conn.close()
