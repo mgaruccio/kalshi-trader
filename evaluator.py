@@ -312,7 +312,12 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
     #    Sort cheapest-first (matches _on_refresh global rebalance logic)
     #    and track global budget across all tickers.
     max_budget = getattr(config, "max_total_deployed_cents", 4000)
-    remaining_budget = max_budget
+    max_cost = getattr(config, "max_no_cost_cents", 92)
+
+    # Subtract capital already deployed in positions
+    positions = get_positions(db_conn)
+    deployed = sum(p.get("contracts", 0) * max_cost for p in positions)
+    remaining_budget = max_budget - deployed
 
     # Sort by bid price ascending (cheapest first)
     for sig_info in passing_signals:
