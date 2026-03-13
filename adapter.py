@@ -718,8 +718,12 @@ class KalshiExecutionClient(LiveExecutionClient):
         from kalshi_python.models.batch_create_orders_request import BatchCreateOrdersRequest
         batch_req = BatchCreateOrdersRequest(orders=requests)
         resp = self.k_portfolio.batch_create_orders_with_http_info(batch_req)
-        data = json.loads(resp.raw_data)
-        return data.get("responses", [])
+        raw = resp.raw_data
+        data = json.loads(raw)
+        responses = data.get("responses") or data.get("orders") or []
+        if not responses:
+            log.warning(f"Batch API returned unexpected structure: {raw[:500]}")
+        return responses
 
     async def _send_batch_submit(
         self, commands: list[SubmitOrder], requests: list[CreateOrderRequest],
