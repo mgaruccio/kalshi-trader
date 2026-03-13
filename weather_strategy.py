@@ -19,6 +19,7 @@ Reacts to:
 """
 import logging
 from datetime import date, timedelta, datetime, timezone
+from pathlib import Path
 
 from nautilus_trader.model.data import QuoteTick, DataType
 from nautilus_trader.model.events import OrderFilled
@@ -30,6 +31,10 @@ from kalshi_weather_ml.markets import parse_ticker, SERIES_CONFIG
 
 from adapter import KALSHI_VENUE
 from data_types import ModelSignal, DangerAlert
+from db import (
+    init_db, get_connection, write_fill, upsert_position,
+    beat_heartbeat, write_danger_exited, get_danger_exited, log_event,
+)
 
 log = logging.getLogger(__name__)
 
@@ -116,12 +121,28 @@ class WeatherStrategy(Strategy):
         self._feature_actor = None  # set after construction
         self._reconciled = False  # set True after first reconciliation
 
+        # DB connection (initialized in on_start)
+        self._db_conn = None
+
     def set_feature_actor(self, actor):
         """Wire the FeatureActor reference for position updates."""
         self._feature_actor = actor
 
     def on_start(self):
         """Subscribe to ModelSignal, DangerAlert, and quote ticks. Start refresh timer."""
+        # Initialize SQLite DB connection
+        try:
+            db_path = Path(self._cfg.db_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            init_db(db_path)
+            self._db_conn = get_connection(db_path)
+            # Load persisted danger_exited to survive restarts
+            self._danger_exited.update(get_danger_exited(self._db_conn))
+            self.log.info(f"DB initialized at {db_path}, loaded {len(self._danger_exited)} danger_exited tickers")
+        except Exception as e:
+            self.log.error(f"DB init failed (continuing without DB): {e}")
+            self._db_conn = None
+
         # Subscribe via msgbus directly — subscribe_data() requires client_id
         # which doesn't exist for internal pub/sub in live TradingNode.
         for dtype in (ModelSignal, DangerAlert):
@@ -606,6 +627,18 @@ class WeatherStrategy(Strategy):
 
         # Mark as danger-exited BEFORE attempting sell (prevents retry loops)
         self._danger_exited.add(alert.ticker)
+        if self._db_conn is not None:
+            try:
+                write_danger_exited(
+                    self._db_conn,
+                    ticker=alert.ticker,
+                    reason=alert.reason,
+                    rule_name=alert.rule_name,
+                    p_win=0.0,  # p_win not available at alert level; use 0.0 as sentinel
+                )
+                self._db_conn.commit()
+            except Exception as e:
+                self.log.error(f"DB danger_exited write failed: {e}")
 
         # Cancel all resting buy orders for this ticker first
         self._cancel_all_buys_for_ticker(alert.ticker)
@@ -735,6 +768,36 @@ class WeatherStrategy(Strategy):
             self._positions_info.pop(ticker, None)
             self._cleanup_ticker_state(ticker)
 
+        # Write fill and updated position to DB
+        if self._db_conn is not None:
+            try:
+                action = "buy" if event.order_side == OrderSide.BUY else "sell"
+                price_cents = int(round(event.last_px.as_double() * 100))
+                fill_qty = int(event.last_qty.as_double())
+                trade_id = str(event.trade_id) if event.trade_id else None
+                write_fill(
+                    self._db_conn,
+                    trade_id=trade_id,
+                    ticker=ticker,
+                    side=side,
+                    action=action,
+                    price_cents=price_cents,
+                    qty=fill_qty,
+                )
+                # Upsert current position state (may be 0 if fully closed)
+                current_pos = self._positions_info.get(ticker, {})
+                upsert_position(
+                    self._db_conn,
+                    ticker,
+                    side=current_pos.get("side", side),
+                    contracts=current_pos.get("contracts", 0),
+                    city=current_pos.get("city", ""),
+                    threshold=current_pos.get("threshold", 0.0),
+                )
+                self._db_conn.commit()
+            except Exception as e:
+                self.log.error(f"DB write failed for fill: {e}")
+
         # Sync with FeatureActor
         self._sync_positions_to_actor()
 
@@ -844,6 +907,21 @@ class WeatherStrategy(Strategy):
             if remaining_budget is not None:
                 remaining_budget -= deployed
 
+        # Write heartbeat to DB
+        if self._db_conn is not None:
+            try:
+                positions_count = len(self._positions_info)
+                ladders_count = len(self._ladder_orders)
+                beat_heartbeat(
+                    self._db_conn,
+                    "executor",
+                    status="ok",
+                    message=f"positions={positions_count} ladders={ladders_count}",
+                )
+                self._db_conn.commit()
+            except Exception as e:
+                self.log.error(f"DB heartbeat failed: {e}")
+
     def _compute_margin(self, ticker: str, signal: ModelSignal) -> float | None:
         """Compute forecast margin in °F from signal features and ticker threshold.
 
@@ -900,6 +978,14 @@ class WeatherStrategy(Strategy):
         """Push current position info to FeatureActor for exit rule evaluation."""
         if self._feature_actor is not None:
             self._feature_actor.update_positions(self._positions_info)
+
+    def get_state(self) -> dict:
+        """Return serializable strategy state for persistence."""
+        return {"danger_exited": list(self._danger_exited)}
+
+    def set_state(self, state: dict):
+        """Restore strategy state from a previously saved snapshot."""
+        self._danger_exited = set(state.get("danger_exited", []))
 
     @property
     def signals_received(self) -> int:

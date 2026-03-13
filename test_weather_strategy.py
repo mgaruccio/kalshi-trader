@@ -6,6 +6,8 @@ Bind WeatherStrategy's methods onto a pure Python stand-in to bypass
 NT's Cython read-only descriptors (log, clock, cache, etc.).
 """
 import pytest
+import tempfile
+from pathlib import Path
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, call, patch
 
@@ -13,6 +15,7 @@ from nautilus_trader.model.enums import OrderSide
 
 from data_types import ModelSignal, DangerAlert
 from weather_strategy import WeatherStrategy, WeatherStrategyConfig
+from db import init_db, get_connection, get_positions, get_danger_exited, get_recent_fills, get_heartbeats
 
 
 def _make_signal(
@@ -77,6 +80,8 @@ class _TestableWeatherStrategy:
         self._feature_actor = None
         self._reconciled = True  # skip reconciliation in unit tests
         self._subscribed_instruments: set = set()
+        # DB connection (None = disabled in unit tests by default)
+        self._db_conn = None
         # NT mocks
         self.log = MagicMock()
         self.cache = MagicMock()
@@ -128,6 +133,8 @@ class _TestableWeatherStrategy:
     set_feature_actor = WeatherStrategy.set_feature_actor
     _sync_positions_to_actor = WeatherStrategy._sync_positions_to_actor
     _reconcile_existing_state = WeatherStrategy._reconcile_existing_state
+    get_state = WeatherStrategy.get_state
+    set_state = WeatherStrategy.set_state
 
     @property
     def signals_received(self) -> int:
@@ -1824,3 +1831,201 @@ class TestReconciliation:
 
         # 460c at risk + 255c (85*3) > 500c → skip
         strategy.submit_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# DB Integration Tests
+# ---------------------------------------------------------------------------
+
+def _make_fill_event(
+    ticker="KXHIGHCHI-26MAR15-T55",
+    side="no",
+    order_side=OrderSide.BUY,
+    price_cents=85,
+    qty=3,
+):
+    """Build a mock OrderFilled event."""
+    event = MagicMock()
+    event.instrument_id.symbol.value = f"{ticker}-{side.upper()}"
+    event.order_side = order_side
+    event.last_px.as_double.return_value = price_cents / 100.0
+    event.last_qty.as_double.return_value = float(qty)
+    event.trade_id = "trade-abc-123"
+    return event
+
+
+class TestDbIntegration:
+    """Tests for SQLite DB write integration in WeatherStrategy."""
+
+    def _make_strategy_with_db(self, tmp_path: Path, **config_kwargs):
+        """Create a _TestableWeatherStrategy with a real SQLite DB."""
+        db_path = tmp_path / "trading.db"
+        init_db(db_path)
+        strategy = _make_strategy(**config_kwargs)
+        conn = get_connection(db_path)
+        strategy._db_conn = conn
+        return strategy, conn, db_path
+
+    def test_fill_writes_to_db(self, tmp_path):
+        """When a fill occurs, a row is written to the fills table."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.cache.instrument.return_value = _mock_instrument()
+
+        event = _make_fill_event(qty=3, price_cents=85, order_side=OrderSide.BUY)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"threshold": 55, "series": "KXHIGHCHI"}
+            strategy.on_order_filled(event)
+
+        fills = get_recent_fills(conn)
+        assert len(fills) == 1
+        f = fills[0]
+        assert f["ticker"] == "KXHIGHCHI-26MAR15-T55"
+        assert f["side"] == "no"
+        assert f["action"] == "buy"
+        assert f["price_cents"] == 85
+        assert f["qty"] == 3
+        assert f["trade_id"] == "trade-abc-123"
+
+    def test_fill_sell_writes_action_sell(self, tmp_path):
+        """Sell fills are recorded with action='sell'."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        # Pre-seed position so sell doesn't go negative and get cleaned up
+        strategy._positions_info["KXHIGHCHI-26MAR15-T55"] = {
+            "side": "no", "contracts": 5, "city": "chicago", "threshold": 55.0
+        }
+
+        event = _make_fill_event(qty=2, price_cents=97, order_side=OrderSide.SELL)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"threshold": 55, "series": "KXHIGHCHI"}
+            strategy.on_order_filled(event)
+
+        fills = get_recent_fills(conn)
+        assert any(f["action"] == "sell" for f in fills)
+
+    def test_fill_upserts_position_to_db(self, tmp_path):
+        """After a fill, the position is upserted into the DB positions table."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.cache.instrument.return_value = _mock_instrument()
+
+        event = _make_fill_event(qty=3, price_cents=85, order_side=OrderSide.BUY)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"threshold": 55, "series": "KXHIGHCHI"}
+            strategy.on_order_filled(event)
+
+        positions = get_positions(conn)
+        assert len(positions) == 1
+        p = positions[0]
+        assert p["ticker"] == "KXHIGHCHI-26MAR15-T55"
+        assert p["contracts"] == 3
+        assert p["side"] == "no"
+
+    def test_db_write_failure_does_not_crash_fill(self, tmp_path):
+        """If the DB write fails, on_order_filled still completes (no exception raised)."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        # Close the connection to force a DB error
+        conn.close()
+
+        event = _make_fill_event(qty=3, price_cents=85, order_side=OrderSide.BUY)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"threshold": 55, "series": "KXHIGHCHI"}
+            # Should not raise even with broken DB
+            strategy.on_order_filled(event)
+
+        # Position tracking still works despite DB failure
+        assert "KXHIGHCHI-26MAR15-T55" in strategy._positions_info
+
+    def test_heartbeat_written_on_refresh(self, tmp_path):
+        """_on_refresh writes an 'executor' heartbeat to the DB."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+
+        strategy._on_refresh()
+
+        heartbeats = get_heartbeats(conn)
+        assert any(h["process_name"] == "executor" for h in heartbeats)
+        hb = next(h for h in heartbeats if h["process_name"] == "executor")
+        assert hb["status"] == "ok"
+        assert "positions=" in hb["message"]
+        assert "ladders=" in hb["message"]
+
+    def test_heartbeat_not_written_if_no_db(self):
+        """_on_refresh does not crash if _db_conn is None."""
+        strategy = _make_strategy()
+        strategy._db_conn = None
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+
+        # Must not raise
+        strategy._on_refresh()
+
+    def test_danger_exited_written_to_db(self, tmp_path):
+        """When a CRITICAL DangerAlert is processed, the ticker is written to danger_exited."""
+        strategy, conn, _ = self._make_strategy_with_db(tmp_path)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        strategy._positions_info["KXHIGHCHI-26MAR15-T55"] = {
+            "side": "no", "contracts": 3, "city": "chicago", "threshold": 55.0
+        }
+        # Provide a quote for the exit sell
+        strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(50, 55)
+
+        alert = _make_alert(level="CRITICAL")
+        strategy._evaluate_exit(alert)
+
+        tickers = get_danger_exited(conn)
+        assert "KXHIGHCHI-26MAR15-T55" in tickers
+
+    def test_danger_exited_loaded_on_on_start_override(self, tmp_path):
+        """get_danger_exited is called and populates _danger_exited from DB."""
+        db_path = tmp_path / "trading.db"
+        init_db(db_path)
+        # Pre-write a danger_exited entry
+        conn = get_connection(db_path)
+        from db import write_danger_exited
+        write_danger_exited(conn, "KXHIGHCHI-26MAR15-T55", reason="test", rule_name="test_rule", p_win=0.5)
+        conn.commit()
+        conn.close()
+
+        # Create strategy and manually simulate what on_start does for DB
+        strategy = _make_strategy()
+        strategy._db_conn = get_connection(db_path)
+        strategy._danger_exited.update(get_danger_exited(strategy._db_conn))
+
+        assert "KXHIGHCHI-26MAR15-T55" in strategy._danger_exited
+
+    def test_get_state_set_state_roundtrip(self):
+        """get_state/set_state preserves danger_exited across instances."""
+        strategy1 = _make_strategy()
+        strategy1._danger_exited = {"KXHIGHCHI-26MAR15-T55", "KXHIGHTBOS-26MAR13-T45"}
+
+        state = strategy1.get_state()
+        assert set(state["danger_exited"]) == {"KXHIGHCHI-26MAR15-T55", "KXHIGHTBOS-26MAR13-T45"}
+
+        strategy2 = _make_strategy()
+        strategy2.set_state(state)
+        assert strategy2._danger_exited == {"KXHIGHCHI-26MAR15-T55", "KXHIGHTBOS-26MAR13-T45"}
+
+    def test_set_state_empty(self):
+        """set_state with empty dict leaves _danger_exited as empty set."""
+        strategy = _make_strategy()
+        strategy._danger_exited = {"KXHIGHCHI-26MAR15-T55"}
+        strategy.set_state({})
+        assert strategy._danger_exited == set()
+
+    def test_fill_without_db_still_tracks_position(self):
+        """Fill handling works correctly when _db_conn is None (no DB)."""
+        strategy = _make_strategy()
+        strategy._db_conn = None
+        strategy.cache.instrument.return_value = _mock_instrument()
+
+        event = _make_fill_event(qty=5, price_cents=82, order_side=OrderSide.BUY)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"threshold": 55, "series": "KXHIGHCHI"}
+            strategy.on_order_filled(event)
+
+        assert strategy._positions_info["KXHIGHCHI-26MAR15-T55"]["contracts"] == 5
