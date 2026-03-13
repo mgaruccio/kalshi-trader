@@ -159,6 +159,13 @@ class TestEvaluateCycle:
 
         mock_config = MagicMock()
         mock_config.min_p_win = 0.90
+        mock_config.above_no_enabled = True
+        mock_config.above_yes_enabled = True
+        mock_config.below_no_enabled = True
+        mock_config.below_yes_enabled = True
+        mock_config.min_models_scored = 1
+        mock_config.min_margin = None
+        mock_config.ensemble_require_unanimous = False
         mock_config.stable_ladder_offsets_cents = (0, 1, 3, 5, 10)
         mock_config.stable_size = 3
         mock_config.thin_margin_threshold_f = 2.0
@@ -288,10 +295,15 @@ class TestEvaluateCycle:
         stream_key, fields = xadd_calls[0]
         assert stream_key == "test-signals"
         assert fields[b"type"] == b"ModelSignal"
-        # Decode payload
+        # Decode payload and verify full roundtrip
         payload = _msgpack.unpackb(fields[b"payload"], raw=False)
         assert payload["ticker"] == "KXHIGHCHI-26MAR15-T55"
         assert payload["side"] == "no"
+        # Verify p_win is preserved through msgpack roundtrip
+        from data_types import ModelSignal as _ModelSignal
+        restored = _ModelSignal.from_dict(payload)
+        expected_p_win = no_score.p_win
+        assert restored.p_win == pytest.approx(expected_p_win, abs=0.01)
         conn.close()
 
 

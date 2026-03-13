@@ -624,7 +624,7 @@ class WeatherStrategy(Strategy):
                     ticker=alert.ticker,
                     reason=alert.reason,
                     rule_name=alert.rule_name,
-                    p_win=0.0,  # p_win not available at alert level; use 0.0 as sentinel
+                    p_win=None,  # p_win not available at alert level
                 )
                 self._db_conn.commit()
             except Exception as e:

@@ -112,7 +112,7 @@ def cmd_fills(conn, args):
 
 def cmd_pnl(conn, args):
     """Cumulative P&L from fills."""
-    fills = get_recent_fills(conn, limit=1000)
+    fills = get_recent_fills(conn, limit=10000)  # fetch all (practical upper bound)
     if not fills:
         print("No fills to compute P&L")
         return

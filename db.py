@@ -508,3 +508,11 @@ def get_recent_events(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_forecasts(conn: sqlite3.Connection) -> list[dict]:
+    """Return all forecast rows ordered by date desc, city."""
+    rows = conn.execute(
+        "SELECT * FROM forecasts ORDER BY date DESC, city"
+    ).fetchall()
+    return [dict(r) for r in rows]

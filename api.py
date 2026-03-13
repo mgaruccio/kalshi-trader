@@ -4,6 +4,7 @@ Thin read-only wrappers around db.py functions. No business logic.
 """
 import argparse
 import logging
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -21,6 +22,7 @@ from db import (
     get_danger_exited,
     get_config,
     get_recent_events,
+    get_forecasts,
 )
 
 log = logging.getLogger(__name__)
@@ -78,14 +80,7 @@ def create_app(db_path: str = "data/trading.db") -> FastAPI:
 
     @app.get("/api/forecasts")
     def forecasts():
-        conn = get_connection(Path(db_path))
-        try:
-            rows = conn.execute(
-                "SELECT * FROM forecasts ORDER BY date DESC, city"
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        return _query(db_path, get_forecasts)
 
     # Static files + dashboard
     static_dir = Path(__file__).parent / "static"
@@ -105,8 +100,13 @@ def create_app(db_path: str = "data/trading.db") -> FastAPI:
     return app
 
 
-# Module-level app for uvicorn
-app = create_app()
+# Module-level app for uvicorn — respects TRADING_DB env var
+def _get_app() -> FastAPI:
+    db_path = os.environ.get("TRADING_DB", "data/trading.db")
+    return create_app(db_path)
+
+
+app = _get_app()
 
 
 if __name__ == "__main__":

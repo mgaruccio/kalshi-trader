@@ -23,19 +23,20 @@ def conn(db_path):
 
 
 def test_init_db_creates_tables(db_path):
-    """init_db creates all 11 tables and enables WAL mode."""
+    """init_db creates exactly the 11 expected tables and enables WAL mode."""
     c = db.get_connection(db_path)
     try:
         row = c.execute("PRAGMA journal_mode").fetchone()
         assert row[0] == "wal"
 
-        tables = {
+        tables = sorted(
             r[0]
             for r in c.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
-        }
-        expected = {
+        )
+        expected = sorted([
             "evaluations",
             "desired_orders",
             "positions",
@@ -47,8 +48,8 @@ def test_init_db_creates_tables(db_path):
             "events",
             "config",
             "danger_exited",
-        }
-        assert expected.issubset(tables)
+        ])
+        assert tables == expected
     finally:
         c.close()
 

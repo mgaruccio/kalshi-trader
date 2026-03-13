@@ -16,6 +16,7 @@ from pathlib import Path
 import msgpack
 import numpy as np
 import redis
+import sqlite3
 
 # kalshi_weather_ml imports
 _KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
@@ -153,6 +154,27 @@ def compute_desired_ladder(
     return orders
 
 
+def _get_filter_gate(score, config) -> str:
+    """Return the name of the first filter gate that rejects this score, or 'pass'."""
+    strategy_key = f"{score.direction}_{score.side}"
+    enabled_key = f"{strategy_key}_enabled"
+
+    if not getattr(config, enabled_key, True):
+        return "strategy_disabled"
+    if score.n_models_scored < getattr(config, "min_models_scored", 0):
+        return "min_models"
+    min_margin = getattr(config, "min_margin", None)
+    if min_margin is not None and score.margin < min_margin:
+        return "min_margin"
+    if score.p_win < config.min_p_win:
+        return "min_p_win"
+    if getattr(config, "ensemble_require_unanimous", False):
+        failing = [n for n, pw in score.model_scores.items() if pw < config.min_p_win]
+        if failing:
+            return "unanimous"
+    return "pass"
+
+
 def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, config, stream_key):
     """One evaluation cycle: score all markets, write to DB, publish to Redis."""
     cycle_id = str(uuid.uuid4())[:8]
@@ -192,7 +214,7 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
             ecmwf = get_forecast(city, sd, PRIMARY_MODEL)
             gfs = get_forecast(city, sd, CONSENSUS_MODEL)
             icon = get_forecast_icon(city, sd)
-            wx = get_weather_features(city, sd) if get_weather_features else {}
+            wx = get_weather_features(city, sd)
         except Exception as e:
             log.warning(f"Forecast fetch failed for {city}/{sd}: {e}")
             continue
@@ -237,7 +259,22 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
             for s in scores:
                 key = (s.ticker, s.side)
                 filter_result = "pass" if key in passing_keys else "filtered"
-                filter_reason = "" if filter_result == "pass" else "below_threshold_or_disabled"
+                if filter_result == "pass":
+                    filter_reason = ""
+                else:
+                    gate = _get_filter_gate(s, config)
+                    if gate == "min_p_win":
+                        filter_reason = f"pw={s.p_win:.3f} < {config.min_p_win:.3f}"
+                    elif gate == "min_margin":
+                        filter_reason = f"margin={s.margin:.1f}F < {config.min_margin:.1f}F"
+                    elif gate == "min_models":
+                        filter_reason = f"n_models={s.n_models_scored} < {getattr(config, 'min_models_scored', 0)}"
+                    elif gate == "unanimous":
+                        filter_reason = "ensemble_not_unanimous"
+                    elif gate == "strategy_disabled":
+                        filter_reason = f"{s.direction}_{s.side}_disabled"
+                    else:
+                        filter_reason = gate
 
                 all_evals.append({
                     "cycle_id": cycle_id,
@@ -306,11 +343,12 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
 
         # Publish ModelSignal to Redis
         if redis_client:
+            now_ns = int(time.time_ns())
             signal = ModelSignal(
                 city=s.city, ticker=s.ticker, side=s.side,
                 p_win=s.p_win, model_scores=s.model_scores,
                 features_snapshot=sig_features,
-                ts_event=int(time.time_ns()), ts_init=int(time.time_ns()),
+                ts_event=now_ns, ts_init=now_ns,
             )
             try:
                 payload = msgpack.packb(ModelSignal.to_dict(signal), use_bin_type=True)
@@ -376,6 +414,13 @@ def main():
         try:
             config = load_config()  # hot reload
             evaluate_cycle(conn, r, models, names, weights, config, args.stream_key)
+        except sqlite3.DatabaseError as e:
+            log.error(f"DB error, reconnecting: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = get_connection(db_path)
         except Exception as e:
             log.error(f"Cycle failed: {e}", exc_info=True)
             try:
