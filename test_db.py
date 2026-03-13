@@ -377,3 +377,82 @@ def test_get_latest_evaluations_returns_most_recent_cycle(conn):
     cycle1 = db.get_latest_evaluations(conn, cycle_id="cycle-001")
     assert len(cycle1) == 1
     assert cycle1[0]["ticker"] == "KXHIGHNY-26MAR13-T52"
+
+
+def test_write_and_read_order(conn):
+    """Write an order, read it back via get_recent_orders."""
+    db.write_order(
+        conn,
+        client_order_id="ord-001",
+        venue_order_id="kalshi-555",
+        ticker="KXHIGHNY-26MAR13-T52",
+        side="NO",
+        order_side="buy",
+        price_cents=45,
+        qty=5,
+        status="submitted",
+    )
+    conn.commit()
+
+    orders = db.get_recent_orders(conn)
+    assert len(orders) == 1
+    o = orders[0]
+    assert o["client_order_id"] == "ord-001"
+    assert o["venue_order_id"] == "kalshi-555"
+    assert o["ticker"] == "KXHIGHNY-26MAR13-T52"
+    assert o["side"] == "NO"
+    assert o["order_side"] == "buy"
+    assert o["price_cents"] == 45
+    assert o["qty"] == 5
+    assert o["status"] == "submitted"
+    assert o["created_at"] is not None
+
+
+def test_get_recent_orders_with_status_filter(conn):
+    """get_recent_orders filters by status when provided."""
+    db.write_order(
+        conn,
+        client_order_id="ord-001",
+        ticker="KXHIGHNY-26MAR13-T52",
+        side="NO",
+        order_side="buy",
+        price_cents=45,
+        qty=5,
+        status="submitted",
+    )
+    db.write_order(
+        conn,
+        client_order_id="ord-002",
+        ticker="KXHIGHCHI-26MAR13-T48",
+        side="NO",
+        order_side="buy",
+        price_cents=55,
+        qty=3,
+        status="filled",
+    )
+    db.write_order(
+        conn,
+        client_order_id="ord-003",
+        ticker="KXHIGHDCA-26MAR13-T60",
+        side="NO",
+        order_side="buy",
+        price_cents=40,
+        qty=4,
+        status="filled",
+    )
+    conn.commit()
+
+    # No filter — all 3 returned
+    all_orders = db.get_recent_orders(conn)
+    assert len(all_orders) == 3
+
+    # Filter by "submitted"
+    submitted = db.get_recent_orders(conn, status="submitted")
+    assert len(submitted) == 1
+    assert submitted[0]["client_order_id"] == "ord-001"
+
+    # Filter by "filled"
+    filled = db.get_recent_orders(conn, status="filled")
+    assert len(filled) == 2
+    client_ids = {o["client_order_id"] for o in filled}
+    assert client_ids == {"ord-002", "ord-003"}

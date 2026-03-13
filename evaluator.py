@@ -37,12 +37,10 @@ log = logging.getLogger(__name__)
 
 # Coast normals for wind_dir_offshore — mirrors feature_actor._build_extra_features
 _COAST_NORMAL = {
-    "miami": 90, "tampa": 260, "jacksonville": 60,
-    "new_york": 150, "boston": 90, "baltimore": 170,
-    "norfolk": 130, "houston": 150, "new_orleans": 180,
-    "los_angeles": 240, "san_francisco": 270, "san_diego": 260,
-    "seattle": 270, "portland": 290, "charleston": 120,
-    "savannah": 100, "philadelphia": 135, "washington_dc": 135,
+    "los_angeles": 240, "san_francisco": 270, "miami": 90,
+    "new_york": 150, "boston": 90, "seattle": 270,
+    "houston": 150, "new_orleans": 180, "philadelphia": 135,
+    "washington_dc": 135,
 }
 
 
