@@ -275,7 +275,7 @@ def _make_exec_client():
     client._pending_cancels = []
     client._submit_flush_handle = None
     client._cancel_flush_handle = None
-    client._BATCH_MAX = 20
+    client._BATCH_MAX = 9
     client._BATCH_WINDOW_S = 0.05
     client._accepted_orders = set()
     client._executor = None
@@ -376,29 +376,25 @@ async def test_submit_batch_accumulates():
 
 
 @pytest.mark.asyncio
-async def test_submit_batch_chunks_at_20():
-    """25 orders should produce 2 batch API calls (20 + 5)."""
+async def test_submit_batch_chunks_at_9():
+    """15 orders should produce 2 batch API calls (9 + 6)."""
     client = _make_exec_client()
     client.k_portfolio.batch_create_orders.side_effect = [
-        _make_batch_response(20),
-        _make_batch_response(5),
+        _make_batch_response(9),
+        _make_batch_response(6),
     ]
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
         mock_clock.return_value.timestamp_ns.return_value = 1000
 
-        # First 20 trigger immediate flush
-        for i in range(20):
-            await client._submit_order(_make_submit_cmd(idx=i))
-
-        # Remaining 5 need manual flush
-        for i in range(20, 25):
-            await client._submit_order(_make_submit_cmd(idx=i))
+        # Accumulate all 15, then flush (tests chunking logic)
+        for i in range(15):
+            client._pending_submits.append(_make_submit_cmd(idx=i))
         await client._flush_submits()
 
     assert client.k_portfolio.batch_create_orders.call_count == 2
-    assert len(client._accepted) == 25
+    assert len(client._accepted) == 15
 
 
 @pytest.mark.asyncio
@@ -427,7 +423,7 @@ async def test_submit_batch_429_retry():
 
 @pytest.mark.asyncio
 async def test_submit_batch_429_double_fail():
-    """Both calls 429 — all orders rejected."""
+    """Both attempts 429 — all orders rejected."""
     from kalshi_python.exceptions import ApiException
 
     client = _make_exec_client()
@@ -487,7 +483,7 @@ async def test_cancel_batch_accumulates():
 
 @pytest.mark.asyncio
 async def test_cancel_batch_429_rejects_all():
-    """Cancel batch 429 double-fail rejects all cancels."""
+    """Cancel batch 429 exhausted rejects all cancels."""
     from kalshi_python.exceptions import ApiException
 
     client = _make_exec_client()

@@ -331,7 +331,7 @@ class KalshiExecutionClient(LiveExecutionClient):
         self._pending_cancels: list[CancelOrder] = []
         self._submit_flush_handle: asyncio.TimerHandle | None = None
         self._cancel_flush_handle: asyncio.TimerHandle | None = None
-        self._BATCH_MAX = 20
+        self._BATCH_MAX = 9  # Basic tier: 10 writes/sec, each batch item counts as 1
         self._BATCH_WINDOW_S = 0.05  # 50ms
 
     def _fetch_balance(self) -> int:
@@ -700,8 +700,10 @@ class KalshiExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
 
-        # Send in chunks of BATCH_MAX
+        # Send in chunks of BATCH_MAX with 1.1s gap to stay under 10 writes/sec
         for i in range(0, len(pairs), self._BATCH_MAX):
+            if i > 0:
+                await asyncio.sleep(1.1)
             chunk = pairs[i:i + self._BATCH_MAX]
             commands = [c for c, _ in chunk]
             requests = [r for _, r in chunk]
@@ -718,8 +720,8 @@ class KalshiExecutionClient(LiveExecutionClient):
             self._process_batch_results(commands, responses.responses or [])
         except ApiException as e:
             if e.status == 429:
-                self._log.warning(f"Batch submit 429, retrying {len(requests)} orders after 1s")
-                await asyncio.sleep(1.0)
+                self._log.warning(f"Batch submit 429, retrying {len(requests)} orders after 1.5s")
+                await asyncio.sleep(1.5)
                 try:
                     responses = await asyncio.get_running_loop().run_in_executor(
                         self._executor,
@@ -811,6 +813,8 @@ class KalshiExecutionClient(LiveExecutionClient):
         order_ids = [cmd.venue_order_id.value for cmd in batch]
 
         for i in range(0, len(order_ids), self._BATCH_MAX):
+            if i > 0:
+                await asyncio.sleep(1.1)
             chunk_ids = order_ids[i:i + self._BATCH_MAX]
             chunk_cmds = batch[i:i + self._BATCH_MAX]
             try:
@@ -818,11 +822,11 @@ class KalshiExecutionClient(LiveExecutionClient):
                     self._executor,
                     lambda ids=chunk_ids: self.k_portfolio.batch_cancel_orders(order_ids=ids),
                 )
-                # Cancel confirmation arrives via WebSocket, same as before
+                # Cancel confirmation arrives via WebSocket
             except ApiException as e:
                 if e.status == 429:
-                    self._log.warning("Batch cancel 429, retrying after 1s")
-                    await asyncio.sleep(1.0)
+                    self._log.warning("Batch cancel 429, retrying after 1.5s")
+                    await asyncio.sleep(1.5)
                     try:
                         await asyncio.get_running_loop().run_in_executor(
                             self._executor,
