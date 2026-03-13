@@ -709,15 +709,27 @@ class KalshiExecutionClient(LiveExecutionClient):
             requests = [r for _, r in chunk]
             await self._send_batch_submit(commands, requests)
 
+    def _do_batch_submit(self, requests: list[CreateOrderRequest]) -> list[dict]:
+        """Send batch order request, return raw response list.
+
+        Uses _with_http_info + json.loads to avoid SDK deserialization bugs
+        (same pattern as _fetch_positions_raw).
+        """
+        from kalshi_python.models.batch_create_orders_request import BatchCreateOrdersRequest
+        batch_req = BatchCreateOrdersRequest(orders=requests)
+        resp = self.k_portfolio.batch_create_orders_with_http_info(batch_req)
+        data = json.loads(resp.raw_data)
+        return data.get("responses", [])
+
     async def _send_batch_submit(
         self, commands: list[SubmitOrder], requests: list[CreateOrderRequest],
     ) -> None:
         try:
             responses = await asyncio.get_running_loop().run_in_executor(
                 self._executor,
-                lambda: self.k_portfolio.batch_create_orders(orders=requests),
+                lambda: self._do_batch_submit(requests),
             )
-            self._process_batch_results(commands, responses.responses or [])
+            self._process_batch_results(commands, responses)
         except ApiException as e:
             if e.status == 429:
                 self._log.warning(f"Batch submit 429, retrying {len(requests)} orders after 1.5s")
@@ -725,9 +737,9 @@ class KalshiExecutionClient(LiveExecutionClient):
                 try:
                     responses = await asyncio.get_running_loop().run_in_executor(
                         self._executor,
-                        lambda: self.k_portfolio.batch_create_orders(orders=requests),
+                        lambda: self._do_batch_submit(requests),
                     )
-                    self._process_batch_results(commands, responses.responses or [])
+                    self._process_batch_results(commands, responses)
                 except Exception as retry_e:
                     self._log.error(f"Batch submit retry failed: {retry_e}")
                     self._reject_all(commands, str(retry_e))
@@ -738,7 +750,7 @@ class KalshiExecutionClient(LiveExecutionClient):
             self._log.error(f"Batch submit error: {e}")
             self._reject_all(commands, str(e))
 
-    def _process_batch_results(self, commands, responses) -> None:
+    def _process_batch_results(self, commands, responses: list[dict]) -> None:
         ts = self._clock.timestamp_ns()
         for i, cmd in enumerate(commands):
             if i >= len(responses):
@@ -751,18 +763,21 @@ class KalshiExecutionClient(LiveExecutionClient):
                 )
                 continue
             resp = responses[i]
-            if resp.order is not None:
+            order = resp.get("order") if isinstance(resp, dict) else getattr(resp, "order", None)
+            if order is not None:
+                order_id = order.get("order_id") if isinstance(order, dict) else getattr(order, "order_id", None)
                 if cmd.order.client_order_id not in self._accepted_orders:
                     self.generate_order_accepted(
                         strategy_id=cmd.strategy_id,
                         instrument_id=cmd.instrument_id,
                         client_order_id=cmd.order.client_order_id,
-                        venue_order_id=VenueOrderId(resp.order.order_id),
+                        venue_order_id=VenueOrderId(order_id),
                         ts_event=ts,
                     )
                     self._accepted_orders.add(cmd.order.client_order_id)
             else:
-                error_msg = str(resp.error) if resp.error else "Unknown batch error"
+                error = resp.get("error") if isinstance(resp, dict) else getattr(resp, "error", None)
+                error_msg = str(error) if error else "Unknown batch error"
                 self.generate_order_rejected(
                     strategy_id=cmd.strategy_id,
                     instrument_id=cmd.instrument_id,

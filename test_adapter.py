@@ -332,33 +332,26 @@ def _make_cancel_cmd(order_id="venue-0", idx=0):
 
 
 def _make_batch_response(n, errors_at=None):
-    """Create a mock BatchCreateOrdersResponse with n items.
-
-    errors_at: set of indices that should be errors instead of successes.
-    """
+    """Create a raw batch response list (list of dicts, as returned by _do_batch_submit)."""
     errors_at = errors_at or set()
-    resp = MagicMock()
     items = []
     for i in range(n):
-        item = MagicMock()
         if i in errors_at:
-            item.order = None
-            item.error = MagicMock()
-            item.error.__str__ = lambda self: "Insufficient balance"
+            items.append({"order": None, "error": {"message": "Insufficient balance"}})
         else:
-            item.order = MagicMock()
-            item.order.order_id = f"venue-{i}"
-            item.error = None
-        items.append(item)
-    resp.responses = items
-    return resp
+            items.append({"order": {"order_id": f"venue-{i}"}, "error": None})
+    return items
 
 
 @pytest.mark.asyncio
 async def test_submit_batch_accumulates():
     """Multiple submit_order calls should accumulate and flush as one batch API call."""
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.return_value = _make_batch_response(5)
+    call_count = [0]
+    def mock_do_batch(reqs):
+        call_count[0] += 1
+        return _make_batch_response(len(reqs))
+    client._do_batch_submit = mock_do_batch
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
@@ -370,7 +363,7 @@ async def test_submit_batch_accumulates():
         assert len(client._pending_submits) == 5
         await client._flush_submits()
 
-    client.k_portfolio.batch_create_orders.assert_called_once()
+    assert call_count[0] == 1
     assert len(client._accepted) == 5
     assert len(client._rejected) == 0
 
@@ -379,21 +372,21 @@ async def test_submit_batch_accumulates():
 async def test_submit_batch_chunks_at_9():
     """15 orders should produce 2 batch API calls (9 + 6)."""
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.side_effect = [
-        _make_batch_response(9),
-        _make_batch_response(6),
-    ]
+    call_count = [0]
+    def mock_do_batch(reqs):
+        call_count[0] += 1
+        return _make_batch_response(len(reqs))
+    client._do_batch_submit = mock_do_batch
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
         mock_clock.return_value.timestamp_ns.return_value = 1000
 
-        # Accumulate all 15, then flush (tests chunking logic)
         for i in range(15):
             client._pending_submits.append(_make_submit_cmd(idx=i))
         await client._flush_submits()
 
-    assert client.k_portfolio.batch_create_orders.call_count == 2
+    assert call_count[0] == 2
     assert len(client._accepted) == 15
 
 
@@ -403,10 +396,13 @@ async def test_submit_batch_429_retry():
     from kalshi_python.exceptions import ApiException
 
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.side_effect = [
-        ApiException(status=429, reason="Rate limited"),
-        _make_batch_response(3),
-    ]
+    call_count = [0]
+    def mock_do_batch(reqs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise ApiException(status=429, reason="Rate limited")
+        return _make_batch_response(len(reqs))
+    client._do_batch_submit = mock_do_batch
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
@@ -416,7 +412,7 @@ async def test_submit_batch_429_retry():
             await client._submit_order(_make_submit_cmd(idx=i))
         await client._flush_submits()
 
-    assert client.k_portfolio.batch_create_orders.call_count == 2
+    assert call_count[0] == 2
     assert len(client._accepted) == 3
     assert len(client._rejected) == 0
 
@@ -427,10 +423,9 @@ async def test_submit_batch_429_double_fail():
     from kalshi_python.exceptions import ApiException
 
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.side_effect = [
-        ApiException(status=429, reason="Rate limited"),
-        ApiException(status=429, reason="Still rate limited"),
-    ]
+    def mock_do_batch(reqs):
+        raise ApiException(status=429, reason="Rate limited")
+    client._do_batch_submit = mock_do_batch
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
@@ -448,7 +443,7 @@ async def test_submit_batch_429_double_fail():
 async def test_submit_batch_partial_error():
     """Batch response with mix of success/error — per-order events."""
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.return_value = _make_batch_response(3, errors_at={1})
+    client._do_batch_submit = lambda reqs: _make_batch_response(len(reqs), errors_at={1})
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
@@ -507,7 +502,7 @@ async def test_cancel_batch_429_rejects_all():
 async def test_single_order_batched():
     """A single order still goes through batch path correctly."""
     client = _make_exec_client()
-    client.k_portfolio.batch_create_orders.return_value = _make_batch_response(1)
+    client._do_batch_submit = lambda reqs: _make_batch_response(len(reqs))
 
     with patch("adapter.KalshiExecutionClient._clock", new_callable=PropertyMock) as mock_clock, \
          patch("adapter.KalshiExecutionClient._log", new_callable=PropertyMock):
@@ -516,7 +511,6 @@ async def test_single_order_batched():
         await client._submit_order(_make_submit_cmd(idx=0))
         await client._flush_submits()
 
-    client.k_portfolio.batch_create_orders.assert_called_once()
     assert len(client._accepted) == 1
 
 
