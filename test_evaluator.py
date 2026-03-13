@@ -84,7 +84,7 @@ class TestEvaluateCycle:
             ),
         ]
 
-        mock_msgbus = MagicMock()
+        mock_publish = MagicMock()
         mock_config = MagicMock()
         mock_config.min_p_win = 0.90
         mock_config.above_no_enabled = True
@@ -111,7 +111,7 @@ class TestEvaluateCycle:
 
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=mock_msgbus,
+                publish_signal=mock_publish,
                 models=[],
                 model_names=[],
                 model_weights=[],
@@ -189,7 +189,7 @@ class TestEvaluateCycle:
 
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=None,
+                publish_signal=None,
                 models=[], model_names=[], model_weights=[],
                 config=mock_config,
             )
@@ -208,10 +208,10 @@ class TestEvaluateCycle:
         conn = get_connection(tmp_db)
 
         with patch("evaluator.fetch_open_markets", return_value=[]):
-            mock_msgbus = MagicMock()
+            mock_publish = MagicMock()
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=mock_msgbus,
+                publish_signal=mock_publish,
                 models=[], model_names=[], model_weights=[],
                 config=MagicMock(),
             )
@@ -228,10 +228,10 @@ class TestEvaluateCycle:
         conn = get_connection(tmp_db)
 
         with patch("evaluator.fetch_open_markets", return_value=[]):
-            # Should not raise even with msgbus=None
+            # Should not raise even with publish_signal=None
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=None,
+                publish_signal=None,
                 models=[], model_names=[], model_weights=[],
                 config=MagicMock(),
             )
@@ -275,9 +275,10 @@ class TestEvaluateCycle:
         mock_config.max_total_deployed_cents = 4000
         mock_config.max_no_cost_cents = 92
 
-        mock_msgbus = MagicMock()
+        mock_publish = MagicMock()
         publish_calls = []
-        mock_msgbus.publish.side_effect = lambda topic, msg, **kw: publish_calls.append((topic, msg))
+        published = []
+        mock_publish = MagicMock(side_effect=lambda sig: published.append(sig))
 
         with patch("evaluator.fetch_open_markets", return_value=mock_markets), \
              patch("evaluator.get_forecast", return_value=52.0), \
@@ -288,14 +289,13 @@ class TestEvaluateCycle:
 
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=mock_msgbus,
+                publish_signal=mock_publish,
                 models=[], model_names=[], model_weights=[],
                 config=mock_config,
             )
 
-        assert len(publish_calls) == 1
-        topic, signal = publish_calls[0]
-        assert "ModelSignal" in topic
+        assert len(published) == 1
+        signal = published[0]
         assert type(signal).__name__ == "ModelSignal"
         assert signal.ticker == "KXHIGHCHI-26MAR15-T55"
         assert signal.side == "no"
@@ -608,7 +608,7 @@ class TestStalenessGate:
 
             evaluate_cycle(
                 db_conn=conn,
-                msgbus=MagicMock(),
+                publish_signal=MagicMock(),
                 models=[mock_model],
                 model_names=["emos"],
                 model_weights=[1.0],

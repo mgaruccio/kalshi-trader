@@ -13,15 +13,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import msgspec
 import numpy as np
 import sqlite3
 
-from nautilus_trader.common.component import MessageBus, LiveClock
+from datetime import timedelta
+
+from nautilus_trader.common.actor import Actor, ActorConfig
 from nautilus_trader.common.config import MessageBusConfig, DatabaseConfig
+from nautilus_trader.live.node import TradingNode
+from nautilus_trader.live.config import TradingNodeConfig
 from nautilus_trader.model.data import DataType
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.serialization.serializer import MsgSpecSerializer
 
 # kalshi_weather_ml imports
 _KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
@@ -208,7 +209,7 @@ def _check_rolling_features_staleness(max_stale_hours: float = 36.0) -> bool:
         return False
 
 
-def evaluate_cycle(db_conn, msgbus, models, model_names, model_weights, config, stream_key=None):
+def evaluate_cycle(db_conn, publish_signal, models, model_names, model_weights, config):
     """One evaluation cycle: score all markets, write to DB, publish to Redis."""
     cycle_id = str(uuid.uuid4())[:8]
     cycle_ts = datetime.now(timezone.utc).isoformat()
@@ -416,8 +417,8 @@ def evaluate_cycle(db_conn, msgbus, models, model_names, model_weights, config, 
                 **order,
             })
 
-        # Publish ModelSignal via NT MessageBus (writes to Redis in NT's format)
-        if msgbus:
+        # Publish ModelSignal via callback (NT Actor's publish_data in production)
+        if publish_signal:
             now_ns = int(time.time_ns())
             signal = ModelSignal(
                 city=s.city, ticker=s.ticker, side=s.side,
@@ -426,10 +427,9 @@ def evaluate_cycle(db_conn, msgbus, models, model_names, model_weights, config, 
                 ts_event=now_ns, ts_init=now_ns,
             )
             try:
-                topic = f"data.{DataType(ModelSignal).topic}"
-                msgbus.publish(topic, signal)
+                publish_signal(signal)
             except Exception as e:
-                log.error(f"Redis publish failed: {e}")
+                log.error(f"Signal publish failed: {e}")
 
     # 6. Write desired orders
     if desired:
@@ -448,14 +448,90 @@ def evaluate_cycle(db_conn, msgbus, models, model_names, model_weights, config, 
     )
 
 
+class EvaluatorActorConfig(ActorConfig):
+    db_path: str = "data/trading.db"
+    cycle_seconds: int = 300
+
+
+class EvaluatorActor(Actor):
+    """NT Actor that runs ML evaluation cycles and publishes ModelSignals.
+
+    Runs inside a producer TradingNode. Publishes via self.publish_data()
+    which NT routes to Redis streams automatically.
+    """
+
+    def __init__(self, config: EvaluatorActorConfig):
+        super().__init__(config)
+        self._cfg = config
+        self._db_conn = None
+        self._models = []
+        self._model_names = []
+        self._model_weights = []
+        self._kw_config = None
+
+    def on_start(self):
+        # DB setup
+        db_path = Path(self._cfg.db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        init_db(db_path)
+        self._db_conn = get_connection(db_path)
+
+        # Load ML models
+        self._kw_config = load_config()
+        self._models, self._model_names, self._model_weights = load_models(self._kw_config)
+
+        # Start evaluation timer
+        self.clock.set_timer(
+            "eval_cycle",
+            interval=timedelta(seconds=self._cfg.cycle_seconds),
+            callback=self._on_eval_timer,
+        )
+        self.log.info(f"EvaluatorActor started. DB={self._cfg.db_path}, interval={self._cfg.cycle_seconds}s")
+
+        # Run first cycle immediately
+        self._run_cycle()
+
+    def _on_eval_timer(self, event=None):
+        self._run_cycle()
+
+    def _run_cycle(self):
+        try:
+            self._kw_config = load_config()  # hot reload
+            evaluate_cycle(
+                db_conn=self._db_conn,
+                publish_signal=self._publish_signal,
+                models=self._models,
+                model_names=self._model_names,
+                model_weights=self._model_weights,
+                config=self._kw_config,
+            )
+        except sqlite3.DatabaseError as e:
+            self.log.error(f"DB error, reconnecting: {e}")
+            try:
+                self._db_conn.close()
+            except Exception:
+                pass
+            db_path = Path(self._cfg.db_path)
+            self._db_conn = get_connection(db_path)
+        except Exception as e:
+            self.log.error(f"Cycle failed: {e}")
+            try:
+                log_event(self._db_conn, "evaluator", "error", str(e))
+                self._db_conn.commit()
+            except Exception:
+                pass
+
+    def _publish_signal(self, signal: ModelSignal):
+        self.publish_data(DataType(ModelSignal), signal)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Standalone ML evaluator")
+    parser = argparse.ArgumentParser(description="Evaluator TradingNode (producer)")
     parser.add_argument("--db", default="data/trading.db")
     parser.add_argument("--redis-host", default="localhost")
     parser.add_argument("--redis-port", type=int, default=6379)
     parser.add_argument("--stream-key", default="weather-signals")
     parser.add_argument("--interval", type=int, default=300, help="Seconds between cycles")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -463,20 +539,9 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    db_path = Path(args.db)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    init_db(db_path)
-    conn = get_connection(db_path)
-
-    # Create NT MessageBus with Redis backing (uses NT's own serialization + stream format)
-    msgbus = None
-    try:
-        clock = LiveClock()
-        serializer = MsgSpecSerializer(
-            encoding=msgspec.msgpack,
-            timestamps_as_str=True,
-        )
-        msgbus_config = MessageBusConfig(
+    config = TradingNodeConfig(
+        trader_id="EVALUATOR-001",
+        message_bus=MessageBusConfig(
             database=DatabaseConfig(
                 type="redis",
                 host=args.redis_host,
@@ -488,48 +553,26 @@ def main():
             streams_prefix=args.stream_key,
             stream_per_topic=False,
             encoding="msgpack",
-        )
-        msgbus = MessageBus(
-            trader_id=TraderId("EVALUATOR-001"),
-            clock=clock,
-            serializer=serializer,
-            config=msgbus_config,
-        )
-        # Register ModelSignal as a publishable + streaming type
-        msgbus.add_streaming_type(ModelSignal)
-        log.info(f"NT MessageBus connected to Redis: {args.redis_host}:{args.redis_port}")
-    except Exception as e:
-        log.warning(f"MessageBus setup failed — signals will only be written to DB: {e}")
-        msgbus = None
+        ),
+    )
 
-    config = load_config()
-    models, names, weights = load_models(config)
+    node = TradingNode(config=config)
+    node.build()
 
-    log.info(f"Evaluator started. DB={args.db}, interval={args.interval}s")
+    actor = EvaluatorActor(EvaluatorActorConfig(
+        db_path=args.db,
+        cycle_seconds=args.interval,
+    ))
+    node.trader.add_actor(actor)
 
-    while True:
-        try:
-            config = load_config()  # hot reload
-            evaluate_cycle(conn, msgbus, models, names, weights, config)
-        except sqlite3.DatabaseError as e:
-            log.error(f"DB error, reconnecting: {e}")
-            try:
-                conn.close()
-            except Exception:
-                pass
-            conn = get_connection(db_path)
-        except Exception as e:
-            log.error(f"Cycle failed: {e}", exc_info=True)
-            try:
-                log_event(conn, "evaluator", "error", str(e))
-                conn.commit()
-            except Exception:
-                pass
-        if args.once:
-            break
-        time.sleep(args.interval)
-
-    conn.close()
+    log.info("Starting Evaluator TradingNode. Press Ctrl+C to stop.")
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        log.info("Stopping...")
+        node.stop()
+    finally:
+        node.dispose()
 
 
 if __name__ == "__main__":
