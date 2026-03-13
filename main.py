@@ -18,6 +18,7 @@ if _kw_root:
 
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.live.config import TradingNodeConfig, LiveDataClientConfig, LiveExecClientConfig
+from nautilus_trader.common.config import MessageBusConfig, DatabaseConfig
 
 from adapter import (
     KalshiDataClientFactory,
@@ -42,6 +43,12 @@ def main():
                         help="Max contracts per ticker (default: 15)")
     parser.add_argument("--max-cost", type=int, default=94,
                         help="Max cost per contract in cents (default: 94)")
+    parser.add_argument("--stream-key", default="weather-signals",
+                        help="Redis stream key for evaluator signals")
+    parser.add_argument("--redis-host", default="localhost")
+    parser.add_argument("--redis-port", type=int, default=6379)
+    parser.add_argument("--db", default="data/trading.db",
+                        help="SQLite DB path for state")
     args = parser.parse_args()
 
     try:
@@ -67,10 +74,23 @@ def main():
     log.info(f"Loaded {len(instruments)} instruments")
 
     # 2. Setup TradingNode
+    message_bus = MessageBusConfig(
+        database=DatabaseConfig(
+            type="redis",
+            host=args.redis_host,
+            port=args.redis_port,
+        ),
+        external_streams=[args.stream_key],
+        encoding="msgpack",
+    )
+
     config = TradingNodeConfig(
         trader_id=f"KALSHI-WEATHER-{config_obj.environment.upper()}",
+        message_bus=message_bus,
         data_clients={"KALSHI": LiveDataClientConfig()},
         exec_clients={} if args.dry_run else {"KALSHI": LiveExecClientConfig()},
+        load_state=True,
+        save_state=True,
     )
     node = TradingNode(config=config)
     node.add_data_client_factory("KALSHI", KalshiDataClientFactory)
@@ -100,6 +120,7 @@ def main():
         max_total_deployed_cents=args.capital,
         open_spread_enabled=False,
     )
+    strategy_kwargs["db_path"] = args.db
     if args.dry_run:
         strategy_kwargs["max_position_per_ticker"] = 0
         log.info("DRY RUN: max_position_per_ticker=0, no orders will be placed")

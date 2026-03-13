@@ -68,6 +68,9 @@ class WeatherStrategyConfig(StrategyConfig, frozen=True):
     max_position_per_ticker: int = 20
     danger_exit_enabled: bool = True
 
+    # SQLite DB path for state persistence (used by DB-backed architecture)
+    db_path: str = "data/trading.db"
+
 
 class WeatherStrategy(Strategy):
     """Event-driven weather trading strategy with 2-phase market-making.
