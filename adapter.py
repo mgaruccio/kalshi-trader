@@ -505,30 +505,30 @@ class KalshiExecutionClient(LiveExecutionClient):
         return reports
 
     def _fetch_positions_raw(self) -> list[dict]:
-        """Two-step position query matching Kalshi API structure.
+        """Two-step position query using raw HTTP responses.
 
-        The API returns event_positions at the top level (not market_positions).
-        Must query per-event to get individual market positions with ticker and qty.
+        The kalshi_python SDK drops event_positions from the deserialized model,
+        so we parse raw_data directly.  Step 1: get event tickers with exposure.
+        Step 2: query per-event for individual market positions.
         """
-        resp = self.k_portfolio.get_positions()
-        # SDK model has .event_positions or raw dict fallback
-        event_positions = getattr(resp, "event_positions", None)
-        if event_positions is None:
-            # Try raw dict access (SDK may deserialize differently)
-            raw = resp.to_dict() if hasattr(resp, "to_dict") else {}
-            event_positions = raw.get("event_positions", [])
+        resp = self.k_portfolio.get_positions_with_http_info()
+        data = json.loads(resp.raw_data)
+        event_positions = data.get("event_positions", [])
 
         positions = []
-        for ep in event_positions or []:
-            event_ticker = getattr(ep, "event_ticker", None) or (ep.get("event_ticker") if isinstance(ep, dict) else None)
+        for ep in event_positions:
+            event_ticker = ep.get("event_ticker")
             if not event_ticker:
                 continue
-            detail = self.k_portfolio.get_positions(event_ticker=event_ticker)
-            market_positions = getattr(detail, "market_positions", None)
-            if market_positions is None:
-                raw = detail.to_dict() if hasattr(detail, "to_dict") else {}
-                market_positions = raw.get("market_positions", [])
-            for mp in market_positions or []:
+            # Skip events with zero exposure (settled)
+            exposure = float(ep.get("event_exposure_dollars", 0))
+            if exposure == 0:
+                continue
+            detail_resp = self.k_portfolio.get_positions_with_http_info(
+                event_ticker=event_ticker
+            )
+            detail = json.loads(detail_resp.raw_data)
+            for mp in detail.get("market_positions", []):
                 positions.append(mp)
         return positions
 
@@ -540,10 +540,9 @@ class KalshiExecutionClient(LiveExecutionClient):
             )
             ts = self._clock.timestamp_ns()
             for pos in positions:
-                # Handle both SDK objects and raw dicts
-                ticker = getattr(pos, "ticker", None) or (pos.get("ticker") if isinstance(pos, dict) else None)
-                position = getattr(pos, "position", None) or (pos.get("position") if isinstance(pos, dict) else None)
-                if not ticker or not position or position == 0:
+                ticker = pos.get("ticker")
+                position = int(float(pos.get("position_fp", 0)))
+                if not ticker or position == 0:
                     continue
                 side = "YES" if position > 0 else "NO"
                 inst_id = InstrumentId(Symbol(f"{ticker}-{side}"), KALSHI_VENUE)
