@@ -35,6 +35,7 @@ from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.objects import Price, Quantity, Currency
 from nautilus_trader.model.enums import (
     AccountType,
+    CurrencyType,
     OmsType,
     OrderSide,
     OrderType,
@@ -44,11 +45,24 @@ from nautilus_trader.model.enums import (
 )
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.model.currencies import register_currency
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
 
 KALSHI_VENUE = Venue("KALSHI")
+
+# Register CONTRACT currency in both Cython and pyo3 backends so that
+# instrument conversion during reconciliation doesn't crash with
+# "ValueError: Unknown currency: CONTRACT".
+_CONTRACT = Currency(
+    code="CONTRACT",
+    precision=0,
+    iso4217=0,
+    name="CONTRACT",
+    currency_type=CurrencyType.CRYPTO,
+)
+register_currency(_CONTRACT)
 
 
 def _parse_ts(ts_raw, fallback_ns: int) -> int:
@@ -504,35 +518,64 @@ class KalshiExecutionClient(LiveExecutionClient):
             self._log.error(f"Error fetching active orders: {e}")
         return reports
 
-    def _fetch_positions(self):
-        return self.k_portfolio.get_positions()
+    def _fetch_positions_raw(self) -> list[dict]:
+        """Two-step position query using raw HTTP responses.
+
+        The kalshi_python SDK drops event_positions from the deserialized model,
+        so we parse raw_data directly.  Step 1: get event tickers with exposure.
+        Step 2: query per-event for individual market positions.
+        """
+        resp = self.k_portfolio.get_positions_with_http_info()
+        data = json.loads(resp.raw_data)
+        event_positions = data.get("event_positions", [])
+
+        positions = []
+        for ep in event_positions:
+            event_ticker = ep.get("event_ticker")
+            if not event_ticker:
+                continue
+            # Skip events with zero exposure (settled)
+            exposure = float(ep.get("event_exposure_dollars", 0))
+            if exposure == 0:
+                continue
+            detail_resp = self.k_portfolio.get_positions_with_http_info(
+                event_ticker=event_ticker
+            )
+            detail = json.loads(detail_resp.raw_data)
+            for mp in detail.get("market_positions", []):
+                positions.append(mp)
+        return positions
 
     async def generate_position_status_reports(self, command) -> list:
         reports = []
         try:
-            resp = await asyncio.get_running_loop().run_in_executor(
-                self._executor, self._fetch_positions
+            positions = await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._fetch_positions_raw
             )
             ts = self._clock.timestamp_ns()
-            for pos in getattr(resp, "positions", None) or []:
-                if pos.position == 0:
+            for pos in positions:
+                ticker = pos.get("ticker")
+                position = int(float(pos.get("position_fp", 0)))
+                if not ticker or position == 0:
                     continue
-                side = "YES" if pos.position > 0 else "NO"
-                inst_id = InstrumentId(Symbol(f"{pos.ticker}-{side}"), KALSHI_VENUE)
+                side = "YES" if position > 0 else "NO"
+                inst_id = InstrumentId(Symbol(f"{ticker}-{side}"), KALSHI_VENUE)
                 instrument = self._instrument_provider.find(inst_id)
                 if not instrument:
+                    self._log.warning(f"Position {ticker}-{side} not in instrument cache, skipping")
                     continue
                 reports.append(
                     PositionStatusReport(
                         account_id=self.account_id,
                         instrument_id=inst_id,
                         position_side=PositionSide.LONG,
-                        quantity=instrument.make_qty(abs(pos.position)),
+                        quantity=instrument.make_qty(abs(position)),
                         report_id=UUID4(),
                         ts_last=ts,
                         ts_init=ts,
                     )
                 )
+                self._log.info(f"Position report: {ticker} {side} qty={abs(position)}")
         except Exception as e:
             self._log.error(f"Error fetching positions: {e}")
         return reports

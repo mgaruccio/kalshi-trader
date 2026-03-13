@@ -36,6 +36,12 @@ def main():
     parser = argparse.ArgumentParser(description="Weather TradingNode")
     parser.add_argument("--dry-run", action="store_true",
                         help="Paper trade: evaluate signals but block all orders (max_position=0)")
+    parser.add_argument("--capital", type=int, default=4000,
+                        help="Max total deployed capital in cents (default: 4000 = $40)")
+    parser.add_argument("--max-per-ticker", type=int, default=30,
+                        help="Max contracts per ticker (default: 30)")
+    parser.add_argument("--max-cost", type=int, default=94,
+                        help="Max cost per contract in cents (default: 94)")
     args = parser.parse_args()
 
     try:
@@ -86,11 +92,11 @@ def main():
     # 4. Add WeatherStrategy
     strategy_kwargs = dict(
         stable_min_p_win=0.90,
-        max_cost_cents=94,
+        max_cost_cents=args.max_cost,
         sell_target_cents=97,
         stable_size=3,
-        max_position_per_ticker=30,
-        max_total_deployed_cents=3000,  # $30 cap
+        max_position_per_ticker=args.max_per_ticker,
+        max_total_deployed_cents=args.capital,
         open_spread_enabled=False,
     )
     if args.dry_run:
