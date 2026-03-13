@@ -510,7 +510,7 @@ class KalshiExecutionClient(LiveExecutionClient):
         The API returns event_positions at the top level (not market_positions).
         Must query per-event to get individual market positions with ticker and qty.
         """
-        resp = self.k_portfolio.get_positions(settlement_status="unsettled")
+        resp = self.k_portfolio.get_positions()
         # SDK model has .event_positions or raw dict fallback
         event_positions = getattr(resp, "event_positions", None)
         if event_positions is None:
