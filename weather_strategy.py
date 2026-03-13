@@ -56,6 +56,11 @@ class WeatherStrategyConfig(StrategyConfig, frozen=True):
     # Cost ceiling
     max_cost_cents: int = 92              # never buy above this price
 
+    # Margin-based size reduction: when forecast margin < threshold,
+    # multiply stable_size by the reduction factor
+    thin_margin_threshold_f: float = 2.0   # degrees F
+    thin_margin_size_factor: float = 0.5   # e.g. 0.5 = half the usual size
+
     # Portfolio-level capital guard
     max_total_deployed_cents: int = 0     # 0 = disabled; e.g. 2500 = $25 cap
 
@@ -83,6 +88,7 @@ class WeatherStrategy(Strategy):
 
         # Quote tracking
         self._latest_quotes: dict[str, QuoteTick] = {}  # instrument_id_str -> tick
+        self._subscribed_instruments: set[str] = set()  # instrument_id values we're subscribed to
 
         # Position tracking
         self._positions_info: dict[str, dict] = {}  # ticker -> {side, threshold, city, contracts}
@@ -125,6 +131,7 @@ class WeatherStrategy(Strategy):
         instruments = self.cache.instruments()
         for inst in instruments:
             self.subscribe_quote_ticks(inst.id)
+            self._subscribed_instruments.add(inst.id.value)
 
         # Periodic ladder refresh timer
         self.clock.set_timer(
@@ -318,9 +325,14 @@ class WeatherStrategy(Strategy):
 
         # Phase 2: Stable ladder
         if signal.p_win < self._cfg.stable_min_p_win:
-            self.log.info(
-                f"Skip {signal.ticker}: p_win={signal.p_win:.3f} < {self._cfg.stable_min_p_win}"
-            )
+            # Signal no longer qualifies — evict stale entry so _on_refresh
+            # stops maintaining the ladder for this ticker
+            if signal.ticker in self._eligible_signals:
+                self.log.info(
+                    f"Evict {signal.ticker}: p_win dropped to {signal.p_win:.3f} "
+                    f"< {self._cfg.stable_min_p_win}"
+                )
+                self._eligible_signals.pop(signal.ticker)
             return
 
         # Store qualifying signal for periodic refresh (deployment on _on_refresh)
@@ -463,6 +475,19 @@ class WeatherStrategy(Strategy):
         else:
             remaining_budget = float('inf')
 
+        # Compute margin for size reduction on thin-margin trades
+        effective_size = self._cfg.stable_size
+        if self._cfg.thin_margin_threshold_f > 0:
+            margin = self._compute_margin(ticker, signal)
+            if margin is not None and margin < self._cfg.thin_margin_threshold_f:
+                effective_size = max(1, int(
+                    self._cfg.stable_size * self._cfg.thin_margin_size_factor
+                ))
+                self.log.info(
+                    f"Thin margin {ticker}: {margin:.1f}F < {self._cfg.thin_margin_threshold_f}F, "
+                    f"size {self._cfg.stable_size} -> {effective_size}"
+                )
+
         total_deployed = 0
         order_ids = []
         for offset in self._cfg.stable_ladder_offsets_cents:
@@ -471,7 +496,7 @@ class WeatherStrategy(Strategy):
             if price_cents > self._cfg.max_cost_cents:
                 continue
             price = instrument.make_price(price_cents / 100.0)
-            size = min(self._cfg.stable_size, max(0, capacity))
+            size = min(effective_size, max(0, capacity))
             if size <= 0:
                 break
             order_cost = price_cents * size
@@ -738,6 +763,15 @@ class WeatherStrategy(Strategy):
             self._reconciled = True
             self._reconcile_existing_state()
 
+        # Subscribe to quote ticks for any new instruments added to cache
+        # (e.g. tomorrow's contracts discovered by instrument reload)
+        for inst in self.cache.instruments():
+            key = inst.id.value
+            if key not in self._subscribed_instruments:
+                self.subscribe_quote_ticks(inst.id)
+                self._subscribed_instruments.add(key)
+                self.log.info(f"Subscribed to new instrument: {key}")
+
         if self._is_backoff_window():
             self.log.info("Back-off window: cancelling all resting buy orders")
             self._cancel_all_resting_buys()
@@ -789,6 +823,30 @@ class WeatherStrategy(Strategy):
             deployed = self._deploy_ladder(ticker, signal, budget_remaining=remaining_budget)
             if remaining_budget is not None:
                 remaining_budget -= deployed
+
+    def _compute_margin(self, ticker: str, signal: ModelSignal) -> float | None:
+        """Compute forecast margin in °F from signal features and ticker threshold.
+
+        For NO trades: margin = threshold - max(ecmwf, gfs). Higher = safer.
+        Returns None if threshold or forecasts unavailable.
+        """
+        parsed = parse_ticker(ticker)
+        if not parsed:
+            return None
+        threshold = float(parsed["threshold"])
+
+        features = signal.features_snapshot or {}
+        ecmwf = features.get("ecmwf_high")
+        gfs = features.get("gfs_high")
+        if ecmwf is None and gfs is None:
+            forecast = features.get("forecast_high")
+            if forecast is None:
+                return None
+            return threshold - forecast
+
+        temps = [t for t in (ecmwf, gfs) if t is not None]
+        consensus = max(temps)
+        return threshold - consensus
 
     def _cancel_ladder_orders(self, ticker: str):
         """Cancel all Phase 2 ladder buy orders for a ticker."""

@@ -76,6 +76,7 @@ class _TestableWeatherStrategy:
         self._stable_orders_placed: int = 0
         self._feature_actor = None
         self._reconciled = True  # skip reconciliation in unit tests
+        self._subscribed_instruments: set = set()
         # NT mocks
         self.log = MagicMock()
         self.cache = MagicMock()
@@ -119,6 +120,7 @@ class _TestableWeatherStrategy:
     _total_capital_at_risk = WeatherStrategy._total_capital_at_risk
     _cancel_all_resting_buys = WeatherStrategy._cancel_all_resting_buys
     _place_resting_sell = WeatherStrategy._place_resting_sell
+    _compute_margin = WeatherStrategy._compute_margin
     _on_refresh = WeatherStrategy._on_refresh
     _is_backoff_window = WeatherStrategy._is_backoff_window
     _utc_now = WeatherStrategy._utc_now

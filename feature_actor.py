@@ -134,7 +134,9 @@ class FeatureActor(Actor):
         self._city_features: dict[tuple[str, str], CityFeatureState] = {}
         self._positions: dict[str, dict] = {}  # ticker -> {side, threshold, city}
         self._events_received: int = 0
-        
+        self._instrument_provider = None  # set via set_instrument_provider()
+        self._known_instruments: set[str] = set()  # instrument_id values we've seen
+
         # Ensemble model state
         self.ensemble_models = []
         self.ensemble_names = []
@@ -144,6 +146,10 @@ class FeatureActor(Actor):
         if load_config:
             self._kw_config = load_config()
         self._load_models()
+
+    def set_instrument_provider(self, provider):
+        """Wire the instrument provider for periodic reload of new markets."""
+        self._instrument_provider = provider
 
     def _load_models(self):
         """Load ensemble models from config (ensemble_models + ensemble_weights).
@@ -209,6 +215,10 @@ class FeatureActor(Actor):
             interval=timedelta(seconds=self._cfg.model_cycle_seconds),
             callback=self._on_model_timer,
         )
+
+        # Seed known instruments so we can detect new ones on reload
+        for inst in self.cache.instruments():
+            self._known_instruments.add(inst.id.value)
 
         if self._cfg.live_mode:
             self._start_live_pollers()
@@ -279,12 +289,41 @@ class FeatureActor(Actor):
             if self._cfg.danger_check_enabled and self._positions:
                 self._check_danger(data.city)
 
+    def _reload_instruments(self):
+        """Reload instruments from Kalshi API and add new ones to cache.
+
+        Called each model cycle so newly-opened markets (e.g. tomorrow's
+        contracts that open at ~10am ET) are discovered without restart.
+        """
+        if self._instrument_provider is None:
+            return
+
+        try:
+            self._instrument_provider.load_all(filters={"series_ticker": "KXHIGH"})
+            new_count = 0
+            for inst in self._instrument_provider.list_all():
+                inst_key = inst.id.value
+                if inst_key not in self._known_instruments:
+                    self._known_instruments.add(inst_key)
+                    # Add to cache if not already present
+                    if self.cache.instrument(inst.id) is None:
+                        self.cache.add_instrument(inst)
+                        new_count += 1
+            if new_count:
+                self.log.info(f"Instrument reload: {new_count} new instruments added to cache")
+        except Exception as e:
+            self.log.warning(f"Instrument reload failed: {e}")
+
     def _on_model_timer(self, event):
         """Run ML ensemble on accumulated features.
 
-        1. For each city with active positions, re-evaluate and publish ModelSignal
-        2. Scan all cached instruments for new entry opportunities
+        1. Reload instruments (discover new markets)
+        2. For each city with active positions, re-evaluate and publish ModelSignal
+        3. Scan all cached instruments for new entry opportunities
         """
+        # Discover newly-opened markets (e.g. tomorrow's contracts)
+        self._reload_instruments()
+
         ts = self.clock.timestamp_ns()
         now_dt = datetime.now()
 

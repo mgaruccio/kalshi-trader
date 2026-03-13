@@ -188,8 +188,11 @@ def test_delta_removes_level_on_zero():
     assert tick.bid_price.as_double() == 0.50
 
 
-def test_no_tick_emitted_when_book_incomplete():
-    """Should NOT emit garbage when one side of the book is empty."""
+def test_one_sided_book_emits_zero_bid():
+    """When one side of the book is empty, emit 0 bid so quotes stay fresh.
+
+    This prevents stale quotes from cancelled orders being used as "the market".
+    """
     client, ticks = _make_data_client()
 
     # Delta with only yes side — no side is empty
@@ -210,9 +213,27 @@ def test_no_tick_emitted_when_book_incomplete():
         mock_cache.return_value.instrument.return_value = True
         client._handle_ws_message(json.dumps(delta))
 
-    # No ticks should be emitted — book is incomplete (no NO side)
-    quote_ticks = [t for t in ticks if hasattr(t, "bid_price")]
-    assert len(quote_ticks) == 0
+    # YES tick: bid=0.55 (from yes_levels), ask=1.00 (no_levels empty → fallback)
+    yes_ticks = [t for t in ticks if hasattr(t, "bid_price") and "YES" in str(t.instrument_id)]
+    assert len(yes_ticks) == 1
+    assert yes_ticks[0].bid_price.as_double() == 0.55
+    assert yes_ticks[0].ask_price.as_double() == 1.00  # no NO side → ask defaults high
+
+    # NO side not subscribed in default _make_data_client — verify separately
+    client2, ticks2 = _make_data_client(subscriptions={
+        InstrumentId(Symbol("TEST-NO"), Venue("KALSHI")),
+    })
+    with patch("adapter.KalshiDataClient._clock", new_callable=PropertyMock) as mock_clock, \
+         patch("adapter.KalshiDataClient._log", new_callable=PropertyMock), \
+         patch("adapter.KalshiDataClient._cache", new_callable=PropertyMock) as mock_cache:
+        mock_clock.return_value.timestamp_ns.return_value = 100000
+        mock_cache.return_value.instrument.return_value = True
+        client2._handle_ws_message(json.dumps(delta))
+
+    no_ticks = [t for t in ticks2 if hasattr(t, "bid_price")]
+    assert len(no_ticks) == 1
+    assert no_ticks[0].bid_price.as_double() == 0.00
+    assert no_ticks[0].ask_price.as_double() == 0.45
 
 
 def test_no_hardcoded_fallback_prices():

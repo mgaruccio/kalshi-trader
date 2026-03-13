@@ -234,19 +234,22 @@ class KalshiDataClient(LiveMarketDataClient):
 
             # YES: bid = max(yes prices), ask = 1.0 - max(no prices)
             # NO:  bid = max(no prices),  ask = 1.0 - max(yes prices)
+            # When one side is empty, use 0 so quotes stay fresh and the
+            # strategy sees the real market (not stale quotes from our own
+            # cancelled orders).
             if side_suffix == "-YES":
-                best_bid = max(yes_levels.keys()) if yes_levels else None
-                best_ask = (1.0 - max(no_levels.keys())) if no_levels else None
-                bid_qty = yes_levels.get(best_bid, 0) if best_bid is not None else 0
+                best_bid = max(yes_levels.keys()) if yes_levels else 0.0
+                best_ask = (1.0 - max(no_levels.keys())) if no_levels else 1.0
+                bid_qty = yes_levels.get(best_bid, 0) if yes_levels else 0
                 ask_qty = no_levels.get(max(no_levels.keys()), 0) if no_levels else 0
             else:
-                best_bid = max(no_levels.keys()) if no_levels else None
-                best_ask = (1.0 - max(yes_levels.keys())) if yes_levels else None
-                bid_qty = no_levels.get(best_bid, 0) if best_bid is not None else 0
+                best_bid = max(no_levels.keys()) if no_levels else 0.0
+                best_ask = (1.0 - max(yes_levels.keys())) if yes_levels else 1.0
+                bid_qty = no_levels.get(best_bid, 0) if no_levels else 0
                 ask_qty = yes_levels.get(max(yes_levels.keys()), 0) if yes_levels else 0
 
-            if best_bid is None or best_ask is None:
-                continue  # No complete book yet — do NOT emit garbage
+            if not yes_levels and not no_levels:
+                continue  # Truly empty book — no data to emit
 
             try:
                 ts_event = _parse_ts(data.get("ts"), fallback_ns=int(ts))
@@ -439,10 +442,21 @@ class KalshiExecutionClient(LiveExecutionClient):
                 action = data.get("action")
                 ticker = data.get("ticker")
                 side = data.get("side", "yes")
+
+                if not ticker:
+                    # Settlement or closed-contract fill — Kalshi sends fills
+                    # with no ticker for settled contracts. Safe to skip since
+                    # Kalshi handles settlement positions automatically.
+                    self._log.info(
+                        f"Fill skipped (no ticker): order={v_oid} action={action} "
+                        f"side={side} — likely settlement"
+                    )
+                    return
+
                 instrument_id = InstrumentId(
                     Symbol(f"{ticker}-{side.upper()}"), KALSHI_VENUE
                 )
-                
+
                 ts_event = _parse_ts(data.get("ts"), fallback_ns=ts)
 
                 instrument = self._instrument_provider.find(instrument_id)

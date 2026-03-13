@@ -87,6 +87,7 @@ def main():
         live_mode=True,
         model_cycle_seconds=300,
     ))
+    feature_actor.set_instrument_provider(provider)
     node.trader.add_actor(feature_actor)
 
     # 4. Add WeatherStrategy

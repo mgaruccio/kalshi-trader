@@ -23,6 +23,8 @@ class _TestableFeatureActor:
         self._city_features: dict[tuple[str, str], CityFeatureState] = {}
         self._positions: dict[str, dict] = {}
         self._events_received: int = 0
+        self._instrument_provider = None
+        self._known_instruments: set[str] = set()
         self.log = MagicMock()
         self.clock = MagicMock()
         self.clock.timestamp_ns.return_value = 1_000_000_000
@@ -46,6 +48,7 @@ class _TestableFeatureActor:
     _on_model_timer = FeatureActor._on_model_timer
     _scan_opportunities = FeatureActor._scan_opportunities
     _check_danger = FeatureActor._check_danger
+    _reload_instruments = FeatureActor._reload_instruments
     update_positions = FeatureActor.update_positions
 
     @property
