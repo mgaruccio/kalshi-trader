@@ -290,25 +290,31 @@ class TestEvaluateCycle:
              patch("evaluator.score_opportunities", return_value=[no_score]), \
              patch("evaluator.apply_entry_filters", return_value=[no_score]):
 
+            from nautilus_trader.serialization.serializer import MsgSpecSerializer as _MsgSpecSerializer
+            import msgspec as _msgspec_mod
+            ser = _MsgSpecSerializer(encoding=_msgspec_mod.msgpack)
+
             evaluate_cycle(
                 db_conn=conn,
                 redis_client=mock_redis,
                 models=[], model_names=[], model_weights=[],
                 config=mock_config,
                 stream_key="test-signals",
+                serializer=ser,
             )
 
         assert len(xadd_calls) == 1
         stream_key, fields = xadd_calls[0]
         assert stream_key == "test-signals"
         assert fields[b"type"] == b"ModelSignal"
-        # Decode payload and verify full roundtrip
-        payload = _msgpack.unpackb(fields[b"payload"], raw=False)
-        assert payload["ticker"] == "KXHIGHCHI-26MAR15-T55"
-        assert payload["side"] == "no"
-        # Verify p_win is preserved through msgpack roundtrip
-        from data_types import ModelSignal as _ModelSignal
-        restored = _ModelSignal.from_dict(payload)
+        # Decode payload via NT serializer and verify full roundtrip
+        from nautilus_trader.serialization.serializer import MsgSpecSerializer as _MsgSpecSerializer
+        import msgspec as _msgspec_mod
+        deser = _MsgSpecSerializer(encoding=_msgspec_mod.msgpack)
+        restored = deser.deserialize(fields[b"payload"])
+        assert type(restored).__name__ == "ModelSignal"
+        assert restored.ticker == "KXHIGHCHI-26MAR15-T55"
+        assert restored.side == "no"
         expected_p_win = no_score.p_win
         assert restored.p_win == pytest.approx(expected_p_win, abs=0.01)
         conn.close()

@@ -13,10 +13,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import msgpack
 import numpy as np
 import redis
 import sqlite3
+
+from nautilus_trader.serialization.serializer import MsgSpecSerializer
+import msgspec
 
 # kalshi_weather_ml imports
 _KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
@@ -203,7 +205,7 @@ def _check_rolling_features_staleness(max_stale_hours: float = 36.0) -> bool:
         return False
 
 
-def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, config, stream_key):
+def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, config, stream_key, serializer=None):
     """One evaluation cycle: score all markets, write to DB, publish to Redis."""
     cycle_id = str(uuid.uuid4())[:8]
     cycle_ts = datetime.now(timezone.utc).isoformat()
@@ -411,8 +413,8 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
                 **order,
             })
 
-        # Publish ModelSignal to Redis
-        if redis_client:
+        # Publish ModelSignal to Redis using NT's serializer
+        if redis_client and serializer:
             now_ns = int(time.time_ns())
             signal = ModelSignal(
                 city=s.city, ticker=s.ticker, side=s.side,
@@ -421,7 +423,7 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
                 ts_event=now_ns, ts_init=now_ns,
             )
             try:
-                payload = msgpack.packb(ModelSignal.to_dict(signal), use_bin_type=True)
+                payload = serializer.serialize(signal)
                 redis_client.xadd(stream_key, {
                     b"type": b"ModelSignal",
                     b"topic": b"data.ModelSignal",
@@ -478,12 +480,15 @@ def main():
     config = load_config()
     models, names, weights = load_models(config)
 
+    # NT-compatible serializer for Redis publishing
+    serializer = MsgSpecSerializer(encoding=msgspec.msgpack)
+
     log.info(f"Evaluator started. DB={args.db}, interval={args.interval}s")
 
     while True:
         try:
             config = load_config()  # hot reload
-            evaluate_cycle(conn, r, models, names, weights, config, args.stream_key)
+            evaluate_cycle(conn, r, models, names, weights, config, args.stream_key, serializer=serializer)
         except sqlite3.DatabaseError as e:
             log.error(f"DB error, reconnecting: {e}")
             try:

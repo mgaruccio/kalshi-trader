@@ -45,6 +45,7 @@ class ClimateEvent(Data):
     @staticmethod
     def to_dict(obj) -> dict:
         return {
+            "type": "ClimateEvent",
             "source": obj.source,
             "city": obj.city,
             "date": obj.date,
@@ -109,6 +110,7 @@ class ModelSignal(Data):
     @staticmethod
     def to_dict(obj) -> dict:
         return {
+            "type": "ModelSignal",
             "city": obj.city,
             "ticker": obj.ticker,
             "side": obj.side,
@@ -177,6 +179,7 @@ class DangerAlert(Data):
     @staticmethod
     def to_dict(obj) -> dict:
         return {
+            "type": "DangerAlert",
             "ticker": obj.ticker,
             "city": obj.city,
             "alert_level": obj.alert_level,
