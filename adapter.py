@@ -504,35 +504,65 @@ class KalshiExecutionClient(LiveExecutionClient):
             self._log.error(f"Error fetching active orders: {e}")
         return reports
 
-    def _fetch_positions(self):
-        return self.k_portfolio.get_positions()
+    def _fetch_positions_raw(self) -> list[dict]:
+        """Two-step position query matching Kalshi API structure.
+
+        The API returns event_positions at the top level (not market_positions).
+        Must query per-event to get individual market positions with ticker and qty.
+        """
+        resp = self.k_portfolio.get_positions(settlement_status="unsettled")
+        # SDK model has .event_positions or raw dict fallback
+        event_positions = getattr(resp, "event_positions", None)
+        if event_positions is None:
+            # Try raw dict access (SDK may deserialize differently)
+            raw = resp.to_dict() if hasattr(resp, "to_dict") else {}
+            event_positions = raw.get("event_positions", [])
+
+        positions = []
+        for ep in event_positions or []:
+            event_ticker = getattr(ep, "event_ticker", None) or (ep.get("event_ticker") if isinstance(ep, dict) else None)
+            if not event_ticker:
+                continue
+            detail = self.k_portfolio.get_positions(event_ticker=event_ticker)
+            market_positions = getattr(detail, "market_positions", None)
+            if market_positions is None:
+                raw = detail.to_dict() if hasattr(detail, "to_dict") else {}
+                market_positions = raw.get("market_positions", [])
+            for mp in market_positions or []:
+                positions.append(mp)
+        return positions
 
     async def generate_position_status_reports(self, command) -> list:
         reports = []
         try:
-            resp = await asyncio.get_running_loop().run_in_executor(
-                self._executor, self._fetch_positions
+            positions = await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._fetch_positions_raw
             )
             ts = self._clock.timestamp_ns()
-            for pos in getattr(resp, "positions", None) or []:
-                if pos.position == 0:
+            for pos in positions:
+                # Handle both SDK objects and raw dicts
+                ticker = getattr(pos, "ticker", None) or (pos.get("ticker") if isinstance(pos, dict) else None)
+                position = getattr(pos, "position", None) or (pos.get("position") if isinstance(pos, dict) else None)
+                if not ticker or not position or position == 0:
                     continue
-                side = "YES" if pos.position > 0 else "NO"
-                inst_id = InstrumentId(Symbol(f"{pos.ticker}-{side}"), KALSHI_VENUE)
+                side = "YES" if position > 0 else "NO"
+                inst_id = InstrumentId(Symbol(f"{ticker}-{side}"), KALSHI_VENUE)
                 instrument = self._instrument_provider.find(inst_id)
                 if not instrument:
+                    self._log.warning(f"Position {ticker}-{side} not in instrument cache, skipping")
                     continue
                 reports.append(
                     PositionStatusReport(
                         account_id=self.account_id,
                         instrument_id=inst_id,
                         position_side=PositionSide.LONG,
-                        quantity=instrument.make_qty(abs(pos.position)),
+                        quantity=instrument.make_qty(abs(position)),
                         report_id=UUID4(),
                         ts_last=ts,
                         ts_init=ts,
                     )
                 )
+                self._log.info(f"Position report: {ticker} {side} qty={abs(position)}")
         except Exception as e:
             self._log.error(f"Error fetching positions: {e}")
         return reports
