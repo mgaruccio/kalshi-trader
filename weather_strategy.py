@@ -592,16 +592,6 @@ class WeatherStrategy(Strategy):
             total += info.get("contracts", 0) * self._cfg.max_cost_cents
         return total
 
-    def _count_pending_buys(self, instrument_id: InstrumentId) -> int:
-        """Count contracts in outstanding BUY orders for an instrument."""
-        total = 0
-        target_value = instrument_id.value
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
-            if order.instrument_id.value == target_value and order.side == OrderSide.BUY:
-                total += int(order.leaves_qty.as_double())
-        return total
-
     def _evaluate_exit(self, alert: DangerAlert):
         """Evaluate a DangerAlert for potential exit."""
         if not self._cfg.danger_exit_enabled:

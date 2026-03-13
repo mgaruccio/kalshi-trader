@@ -117,7 +117,6 @@ class _TestableWeatherStrategy:
     _make_spread_cancel_callback = WeatherStrategy._make_spread_cancel_callback
     _cancel_spread_orders = WeatherStrategy._cancel_spread_orders
     _deploy_ladder = WeatherStrategy._deploy_ladder
-    _count_pending_buys = WeatherStrategy._count_pending_buys
     _cancel_ladder_orders = WeatherStrategy._cancel_ladder_orders
     _cancel_all_buys_for_ticker = WeatherStrategy._cancel_all_buys_for_ticker
     _cancel_resting_sells_for_ticker = WeatherStrategy._cancel_resting_sells_for_ticker
