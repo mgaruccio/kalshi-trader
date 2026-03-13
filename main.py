@@ -26,6 +26,7 @@ from adapter import (
     KalshiInstrumentProvider,
     KalshiConfig,
 )
+from data_types import ModelSignal, DangerAlert
 from feature_actor import FeatureActor, FeatureActorConfig
 from weather_strategy import WeatherStrategy, WeatherStrategyConfig
 
@@ -97,6 +98,11 @@ def main():
     if not args.dry_run:
         node.add_exec_client_factory("KALSHI", KalshiExecutionClientFactory)
     node.build()
+
+    # Register custom data types for external_streams deserialization.
+    # CRITICAL: must be called after node.build() and before node.run().
+    node.kernel.msgbus.add_streaming_type(ModelSignal)
+    node.kernel.msgbus.add_streaming_type(DangerAlert)
 
     # Register instruments
     for inst in instruments:
