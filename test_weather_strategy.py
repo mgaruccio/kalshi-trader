@@ -75,6 +75,7 @@ class _TestableWeatherStrategy:
         self._spread_orders_placed: int = 0
         self._stable_orders_placed: int = 0
         self._feature_actor = None
+        self._reconciled = True  # skip reconciliation in unit tests
         # NT mocks
         self.log = MagicMock()
         self.cache = MagicMock()

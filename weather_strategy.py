@@ -105,6 +105,7 @@ class WeatherStrategy(Strategy):
         self._spread_orders_placed: int = 0
         self._stable_orders_placed: int = 0
         self._feature_actor = None  # set after construction
+        self._reconciled = False  # set True after first reconciliation
 
     def set_feature_actor(self, actor):
         """Wire the FeatureActor reference for position updates."""
@@ -131,9 +132,6 @@ class WeatherStrategy(Strategy):
             interval=timedelta(minutes=self._cfg.refresh_interval_minutes),
             callback=self._on_refresh,
         )
-
-        # Reconcile positions and orders from previous session
-        self._reconcile_existing_state()
 
         self.log.info(
             f"WeatherStrategy started, subscribed to {len(instruments)} instruments, "
@@ -734,6 +732,12 @@ class WeatherStrategy(Strategy):
         when the bid moves. No mass cancel-all (async cancel lag causes
         phantom order accumulation in live trading).
         """
+        # Deferred reconciliation: on_start fires before NT reconciliation
+        # populates cache, so we reconcile on the first refresh tick instead.
+        if not self._reconciled:
+            self._reconciled = True
+            self._reconcile_existing_state()
+
         if self._is_backoff_window():
             self.log.info("Back-off window: cancelling all resting buy orders")
             self._cancel_all_resting_buys()
