@@ -329,6 +329,10 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
             sig_info["bid_cents"] = m.get("yes_bid", 50)
     passing_signals.sort(key=lambda x: x["bid_cents"])
 
+    # Build position lookup for per-ticker capacity
+    position_by_ticker = {p["ticker"]: p.get("contracts", 0) for p in positions}
+    max_per_ticker = getattr(config, "max_contracts_per_ticker", 20)
+
     desired = []
     for sig_info in passing_signals:
         s = sig_info["score"]
@@ -339,6 +343,11 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
         if remaining_budget <= 0:
             break
 
+        held = position_by_ticker.get(s.ticker, 0)
+        capacity = max(0, max_per_ticker - held)
+        if capacity <= 0:
+            continue
+
         ladder = compute_desired_ladder(
             bid_cents=bid_cents,
             config_offsets=getattr(config, "stable_ladder_offsets_cents", (0, 1, 3, 5, 10)),
@@ -347,7 +356,7 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
             thin_margin_threshold_f=getattr(config, "thin_margin_threshold_f", 2.0),
             thin_margin_size_factor=getattr(config, "thin_margin_size_factor", 0.5),
             margin=s.margin,
-            capacity=getattr(config, "max_contracts_per_ticker", 20),
+            capacity=capacity,
             budget=remaining_budget,
         )
 
