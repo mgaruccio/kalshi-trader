@@ -10,7 +10,7 @@ with the same state attributes and bind the unbound methods from FeatureActor.
 import pytest
 from unittest.mock import MagicMock
 
-from data_types import ClimateEvent, ModelSignal, DangerAlert
+from data_types import ClimateEvent, DangerAlert
 from exit_rules import CityFeatureState
 from feature_actor import FeatureActor, FeatureActorConfig
 
@@ -31,22 +31,13 @@ class _TestableFeatureActor:
         self._published: list = []
         self.publish_data = lambda dt, data: self._published.append(data)
 
-        # Mock ensemble state
-        self.ensemble_models = []
-        self.ensemble_names = []
-        self.ensemble_weights = []
-        self._models_loaded = False
-        self._kw_config = None
-
-        # Mock cache for opportunity scanning
+        # Mock cache for instrument reload
         self.cache = MagicMock()
         self.cache.instruments.return_value = []
 
     # Bind the actual methods from FeatureActor
     on_data = FeatureActor.on_data
     _active_dates_for_city = FeatureActor._active_dates_for_city
-    _on_model_timer = FeatureActor._on_model_timer
-    _scan_opportunities = FeatureActor._scan_opportunities
     _check_danger = FeatureActor._check_danger
     _reload_instruments = FeatureActor._reload_instruments
     update_positions = FeatureActor.update_positions
@@ -233,32 +224,6 @@ class TestFeatureActorLogic:
 
         assert len(actor._published) == 0
 
-    def test_model_timer_no_models_no_signals(self):
-        """Model timer without scoring functions should not emit signals.
-
-        Previously this emitted p_win=0.0 signals. After the silent-failure
-        fix, no signal is emitted when scoring is unavailable.
-        """
-        actor = self._make_actor()
-        actor._city_features[("chicago", "2026-03-10")] = CityFeatureState()
-        actor._city_features[("chicago", "2026-03-10")].update(
-            "ecmwf", {"forecast_high": 55.0})
-        actor._positions = {
-            "KXHIGHCHI-26MAR10-T55": {"side": "no", "threshold": 55.0, "city": "chicago"}
-        }
-
-        actor._on_model_timer(MagicMock())
-
-        signals = [s for s in actor._published if isinstance(s, ModelSignal)]
-        assert len(signals) == 0
-
-    def test_model_timer_no_positions_no_signals(self):
-        """No signals when no positions are held."""
-        actor = self._make_actor()
-
-        actor._on_model_timer(MagicMock())
-        assert len(actor._published) == 0
-
     def test_update_positions(self):
         """update_positions should replace the positions dict."""
         actor = self._make_actor()
@@ -297,35 +262,9 @@ class TestFeatureActorLogic:
 
         assert len(actor._published) == 0
 
-    def test_model_timer_skips_city_without_features(self):
-        """Model timer should skip cities that have no accumulated features."""
-        actor = self._make_actor()
-        actor._city_features = {}  # no features
-        actor._positions = {
-            "KXHIGHCHI-26MAR10-T55": {"side": "no", "threshold": 55.0, "city": "chicago"}
-        }
-
-        actor._on_model_timer(MagicMock())
-        assert len(actor._published) == 0
-
-    def test_model_timer_multiple_tickers_no_models_no_signals(self):
-        """Without scoring functions, no signals emitted even with multiple tickers."""
-        actor = self._make_actor()
-        actor._city_features[("chicago", "2026-03-10")] = CityFeatureState()
-        actor._city_features[("chicago", "2026-03-10")].update(
-            "ecmwf", {"forecast_high": 55.0})
-        actor._positions = {
-            "KXHIGHCHI-26MAR10-T55": {"side": "no", "threshold": 55.0, "city": "chicago"},
-            "KXHIGHCHI-26MAR10-T60": {"side": "no", "threshold": 60.0, "city": "chicago"},
-        }
-
-        actor._on_model_timer(MagicMock())
-
-        signals = [s for s in actor._published if isinstance(s, ModelSignal)]
-        assert len(signals) == 0
-
     def test_non_climate_data_ignored(self):
         """on_data should ignore non-ClimateEvent data."""
+        from data_types import ModelSignal
         actor = self._make_actor()
 
         # Pass a ModelSignal (wrong type)
@@ -335,14 +274,17 @@ class TestFeatureActorLogic:
         assert actor.events_received == 0
         assert len(actor._city_features) == 0
 
-    def test_model_timer_skips_empty_snapshot(self):
-        """Model timer should skip cities whose feature snapshot is empty."""
+    def test_no_model_state_on_actor(self):
+        """FeatureActor instance should have no ML model attributes."""
         actor = self._make_actor()
-        # Create state but with no actual features
-        actor._city_features[("chicago", "2026-03-10")] = CityFeatureState()
-        actor._positions = {
-            "KXHIGHCHI-26MAR10-T55": {"side": "no", "threshold": 55.0, "city": "chicago"}
-        }
+        assert not hasattr(actor, "ensemble_models")
+        assert not hasattr(actor, "ensemble_names")
+        assert not hasattr(actor, "ensemble_weights")
+        assert not hasattr(actor, "_models_loaded")
+        assert not hasattr(actor, "_kw_config")
 
-        actor._on_model_timer(MagicMock())
-        assert len(actor._published) == 0
+    def test_config_has_no_model_fields(self):
+        """FeatureActorConfig should not have model_cycle_seconds or scan_opportunities."""
+        config = FeatureActorConfig()
+        assert not hasattr(config, "model_cycle_seconds")
+        assert not hasattr(config, "scan_opportunities")

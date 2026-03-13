@@ -1,9 +1,11 @@
-"""Climate feature accumulation and signal generation.
+"""Climate feature accumulation and danger monitoring.
 
 FeatureActor sits between raw climate data and the trading strategy.
-It accumulates ClimateEvent data per-city, periodically runs the ML
-ensemble (emitting ModelSignal), and continuously checks exit rules
+It accumulates ClimateEvent data per-city and continuously checks exit rules
 (emitting DangerAlert).
+
+ML scoring (ModelSignal emission) is handled by the standalone evaluator.py
+which reads the DB and publishes to Redis.
 
 In live_mode, timer-based pollers fetch real-time data from
 kalshi_weather_ml and publish ClimateEvents on the same bus path
@@ -12,8 +14,7 @@ used by backtest replay.
 import logging
 import os
 import sys
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import timedelta
 
 # Add kalshi-weather package to path
 _KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
@@ -22,7 +23,7 @@ sys.path.insert(0, f"{_KW_ROOT}/src")
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.model.data import DataType
-from data_types import ClimateEvent, ModelSignal, DangerAlert
+from data_types import ClimateEvent, DangerAlert
 from exit_rules import CityFeatureState, check_exit_rules, should_exit
 
 log = logging.getLogger(__name__)
@@ -53,14 +54,9 @@ except ImportError:
     get_current_sst = None
 
 try:
-    from kalshi_weather_ml.strategy import score_opportunities, score_and_filter
     from kalshi_weather_ml.markets import parse_ticker
-    from kalshi_weather_ml.config import load_config
 except ImportError:
-    score_opportunities = None
-    score_and_filter = None
     parse_ticker = None
-    load_config = None
 
 
 _COAST_NORMAL = {
@@ -119,14 +115,22 @@ def _build_extra_features(
 
 
 class FeatureActorConfig(ActorConfig):
-    model_cycle_seconds: int = 300    # 5 min between model runs
     danger_check_enabled: bool = True  # check exit rules on each event
     live_mode: bool = False            # enables live pollers in Phase 3
-    scan_opportunities: bool = True   # scan all instruments for entry opportunities
 
 
 class FeatureActor(Actor):
-    """Bridges climate data sources to trading strategy signals."""
+    """Bridges climate data sources to trading strategy signals.
+
+    Responsibilities:
+    - Accumulate ClimateEvent data per (city, date) bucket
+    - Check exit rules and publish DangerAlert on each event
+    - Poll live data (METAR, forecasts, SST) when live_mode=True
+
+    NOT responsible for:
+    - ML model loading
+    - ModelSignal emission (handled by evaluator.py via Redis)
+    """
 
     def __init__(self, config: FeatureActorConfig):
         super().__init__(config)
@@ -137,83 +141,18 @@ class FeatureActor(Actor):
         self._instrument_provider = None  # set via set_instrument_provider()
         self._known_instruments: set[str] = set()  # instrument_id values we've seen
 
-        # Ensemble model state
-        self.ensemble_models = []
-        self.ensemble_names = []
-        self.ensemble_weights = []
-        self._models_loaded = False
-        self._kw_config = None
-        if load_config:
-            self._kw_config = load_config()
-        self._load_models()
-
     def set_instrument_provider(self, provider):
         """Wire the instrument provider for periodic reload of new markets."""
         self._instrument_provider = provider
 
-    def _load_models(self):
-        """Load ensemble models from config (ensemble_models + ensemble_weights).
-
-        All-or-nothing: if ANY configured model fails to load, crash.
-        """
-        from kalshi_weather_ml.models.emos import EMOSModel
-        from kalshi_weather_ml.models.ngboost_model import NGBoostModel
-        from kalshi_weather_ml.models.drn_model import DRNModel
-
-        kw_root = Path(_KW_ROOT)
-        models_dir = kw_root / "data" / "models"
-
-        model_loaders = {
-            "emos":           lambda: EMOSModel.load(models_dir / "emos_normal.json"),
-            "ngboost":        lambda: NGBoostModel.load(models_dir / "ngboost_normal.pkl"),
-            "ngboost_spread": lambda: NGBoostModel.load(models_dir / "ngboost_normal_wx_spread.pkl"),
-            "drn":            lambda: DRNModel.load(models_dir / "drn_normal"),
-            "drn_spread":     lambda: DRNModel.load(models_dir / "drn_normal_wx_spread"),
-        }
-
-        # Determine which models to load from config (fallback: emos + ngboost)
-        model_names = ["emos", "ngboost"]
-        config_weights = {}
-        if self._kw_config and hasattr(self._kw_config, "ensemble_models"):
-            model_names = self._kw_config.ensemble_models or model_names
-        if self._kw_config and hasattr(self._kw_config, "ensemble_weights"):
-            config_weights = self._kw_config.ensemble_weights or {}
-
-        for name in model_names:
-            loader = model_loaders.get(name)
-            if loader is None:
-                raise ValueError(f"Unknown model name in ensemble_models: {name!r}")
-            model = loader()  # crash if load fails
-            weight = config_weights.get(name, 1.0)
-            self.ensemble_models.append(model)
-            self.ensemble_names.append(name)
-            self.ensemble_weights.append(weight)
-            self.log.info(f"Loaded model {name!r} (weight={weight})")
-
-        if len(self.ensemble_models) != len(model_names):
-            raise RuntimeError(
-                f"Model load incomplete: loaded {len(self.ensemble_models)}/{len(model_names)} "
-                f"(got {self.ensemble_names}, expected {model_names})"
-            )
-        self._models_loaded = True
-        self.log.info(
-            f"Ensemble ready: {len(self.ensemble_models)} models — "
-            + ", ".join(f"{n}={w}" for n, w in zip(self.ensemble_names, self.ensemble_weights))
-        )
-
     def on_start(self):
-        """Subscribe to climate events and start model cycle timer."""
+        """Subscribe to climate events and optionally start live pollers."""
         # Subscribe via msgbus directly — subscribe_data() requires client_id
         # which doesn't exist for internal pub/sub in live TradingNode.
         # publish_data() publishes to "data.{DataType.topic}", so we match that.
         self.msgbus.subscribe(
             topic=f"data.{DataType(ClimateEvent).topic}",
             handler=self.handle_data,
-        )
-        self.clock.set_timer(
-            "model_cycle",
-            interval=timedelta(seconds=self._cfg.model_cycle_seconds),
-            callback=self._on_model_timer,
         )
 
         # Seed known instruments so we can detect new ones on reload
@@ -224,8 +163,7 @@ class FeatureActor(Actor):
             self._start_live_pollers()
 
         self.log.info(
-            f"FeatureActor started (cycle={self._cfg.model_cycle_seconds}s, "
-            f"live={self._cfg.live_mode})"
+            f"FeatureActor started (live={self._cfg.live_mode})"
         )
 
     def _active_dates_for_city(self, city: str) -> list[str]:
@@ -292,7 +230,7 @@ class FeatureActor(Actor):
     def _reload_instruments(self):
         """Reload instruments from Kalshi API and add new ones to cache.
 
-        Called each model cycle so newly-opened markets (e.g. tomorrow's
+        Called periodically so newly-opened markets (e.g. tomorrow's
         contracts that open at ~10am ET) are discovered without restart.
         """
         if self._instrument_provider is None:
@@ -313,252 +251,6 @@ class FeatureActor(Actor):
                 self.log.info(f"Instrument reload: {new_count} new instruments added to cache")
         except Exception as e:
             self.log.warning(f"Instrument reload failed: {e}")
-
-    def _on_model_timer(self, event):
-        """Run ML ensemble on accumulated features.
-
-        1. Reload instruments (discover new markets)
-        2. For each city with active positions, re-evaluate and publish ModelSignal
-        3. Scan all cached instruments for new entry opportunities
-        """
-        # Discover newly-opened markets (e.g. tomorrow's contracts)
-        self._reload_instruments()
-
-        ts = self.clock.timestamp_ns()
-        now_dt = datetime.now()
-
-        # Track tickers already evaluated for position monitoring
-        evaluated_tickers: set[str] = set()
-
-        # --- Position monitoring: re-evaluate held positions ---
-        if self._positions:
-            # Group positions by (city, settlement_date)
-            cd_positions: dict[tuple[str, str], list[str]] = {}
-            for ticker, info in self._positions.items():
-                city = info.get("city", "")
-                sd = ""
-                if parse_ticker:
-                    parsed = parse_ticker(ticker)
-                    if parsed:
-                        sd = parsed["settlement_date"]
-                cd_positions.setdefault((city, sd), []).append(ticker)
-
-            for (city, sd), tickers in cd_positions.items():
-                state = self._city_features.get((city, sd))
-                if state is None:
-                    continue
-
-                features = state.snapshot()
-                if not features:
-                    continue
-
-                ecmwf = features.get("ecmwf_high")
-                gfs = features.get("gfs_high")
-                if ecmwf is None or gfs is None:
-                    ecmwf = ecmwf or features.get("forecast_high")
-                    gfs = gfs or features.get("forecast_high")
-
-                if ecmwf is None or gfs is None:
-                    continue
-
-                for ticker in tickers:
-                    evaluated_tickers.add(ticker)
-                    pos_info = self._positions[ticker]
-
-                    if not (score_opportunities and parse_ticker and self.ensemble_models):
-                        continue  # no scoring available — skip, don't emit zero signal
-
-                    parsed = parse_ticker(ticker)
-                    if not parsed:
-                        continue
-
-                    if self._cfg.live_mode:
-                        try:
-                            scores = score_opportunities(
-                                ticker=ticker, city=city, direction="above",
-                                threshold=float(parsed["threshold"]),
-                                settlement_date=parsed["settlement_date"],
-                                ecmwf=ecmwf, gfs=gfs,
-                                models=self.ensemble_models,
-                                model_names=self.ensemble_names,
-                                model_weights=self.ensemble_weights,
-                                now=now_dt,
-                                extra_features=features,
-                            )
-                        except Exception as e:
-                            self.log.error(f"Score eval failed for {ticker}: {e}")
-                            continue  # skip ticker — do NOT emit zero signal
-                    else:
-                        # Backtest: crash on inference failure
-                        scores = score_opportunities(
-                            ticker=ticker, city=city, direction="above",
-                            threshold=float(parsed["threshold"]),
-                            settlement_date=parsed["settlement_date"],
-                            ecmwf=ecmwf, gfs=gfs,
-                            models=self.ensemble_models,
-                            model_names=self.ensemble_names,
-                            model_weights=self.ensemble_weights,
-                            now=now_dt,
-                            extra_features=features,
-                        )
-
-                    p_win = 0.0
-                    model_scores = {}
-                    side = pos_info.get("side", "no").lower()
-                    for s in scores:
-                        if s.side == side:
-                            p_win = s.p_win
-                            model_scores = s.model_scores
-                            break
-
-                    if p_win <= 0.0:
-                        self.log.warning(f"No valid p_win for {ticker} (side={side}), skipping signal")
-                        continue
-
-                    signal = ModelSignal(
-                        city=city,
-                        ticker=ticker,
-                        side=pos_info.get("side", "no"),
-                        p_win=p_win,
-                        model_scores=model_scores,
-                        features_snapshot=features,
-                        ts_event=ts,
-                        ts_init=ts,
-                    )
-                    self.publish_data(DataType(ModelSignal), signal)
-
-        # --- Opportunity scanning: evaluate all cached instruments for new entries ---
-        if self._cfg.scan_opportunities:
-            self._scan_opportunities(ts, now_dt, evaluated_tickers)
-
-    def _scan_opportunities(
-        self,
-        ts: int,
-        now_dt: datetime,
-        skip_tickers: set[str],
-    ):
-        """Evaluate all cached instruments for entry opportunities."""
-        if not (score_and_filter and parse_ticker):
-            self.log.error("Cannot scan: scoring functions not available (import failed)")
-            return
-        if not self._models_loaded:
-            self.log.error("Cannot scan: no models loaded")
-            return
-
-        instruments = self.cache.instruments()
-        if not instruments:
-            return
-
-        from kalshi_weather_ml.markets import SERIES_CONFIG
-
-        series_to_city = {s: c for s, c in SERIES_CONFIG}
-
-        # Group instruments by (city, settlement_date), dedup tickers
-        cd_tickers: dict[tuple[str, str], list[dict]] = {}
-        seen_tickers: set[str] = set()
-        for inst in instruments:
-            sym = inst.id.symbol.value  # "KXHIGHCHI-26MAR01-T55-NO"
-            if not (sym.endswith("-YES") or sym.endswith("-NO")):
-                continue
-            ticker = sym.rsplit("-", 1)[0]
-            if ticker in skip_tickers or ticker in seen_tickers:
-                continue
-            seen_tickers.add(ticker)
-
-            parsed = parse_ticker(ticker)
-            if not parsed:
-                continue
-            city = series_to_city.get(parsed["series"], "")
-            sd = parsed["settlement_date"]
-            if city:
-                cd_tickers.setdefault((city, sd), []).append(
-                    {"ticker": ticker, "parsed": parsed}
-                )
-
-        for (city, sd), ticker_list in cd_tickers.items():
-            state = self._city_features.get((city, sd))
-            features = state.snapshot() if state else {}
-
-            ecmwf = features.get("ecmwf_high")
-            gfs = features.get("gfs_high")
-
-            # Bootstrap: fetch forecasts if not yet accumulated (live mode only —
-            # in backtest, climate events must supply all features)
-            if (ecmwf is None or gfs is None) and self._cfg.live_mode and get_forecast is not None:
-                try:
-                    ecmwf = ecmwf or get_forecast(city, sd, PRIMARY_MODEL)
-                    gfs = gfs or get_forecast(city, sd, CONSENSUS_MODEL)
-                    icon = get_forecast(city, sd, "icon_seamless")
-                    wx = get_weather_features(city, sd) if get_weather_features else {}
-
-                    if ecmwf is not None or gfs is not None:
-                        bootstrap = _build_extra_features(
-                            ecmwf, gfs, icon, city, sd, wx,
-                        )
-                        key = (city, sd)
-                        s = self._city_features.setdefault(key, CityFeatureState())
-                        s.update("bootstrap_forecast", bootstrap)
-                        features = s.snapshot()
-                except Exception as e:
-                    self.log.error(f"Live forecast fetch failed for {city}/{sd}: {e}")
-                    continue  # will retry next timer cycle
-
-            if ecmwf is None or gfs is None:
-                continue
-
-            for entry in ticker_list:
-                ticker = entry["ticker"]
-                parsed = entry["parsed"]
-                market = {
-                    "ticker": ticker,
-                    "city": city,
-                    "direction": "above",
-                    "threshold": float(parsed["threshold"]),
-                    "settlement_date": parsed["settlement_date"],
-                    "yes_bid": 50,
-                    "yes_ask": 51,
-                }
-                if self._cfg.live_mode:
-                    try:
-                        scored = score_and_filter(
-                            ticker=ticker, city=city, direction="above",
-                            threshold=float(parsed["threshold"]),
-                            settlement_date=parsed["settlement_date"],
-                            ecmwf=ecmwf, gfs=gfs, config=self._kw_config,
-                            models=self.ensemble_models,
-                            model_names=self.ensemble_names,
-                            model_weights=self.ensemble_weights,
-                            now=now_dt,
-                            extra_features=features,
-                        )
-                    except Exception as e:
-                        self.log.error(f"Scan eval failed for {ticker}: {e}")
-                        continue
-                else:
-                    # Backtest: crash on inference failure
-                    scored = score_and_filter(
-                        ticker=ticker, city=city, direction="above",
-                        threshold=float(parsed["threshold"]),
-                        settlement_date=parsed["settlement_date"],
-                        ecmwf=ecmwf, gfs=gfs, config=self._kw_config,
-                        models=self.ensemble_models,
-                        model_names=self.ensemble_names,
-                        model_weights=self.ensemble_weights,
-                        now=now_dt,
-                        extra_features=features,
-                    )
-                for s in scored:
-                    signal = ModelSignal(
-                        city=city,
-                        ticker=ticker,
-                        side=s.side,
-                        p_win=s.p_win,
-                        model_scores=s.model_scores,
-                        features_snapshot=features,
-                        ts_event=ts,
-                        ts_init=ts,
-                    )
-                    self.publish_data(DataType(ModelSignal), signal)
 
     def _check_danger(self, city: str):
         """Run exit rules for a city and publish DangerAlert if triggered."""

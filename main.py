@@ -102,10 +102,9 @@ def main():
     for inst in instruments:
         node.cache.add_instrument(inst)
 
-    # 3. Add FeatureActor (climate data -> signals)
+    # 3. Add FeatureActor (climate data accumulation + danger monitoring)
     feature_actor = FeatureActor(FeatureActorConfig(
         live_mode=True,
-        model_cycle_seconds=300,
     ))
     feature_actor.set_instrument_provider(provider)
     node.trader.add_actor(feature_actor)
