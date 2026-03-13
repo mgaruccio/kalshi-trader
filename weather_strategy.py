@@ -172,7 +172,7 @@ class WeatherStrategy(Strategy):
         NT's exec client reconciliation populates cache.positions() and
         cache.orders_open() before on_start is called.  We read those to
         rebuild _positions_info (so capital/concentration math is correct)
-        and _resting_sells (so we don't double-post sell targets).
+        and re-place missing sell targets.
         """
         # --- Positions ---
         for position in self.cache.positions():
