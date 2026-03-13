@@ -1808,6 +1808,11 @@ class TestReconciliation:
             mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
             strategy._reconcile_existing_state()
 
+        # Reconciliation places a sell target — record that, then reset
+        reconcile_calls = strategy.submit_order.call_count
+        assert reconcile_calls == 1  # sell target for reconciled position
+        strategy.submit_order.reset_mock()
+
         # Now try to deploy a new ladder — should be blocked by capital cap
         strategy._eligible_signals["KXHIGHTBOS-26MAR13-T45"] = _make_signal(
             ticker="KXHIGHTBOS-26MAR13-T45", p_win=0.97)

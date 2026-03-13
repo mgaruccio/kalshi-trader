@@ -38,8 +38,8 @@ def main():
                         help="Paper trade: evaluate signals but block all orders (max_position=0)")
     parser.add_argument("--capital", type=int, default=4000,
                         help="Max total deployed capital in cents (default: 4000 = $40)")
-    parser.add_argument("--max-per-ticker", type=int, default=30,
-                        help="Max contracts per ticker (default: 30)")
+    parser.add_argument("--max-per-ticker", type=int, default=15,
+                        help="Max contracts per ticker (default: 15)")
     parser.add_argument("--max-cost", type=int, default=94,
                         help="Max cost per contract in cents (default: 94)")
     args = parser.parse_args()

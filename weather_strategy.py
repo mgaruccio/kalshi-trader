@@ -220,6 +220,23 @@ class WeatherStrategy(Strategy):
                 f"Reconciled resting buy: {ticker} order {order.client_order_id} @ {price_cents}c"
             )
 
+        # --- Re-place sell targets for positions without resting sells ---
+        for ticker, info in self._positions_info.items():
+            if ticker in self._resting_sells:
+                continue  # already has sell targets
+            side = info.get("side", "no").upper()
+            contracts = info.get("contracts", 0)
+            if contracts <= 0:
+                continue
+            instrument_id = InstrumentId(
+                Symbol(f"{ticker}-{side}"), KALSHI_VENUE,
+            )
+            self._place_resting_sell(instrument_id, contracts)
+            self.log.info(
+                f"Reconciled sell target: {ticker} {contracts} contracts @ "
+                f"{self._cfg.sell_target_cents}c"
+            )
+
         if self._positions_info:
             self._sync_positions_to_actor()
             self.log.info(
