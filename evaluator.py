@@ -13,12 +13,15 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import msgspec
 import numpy as np
-import redis
 import sqlite3
 
+from nautilus_trader.common.component import MessageBus, LiveClock
+from nautilus_trader.common.config import MessageBusConfig, DatabaseConfig
+from nautilus_trader.model.data import DataType
+from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.serialization.serializer import MsgSpecSerializer
-import msgspec
 
 # kalshi_weather_ml imports
 _KW_ROOT = os.environ.get("KALSHI_WEATHER_ROOT", "/home/mike/code/altmarkets/kalshi-weather")
@@ -205,7 +208,7 @@ def _check_rolling_features_staleness(max_stale_hours: float = 36.0) -> bool:
         return False
 
 
-def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, config, stream_key, serializer=None):
+def evaluate_cycle(db_conn, msgbus, models, model_names, model_weights, config, stream_key=None):
     """One evaluation cycle: score all markets, write to DB, publish to Redis."""
     cycle_id = str(uuid.uuid4())[:8]
     cycle_ts = datetime.now(timezone.utc).isoformat()
@@ -413,8 +416,8 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
                 **order,
             })
 
-        # Publish ModelSignal to Redis using NT's serializer
-        if redis_client and serializer:
+        # Publish ModelSignal via NT MessageBus (writes to Redis in NT's format)
+        if msgbus:
             now_ns = int(time.time_ns())
             signal = ModelSignal(
                 city=s.city, ticker=s.ticker, side=s.side,
@@ -423,12 +426,8 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
                 ts_event=now_ns, ts_init=now_ns,
             )
             try:
-                payload = serializer.serialize(signal)
-                redis_client.xadd(stream_key, {
-                    b"type": b"ModelSignal",
-                    b"topic": b"data.ModelSignal",
-                    b"payload": payload,
-                })
+                topic = f"data.{DataType(ModelSignal).topic}"
+                msgbus.publish(topic, signal)
             except Exception as e:
                 log.error(f"Redis publish failed: {e}")
 
@@ -469,26 +468,49 @@ def main():
     init_db(db_path)
     conn = get_connection(db_path)
 
-    r = redis.Redis(host=args.redis_host, port=args.redis_port)
+    # Create NT MessageBus with Redis backing (uses NT's own serialization + stream format)
+    msgbus = None
     try:
-        r.ping()
-        log.info(f"Redis connected: {args.redis_host}:{args.redis_port}")
-    except redis.ConnectionError:
-        log.warning("Redis not available — signals will only be written to DB")
-        r = None
+        clock = LiveClock()
+        serializer = MsgSpecSerializer(
+            encoding=msgspec.msgpack,
+            timestamps_as_str=True,
+        )
+        msgbus_config = MessageBusConfig(
+            database=DatabaseConfig(
+                type="redis",
+                host=args.redis_host,
+                port=args.redis_port,
+            ),
+            use_trader_id=False,
+            use_trader_prefix=False,
+            use_instance_id=False,
+            streams_prefix=args.stream_key,
+            stream_per_topic=False,
+            encoding="msgpack",
+        )
+        msgbus = MessageBus(
+            trader_id=TraderId("EVALUATOR-001"),
+            clock=clock,
+            serializer=serializer,
+            config=msgbus_config,
+        )
+        # Register ModelSignal as a publishable + streaming type
+        msgbus.register_streaming_type(ModelSignal)
+        log.info(f"NT MessageBus connected to Redis: {args.redis_host}:{args.redis_port}")
+    except Exception as e:
+        log.warning(f"MessageBus setup failed — signals will only be written to DB: {e}")
+        msgbus = None
 
     config = load_config()
     models, names, weights = load_models(config)
-
-    # NT-compatible serializer for Redis publishing
-    serializer = MsgSpecSerializer(encoding=msgspec.msgpack)
 
     log.info(f"Evaluator started. DB={args.db}, interval={args.interval}s")
 
     while True:
         try:
             config = load_config()  # hot reload
-            evaluate_cycle(conn, r, models, names, weights, config, args.stream_key, serializer=serializer)
+            evaluate_cycle(conn, msgbus, models, names, weights, config)
         except sqlite3.DatabaseError as e:
             log.error(f"DB error, reconnecting: {e}")
             try:
