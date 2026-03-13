@@ -42,6 +42,28 @@ class ClimateEvent(Data):
     def ts_init(self) -> int:
         return self._ts_init
 
+    @staticmethod
+    def to_dict(obj) -> dict:
+        return {
+            "source": obj.source,
+            "city": obj.city,
+            "date": obj.date,
+            "features": obj.features,
+            "ts_event": obj.ts_event,
+            "ts_init": obj.ts_init,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ClimateEvent":
+        return ClimateEvent(
+            source=d["source"],
+            city=d["city"],
+            features=d["features"],
+            ts_event=d["ts_event"],
+            ts_init=d["ts_init"],
+            date=d.get("date", ""),
+        )
+
     def __repr__(self) -> str:
         return (
             f"ClimateEvent(source={self.source!r}, city={self.city!r}, "
@@ -83,6 +105,32 @@ class ModelSignal(Data):
     @property
     def ts_init(self) -> int:
         return self._ts_init
+
+    @staticmethod
+    def to_dict(obj) -> dict:
+        return {
+            "city": obj.city,
+            "ticker": obj.ticker,
+            "side": obj.side,
+            "p_win": obj.p_win,
+            "model_scores": obj.model_scores,
+            "features_snapshot": obj.features_snapshot,
+            "ts_event": obj.ts_event,
+            "ts_init": obj.ts_init,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "ModelSignal":
+        return ModelSignal(
+            city=d["city"],
+            ticker=d["ticker"],
+            side=d["side"],
+            p_win=d["p_win"],
+            model_scores=d["model_scores"],
+            features_snapshot=d["features_snapshot"],
+            ts_event=d["ts_event"],
+            ts_init=d["ts_init"],
+        )
 
     def __repr__(self) -> str:
         return (
@@ -126,8 +174,43 @@ class DangerAlert(Data):
     def ts_init(self) -> int:
         return self._ts_init
 
+    @staticmethod
+    def to_dict(obj) -> dict:
+        return {
+            "ticker": obj.ticker,
+            "city": obj.city,
+            "alert_level": obj.alert_level,
+            "rule_name": obj.rule_name,
+            "reason": obj.reason,
+            "features": obj.features,
+            "ts_event": obj.ts_event,
+            "ts_init": obj.ts_init,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "DangerAlert":
+        return DangerAlert(
+            ticker=d["ticker"],
+            city=d["city"],
+            alert_level=d["alert_level"],
+            rule_name=d["rule_name"],
+            reason=d["reason"],
+            features=d["features"],
+            ts_event=d["ts_event"],
+            ts_init=d["ts_init"],
+        )
+
     def __repr__(self) -> str:
         return (
             f"DangerAlert(ticker={self.ticker!r}, level={self.alert_level}, "
             f"rule={self.rule_name!r})"
         )
+
+
+try:
+    from nautilus_trader.serialization.base import register_serializable_type
+    register_serializable_type(ModelSignal, ModelSignal.to_dict, ModelSignal.from_dict)
+    register_serializable_type(DangerAlert, DangerAlert.to_dict, DangerAlert.from_dict)
+    register_serializable_type(ClimateEvent, ClimateEvent.to_dict, ClimateEvent.from_dict)
+except ImportError:
+    pass  # NT not available (e.g., in evaluator-only environments)

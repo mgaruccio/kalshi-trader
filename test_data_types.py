@@ -74,3 +74,59 @@ class TestDangerAlert:
         alert = DangerAlert("T55", "chi", "WATCH", "drift", "test", {}, 0, 0)
         assert "WATCH" in repr(alert)
         assert "drift" in repr(alert)
+
+
+class TestRoundtrip:
+    def test_model_signal_roundtrip(self):
+        signal = ModelSignal(
+            city="chicago", ticker="KXHIGHCHI-26MAR15-T55",
+            side="no", p_win=0.97,
+            model_scores={"emos": 0.98, "ngboost_spread": 0.96},
+            features_snapshot={"ecmwf_high": 55.0, "gfs_high": 54.0},
+            ts_event=1000, ts_init=1000,
+        )
+        d = ModelSignal.to_dict(signal)
+        restored = ModelSignal.from_dict(d)
+        assert restored.city == signal.city
+        assert restored.ticker == signal.ticker
+        assert restored.side == signal.side
+        assert abs(restored.p_win - signal.p_win) < 1e-9
+        assert restored.model_scores == signal.model_scores
+        assert restored.features_snapshot == signal.features_snapshot
+        assert restored.ts_event == signal.ts_event
+        assert restored.ts_init == signal.ts_init
+
+    def test_danger_alert_roundtrip(self):
+        alert = DangerAlert(
+            ticker="KXHIGHCHI-26MAR15-T55", city="chicago",
+            alert_level="CRITICAL", rule_name="obs_past_threshold",
+            reason="Observed 56F exceeds threshold 55F",
+            features={"current_temp": 56.0},
+            ts_event=2000, ts_init=2000,
+        )
+        d = DangerAlert.to_dict(alert)
+        restored = DangerAlert.from_dict(d)
+        assert restored.ticker == alert.ticker
+        assert restored.city == alert.city
+        assert restored.alert_level == alert.alert_level
+        assert restored.rule_name == alert.rule_name
+        assert restored.reason == alert.reason
+        assert restored.features == alert.features
+        assert restored.ts_event == alert.ts_event
+        assert restored.ts_init == alert.ts_init
+
+    def test_climate_event_roundtrip(self):
+        event = ClimateEvent(
+            source="open_meteo", city="chicago",
+            features={"ecmwf_high": 55.0},
+            ts_event=3000, ts_init=3000,
+            date="2026-03-15",
+        )
+        d = ClimateEvent.to_dict(event)
+        restored = ClimateEvent.from_dict(d)
+        assert restored.source == event.source
+        assert restored.city == event.city
+        assert restored.date == event.date
+        assert restored.features == event.features
+        assert restored.ts_event == event.ts_event
+        assert restored.ts_init == event.ts_init
