@@ -105,7 +105,6 @@ class TestEvaluateCycle:
         with patch("evaluator.fetch_open_markets", return_value=mock_markets), \
              patch("evaluator.get_forecast", return_value=52.0), \
              patch("evaluator.get_weather_features", return_value={"wind_speed_afternoon": 10.0}), \
-             patch("evaluator.get_forecast_icon", return_value=53.0), \
              patch("evaluator.score_opportunities", return_value=mock_scores), \
              patch("evaluator.apply_entry_filters", return_value=[mock_scores[0]]):
 
@@ -183,7 +182,6 @@ class TestEvaluateCycle:
         with patch("evaluator.fetch_open_markets", return_value=mock_markets), \
              patch("evaluator.get_forecast", return_value=52.0), \
              patch("evaluator.get_weather_features", return_value={}), \
-             patch("evaluator.get_forecast_icon", return_value=53.0), \
              patch("evaluator.score_opportunities", return_value=[no_score, yes_score]), \
              patch("evaluator.apply_entry_filters", return_value=[no_score]):  # only NO passes
 
@@ -283,7 +281,6 @@ class TestEvaluateCycle:
         with patch("evaluator.fetch_open_markets", return_value=mock_markets), \
              patch("evaluator.get_forecast", return_value=52.0), \
              patch("evaluator.get_weather_features", return_value={}), \
-             patch("evaluator.get_forecast_icon", return_value=53.0), \
              patch("evaluator.score_opportunities", return_value=[no_score]), \
              patch("evaluator.apply_entry_filters", return_value=[no_score]):
 
@@ -352,82 +349,6 @@ class TestLoadModels:
             models, names, weights = load_models(mock_config)
 
         assert weights == [1.0]
-
-
-class TestBuildExtraFeatures:
-    """Test feature building."""
-
-    def test_build_extra_features_basic(self):
-        """Basic feature building with ecmwf + gfs."""
-        from evaluator import build_extra_features
-
-        features = build_extra_features(
-            ecmwf=55.0, gfs=53.0, icon=54.0,
-            city="chicago", date="2026-03-15",
-            wx={"wind_speed_afternoon": 10.0},
-        )
-        assert "ecmwf_high" in features
-        assert "gfs_high" in features
-        assert "model_std" in features
-        assert "model_range" in features
-        assert features["model_range"] == 2.0  # max(55, 54, 53) - min(55, 54, 53) = 55 - 53 = 2
-        assert features["ecmwf_high"] == 55.0
-        assert features["gfs_high"] == 53.0
-        assert features["forecast_high"] == 55.0  # max(ecmwf, gfs)
-
-    def test_build_extra_features_no_icon(self):
-        """Feature building without ICON falls back to 2-model spread."""
-        from evaluator import build_extra_features
-
-        features = build_extra_features(
-            ecmwf=55.0, gfs=53.0, icon=None,
-            city="chicago", date="2026-03-15",
-            wx={},
-        )
-        assert "model_std" in features
-        assert "model_range" in features
-        # 2-model spread: range = 55 - 53 = 2
-        assert features["model_range"] == 2.0
-
-    def test_build_extra_features_wind_dir_offshore_computed(self):
-        """wind_dir_offshore is computed when city has coast normal and wind_dir present."""
-        from evaluator import build_extra_features
-        import numpy as np
-
-        features = build_extra_features(
-            ecmwf=55.0, gfs=53.0, icon=None,
-            city="miami",
-            date="2026-03-15",
-            wx={"wind_dir_afternoon": 90.0},  # exactly onshore
-        )
-        assert "wind_dir_offshore" in features
-        # miami coast_normal=90, wind_dir=90 → angle_diff=0 → cos(0)=1.0
-        assert abs(features["wind_dir_offshore"] - 1.0) < 1e-9
-
-    def test_build_extra_features_no_coast_normal(self):
-        """Cities without coast normal get wind_dir_offshore=0.0."""
-        from evaluator import build_extra_features
-
-        features = build_extra_features(
-            ecmwf=55.0, gfs=53.0, icon=None,
-            city="chicago",  # inland — no coast normal
-            date="2026-03-15",
-            wx={"wind_dir_afternoon": 180.0},
-        )
-        assert features["wind_dir_offshore"] == 0.0
-
-    def test_build_extra_features_wx_merged(self):
-        """Weather features from wx dict are merged into output."""
-        from evaluator import build_extra_features
-
-        wx = {"wind_speed_afternoon": 15.0, "precip_mm": 2.5}
-        features = build_extra_features(
-            ecmwf=55.0, gfs=53.0, icon=None,
-            city="chicago", date="2026-03-15",
-            wx=wx,
-        )
-        assert features["wind_speed_afternoon"] == 15.0
-        assert features["precip_mm"] == 2.5
 
 
 class TestComputeDesiredLadder:
@@ -603,8 +524,7 @@ class TestStalenessGate:
         with patch("evaluator._check_rolling_features_staleness", return_value=False), \
              patch("evaluator.fetch_open_markets", return_value=mock_markets), \
              patch("evaluator.get_forecast", return_value=52.0), \
-             patch("evaluator.get_weather_features", return_value={}), \
-             patch("evaluator.get_forecast_icon", return_value=53.0):
+             patch("evaluator.get_weather_features", return_value={}):
 
             evaluate_cycle(
                 db_conn=conn,

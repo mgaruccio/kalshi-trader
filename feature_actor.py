@@ -25,6 +25,7 @@ from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.model.data import DataType
 from data_types import ClimateEvent, DangerAlert
 from exit_rules import CityFeatureState, check_exit_rules, should_exit
+from shared_features import build_extra_features
 
 log = logging.getLogger(__name__)
 
@@ -58,60 +59,6 @@ try:
 except ImportError:
     parse_ticker = None
 
-
-_COAST_NORMAL = {
-    "los_angeles": 240, "san_francisco": 270, "miami": 90,
-    "new_york": 150, "boston": 90, "seattle": 270,
-    "houston": 150, "new_orleans": 180, "philadelphia": 135,
-    "washington_dc": 135,
-}
-
-
-def _build_extra_features(
-    ecmwf: float | None,
-    gfs: float | None,
-    icon: float | None,
-    city: str,
-    date: str,
-    wx: dict | None,
-) -> dict:
-    """Compute all features needed for spread models: forecasts + model spread + wind_dir_offshore.
-
-    Mirrors quantdesk_adapter._compute_extra_features so the NT path
-    produces the same feature set as the standalone trader.
-    """
-    import numpy as np
-
-    features: dict[str, float] = {}
-
-    if ecmwf is not None:
-        features["ecmwf_high"] = ecmwf
-    if gfs is not None:
-        features["gfs_high"] = gfs
-    if ecmwf is not None and gfs is not None:
-        features["forecast_high"] = max(ecmwf, gfs)
-
-    # Model spread (3-model when ICON available, 2-model fallback)
-    temps = [t for t in (ecmwf, gfs, icon) if t is not None]
-    if len(temps) >= 2:
-        arr = np.array(temps)
-        features["model_std"] = float(np.std(arr, ddof=0))
-        features["model_range"] = float(np.ptp(arr))
-
-    # Weather features from ECMWF forecast
-    if wx:
-        features.update(wx)
-
-    # Derive wind_dir_offshore from wind_dir_afternoon + coast geometry
-    coast_normal = _COAST_NORMAL.get(city)
-    wind_dir = (wx or {}).get("wind_dir_afternoon")
-    if coast_normal is not None and wind_dir is not None:
-        angle_diff = (wind_dir - coast_normal) * np.pi / 180
-        features["wind_dir_offshore"] = float(np.cos(angle_diff))
-    else:
-        features["wind_dir_offshore"] = 0.0
-
-    return features
 
 
 class FeatureActorConfig(ActorConfig):
@@ -161,6 +108,14 @@ class FeatureActor(Actor):
 
         if self._cfg.live_mode:
             self._start_live_pollers()
+
+        if self._instrument_provider is not None:
+            self.clock.set_timer(
+                "reload_instruments",
+                interval=timedelta(minutes=30),
+                callback=lambda _: self._reload_instruments(),
+            )
+            self.log.info("Instrument reload timer started (30m)")
 
         self.log.info(
             f"FeatureActor started (live={self._cfg.live_mode})"
@@ -396,7 +351,7 @@ class FeatureActor(Actor):
                 icon = get_forecast(city, sd, "icon_seamless")
                 wx = get_weather_features(city, sd) if get_weather_features else {}
 
-                features = _build_extra_features(ecmwf, gfs, icon, city, sd, wx)
+                features = build_extra_features(ecmwf, gfs, icon, city, wx)
 
                 if features:
                     evt = ClimateEvent(

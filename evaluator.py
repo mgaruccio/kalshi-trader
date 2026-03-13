@@ -39,16 +39,9 @@ from kalshi_weather_ml.models.drn_model import DRNModel
 from db import init_db, get_connection, write_evaluations, write_desired_orders
 from db import upsert_market, upsert_forecast, beat_heartbeat, log_event, get_positions
 from data_types import ModelSignal
+from shared_features import build_extra_features
 
 log = logging.getLogger(__name__)
-
-# Coast normals for wind_dir_offshore — mirrors feature_actor._build_extra_features
-_COAST_NORMAL = {
-    "los_angeles": 240, "san_francisco": 270, "miami": 90,
-    "new_york": 150, "boston": 90, "seattle": 270,
-    "houston": 150, "new_orleans": 180, "philadelphia": 135,
-    "washington_dc": 135,
-}
 
 
 def load_models(config):
@@ -78,45 +71,6 @@ def load_models(config):
         log.info(f"Loaded model {name!r} (weight={weights[-1]})")
 
     return models, names, weights
-
-
-def build_extra_features(ecmwf, gfs, icon, city, date, wx):
-    """Compute spread + wind features. Mirrors feature_actor._build_extra_features()."""
-    features = {}
-
-    if ecmwf is not None:
-        features["ecmwf_high"] = ecmwf
-    if gfs is not None:
-        features["gfs_high"] = gfs
-    if ecmwf is not None and gfs is not None:
-        features["forecast_high"] = max(ecmwf, gfs)
-
-    temps = [t for t in (ecmwf, gfs, icon) if t is not None]
-    if len(temps) >= 2:
-        arr = np.array(temps)
-        features["model_std"] = float(np.std(arr, ddof=0))
-        features["model_range"] = float(np.ptp(arr))
-
-    if wx:
-        features.update(wx)
-
-    coast_normal = _COAST_NORMAL.get(city)
-    wind_dir = (wx or {}).get("wind_dir_afternoon")
-    if coast_normal is not None and wind_dir is not None:
-        angle_diff = (wind_dir - coast_normal) * np.pi / 180
-        features["wind_dir_offshore"] = float(np.cos(angle_diff))
-    else:
-        features["wind_dir_offshore"] = 0.0
-
-    return features
-
-
-def get_forecast_icon(city, date):
-    """Fetch ICON forecast. Separate function for easy mocking."""
-    try:
-        return get_forecast(city, date, "icon_seamless")
-    except Exception:
-        return None
 
 
 def compute_desired_ladder(
@@ -250,7 +204,10 @@ def evaluate_cycle(db_conn, publish_signal, models, model_names, model_weights, 
         try:
             ecmwf = get_forecast(city, sd, PRIMARY_MODEL)
             gfs = get_forecast(city, sd, CONSENSUS_MODEL)
-            icon = get_forecast_icon(city, sd)
+            try:
+                icon = get_forecast(city, sd, "icon_seamless")
+            except Exception:
+                icon = None
             wx = get_weather_features(city, sd)
         except Exception as e:
             log.warning(f"Forecast fetch failed for {city}/{sd}: {e}")
@@ -260,7 +217,7 @@ def evaluate_cycle(db_conn, publish_signal, models, model_names, model_weights, 
             continue
 
         # Build features
-        features = build_extra_features(ecmwf, gfs, icon, city, sd, wx or {})
+        features = build_extra_features(ecmwf, gfs, icon, city, wx or {})
 
         # Store forecast
         upsert_forecast(db_conn, city, sd,

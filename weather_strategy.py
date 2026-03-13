@@ -104,12 +104,9 @@ class WeatherStrategy(Strategy):
 
         # Phase 1 state
         self._open_spread_placed: set[str] = set()  # tickers with spread deployed
-        self._open_spread_orders: dict[str, list] = {}  # ticker -> list of ClientOrderId
         self._first_tick_time: dict[str, int] = {}  # ticker -> ns timestamp of first signal
 
         # Phase 2 state
-        self._ladder_orders: dict[str, list] = {}  # ticker -> list of ClientOrderId
-        self._resting_sells: dict[str, list] = {}  # ticker -> list of ClientOrderId
         self._eligible_signals: dict[str, ModelSignal] = {}  # ticker -> qualifying signal
         self._last_ladder_bid: dict[str, int] = {}  # ticker -> bid_cents used in last deployment
 
@@ -175,7 +172,7 @@ class WeatherStrategy(Strategy):
         NT's exec client reconciliation populates cache.positions() and
         cache.orders_open() before on_start is called.  We read those to
         rebuild _positions_info (so capital/concentration math is correct)
-        and _resting_sells (so we don't double-post sell targets).
+        and re-place missing sell targets.
         """
         # --- Positions ---
         for position in self.cache.positions():
@@ -207,7 +204,9 @@ class WeatherStrategy(Strategy):
                 f"Reconciled position: {ticker} {side} {contracts} contracts"
             )
 
-        # --- Resting sell orders ---
+        # --- Resting sell orders (just log, no tracking needed) ---
+        sell_count = 0
+        tickers_with_sells: set[str] = set()
         for order in self.cache.orders_open(strategy_id=self.id):
             if order.side != OrderSide.SELL:
                 continue
@@ -218,12 +217,11 @@ class WeatherStrategy(Strategy):
                 ticker = inst_str[:-3]
             else:
                 continue
-            self._resting_sells.setdefault(ticker, []).append(order.client_order_id)
-            self.log.info(
-                f"Reconciled resting sell: {ticker} order {order.client_order_id}"
-            )
+            tickers_with_sells.add(ticker)
+            sell_count += 1
 
-        # --- Resting buy orders (ladder) ---
+        # --- Resting buy orders (set _last_ladder_bid for idempotency) ---
+        buy_count = 0
         for order in self.cache.orders_open(strategy_id=self.id):
             if order.side != OrderSide.BUY:
                 continue
@@ -234,20 +232,16 @@ class WeatherStrategy(Strategy):
                 ticker = inst_str[:-3]
             else:
                 continue
-            self._ladder_orders.setdefault(ticker, []).append(order.client_order_id)
             price_cents = int(round(order.price.as_double() * 100)) if order.price else 0
-            # Use highest price as bid estimate for repricing logic
             existing = self._last_ladder_bid.get(ticker, 0)
             if price_cents > existing:
                 self._last_ladder_bid[ticker] = price_cents
-            self.log.info(
-                f"Reconciled resting buy: {ticker} order {order.client_order_id} @ {price_cents}c"
-            )
+            buy_count += 1
 
         # --- Re-place sell targets for positions without resting sells ---
         for ticker, info in self._positions_info.items():
-            if ticker in self._resting_sells:
-                continue  # already has sell targets
+            if ticker in tickers_with_sells:
+                continue
             side = info.get("side", "no").upper()
             contracts = info.get("contracts", 0)
             if contracts <= 0:
@@ -256,17 +250,12 @@ class WeatherStrategy(Strategy):
                 Symbol(f"{ticker}-{side}"), KALSHI_VENUE,
             )
             self._place_resting_sell(instrument_id, contracts)
-            self.log.info(
-                f"Reconciled sell target: {ticker} {contracts} contracts @ "
-                f"{self._cfg.sell_target_cents}c"
-            )
 
         if self._positions_info:
             self._sync_positions_to_actor()
             self.log.info(
                 f"Reconciliation complete: {len(self._positions_info)} positions, "
-                f"{sum(len(v) for v in self._resting_sells.values())} resting sells, "
-                f"{sum(len(v) for v in self._ladder_orders.values())} resting buys"
+                f"{sell_count} resting sells, {buy_count} resting buys"
             )
 
     def on_data(self, data):
@@ -361,7 +350,7 @@ class WeatherStrategy(Strategy):
             # Window expired — fall through to Phase 2
 
         # Guard: Phase 1 spread still active — suppress Phase 2 until timer cancels
-        if signal.ticker in self._open_spread_placed and signal.ticker in self._open_spread_orders:
+        if signal.ticker in self._open_spread_placed:
             return
 
         # Phase 2: Stable ladder
@@ -401,7 +390,6 @@ class WeatherStrategy(Strategy):
                 )
                 return
 
-        order_ids = []
         for price_cents in self._cfg.open_spread_prices_cents:
             price = instrument.make_price(price_cents / 100.0)
             qty = instrument.make_qty(self._cfg.open_spread_size)
@@ -413,7 +401,6 @@ class WeatherStrategy(Strategy):
                 time_in_force=TimeInForce.GTC,
             )
             self.submit_order(order)
-            order_ids.append(order.client_order_id)
             self._spread_orders_placed += 1
             self.log.info(
                 f"Phase1 spread: {signal.ticker} {signal.side} "
@@ -421,7 +408,6 @@ class WeatherStrategy(Strategy):
             )
 
         self._open_spread_placed.add(signal.ticker)
-        self._open_spread_orders[signal.ticker] = order_ids
 
         # Set one-shot timer to cancel unfilled spread orders after window expires
         window_ns = self._cfg.open_spread_window_minutes * 60 * 1_000_000_000
@@ -441,14 +427,8 @@ class WeatherStrategy(Strategy):
 
     def _cancel_spread_orders(self, ticker: str):
         """Cancel all outstanding Phase 1 spread buy orders for a ticker."""
-        order_ids = set(self._open_spread_orders.get(ticker, []))
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
-            if order.client_order_id in order_ids and order.side == OrderSide.BUY:
-                self.cancel_order(order)
-                self.log.info(f"Phase1 spread cancel: {ticker} order {order.client_order_id}")
-        # Pop AFTER cancellation attempts
-        self._open_spread_orders.pop(ticker, None)
+        self._cancel_buys_for_ticker(ticker)
+        self._open_spread_placed.discard(ticker)
 
     def _deploy_ladder(self, ticker: str, signal: ModelSignal,
                        budget_remaining: int | None = None) -> int:
@@ -474,14 +454,14 @@ class WeatherStrategy(Strategy):
 
         # If ladder exists and bid hasn't moved, skip (idempotent).
         # If bid changed, cancel old ladder and redeploy at new price.
-        if ticker in self._ladder_orders:
-            last_bid = self._last_ladder_bid.get(ticker)
+        last_bid = self._last_ladder_bid.get(ticker)
+        if last_bid is not None:
             if last_bid == bid_cents:
                 return 0
             self.log.info(
                 f"Bid moved {ticker}: {last_bid}c -> {bid_cents}c, redeploying ladder"
             )
-            self._cancel_ladder_orders(ticker)
+            self._cancel_buys_for_ticker(ticker)
 
         instrument_id = InstrumentId(
             Symbol(f"{ticker}-{signal.side.upper()}"),
@@ -530,7 +510,6 @@ class WeatherStrategy(Strategy):
                 )
 
         total_deployed = 0
-        order_ids = []
         for offset in self._cfg.stable_ladder_offsets_cents:
             price_cents = max(1, bid_cents - offset)
             # Cost ceiling: never buy above max_cost_cents
@@ -555,7 +534,6 @@ class WeatherStrategy(Strategy):
                 time_in_force=TimeInForce.GTC,
             )
             self.submit_order(order)
-            order_ids.append(order.client_order_id)
             self._stable_orders_placed += 1
             self.log.info(
                 f"Phase2 ladder: {ticker} {signal.side} "
@@ -565,8 +543,7 @@ class WeatherStrategy(Strategy):
             remaining_budget -= order_cost
             total_deployed += order_cost
 
-        if order_ids:
-            self._ladder_orders.setdefault(ticker, []).extend(order_ids)
+        if total_deployed > 0:
             self._last_ladder_bid[ticker] = bid_cents
 
         return total_deployed
@@ -631,10 +608,10 @@ class WeatherStrategy(Strategy):
                 self.log.error(f"DB danger_exited write failed: {e}")
 
         # Cancel all resting buy orders for this ticker first
-        self._cancel_all_buys_for_ticker(alert.ticker)
+        self._cancel_buys_for_ticker(alert.ticker)
 
         # Cancel resting sells to avoid duplicate sell orders
-        self._cancel_resting_sells_for_ticker(alert.ticker)
+        self._cancel_sells_for_ticker(alert.ticker)
 
         # Submit sell order for existing position
         side = pos_info.get("side", "no").upper()
@@ -673,37 +650,39 @@ class WeatherStrategy(Strategy):
         )
         self.submit_order(order)
 
-    def _cancel_all_buys_for_ticker(self, ticker: str):
-        """Cancel all outstanding BUY orders (Phase 1 + Phase 2) for a ticker."""
-        all_buy_ids = set(
-            self._open_spread_orders.get(ticker, [])
-            + self._ladder_orders.get(ticker, [])
-        )
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
-            if (
-                order.client_order_id in all_buy_ids
-                and order.side == OrderSide.BUY
-            ):
+    def _cancel_buys_for_ticker(self, ticker: str):
+        """Cancel all open BUY orders for a ticker (Phase 1 + Phase 2)."""
+        for order in self.cache.orders_open(strategy_id=self.id):
+            if order.side != OrderSide.BUY:
+                continue
+            inst_str = order.instrument_id.symbol.value
+            if inst_str.endswith("-NO"):
+                order_ticker = inst_str[:-3]
+            elif inst_str.endswith("-YES"):
+                order_ticker = inst_str[:-4]
+            else:
+                continue
+            if order_ticker == ticker:
                 self.cancel_order(order)
-        # Pop AFTER cancellation attempts
-        self._open_spread_orders.pop(ticker, None)
-        self._ladder_orders.pop(ticker, None)
         self._last_ladder_bid.pop(ticker, None)
 
-    def _cancel_resting_sells_for_ticker(self, ticker: str):
+    def _cancel_sells_for_ticker(self, ticker: str):
         """Cancel all resting GTC sell orders for a ticker."""
-        order_ids = set(self._resting_sells.get(ticker, []))
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
-            if order.client_order_id in order_ids and order.side == OrderSide.SELL:
+        for order in self.cache.orders_open(strategy_id=self.id):
+            if order.side != OrderSide.SELL:
+                continue
+            inst_str = order.instrument_id.symbol.value
+            if inst_str.endswith("-NO"):
+                order_ticker = inst_str[:-3]
+            elif inst_str.endswith("-YES"):
+                order_ticker = inst_str[:-4]
+            else:
+                continue
+            if order_ticker == ticker:
                 self.cancel_order(order)
-                self.log.info(f"Resting sell cancel: {ticker} order {order.client_order_id}")
-        self._resting_sells.pop(ticker, None)
 
     def _cleanup_ticker_state(self, ticker: str):
         """Remove all tracking state for a ticker when its position is fully closed."""
-        self._resting_sells.pop(ticker, None)
         self._eligible_signals.pop(ticker, None)
         self._danger_exited.discard(ticker)
         self._open_spread_placed.discard(ticker)
@@ -808,17 +787,8 @@ class WeatherStrategy(Strategy):
         )
         self.submit_order(order)
 
-        # Track resting sell
-        inst_str = instrument_id.symbol.value
-        if inst_str.endswith("-YES"):
-            ticker = inst_str[:-4]
-        elif inst_str.endswith("-NO"):
-            ticker = inst_str[:-3]
-        else:
-            ticker = inst_str
-        self._resting_sells.setdefault(ticker, []).append(order.client_order_id)
         self.log.info(
-            f"Resting sell placed: {ticker} qty={qty} @ {self._cfg.sell_target_cents}c"
+            f"Resting sell placed: {instrument_id.symbol.value} qty={qty} @ {self._cfg.sell_target_cents}c"
         )
 
     def _on_refresh(self, event=None):
@@ -865,26 +835,16 @@ class WeatherStrategy(Strategy):
             desired_tickers.add(ticker)
 
         # 2. Cancel ladders for tickers no longer eligible
-        for ticker in list(self._ladder_orders.keys()):
+        for ticker in list(self._last_ladder_bid.keys()):
             if ticker not in desired_tickers:
-                self._cancel_ladder_orders(ticker)
-                self._last_ladder_bid.pop(ticker, None)
+                self._cancel_buys_for_ticker(ticker)
 
         # 3. Sort cheapest first (matters for initial budget allocation)
         candidates.sort(key=lambda x: x[0])
 
         # 4. Compute budget for new deployments
         if self._cfg.max_total_deployed_cents > 0:
-            position_cost = sum(
-                info.get("contracts", 0) * self._cfg.max_cost_cents
-                for info in self._positions_info.values()
-            )
-            # Existing ladders: estimate cost from tracked order count
-            ladder_cost = 0
-            for ticker, order_ids in self._ladder_orders.items():
-                last_bid = self._last_ladder_bid.get(ticker, 0)
-                ladder_cost += len(order_ids) * last_bid * self._cfg.stable_size
-            remaining_budget = self._cfg.max_total_deployed_cents - position_cost - ladder_cost
+            remaining_budget = self._cfg.max_total_deployed_cents - self._total_capital_at_risk()
         else:
             remaining_budget = None  # disabled
 
@@ -901,7 +861,7 @@ class WeatherStrategy(Strategy):
         if self._db_conn is not None:
             try:
                 positions_count = len(self._positions_info)
-                ladders_count = len(self._ladder_orders)
+                ladders_count = len(self._last_ladder_bid)
                 beat_heartbeat(
                     self._db_conn,
                     "executor",
@@ -936,28 +896,12 @@ class WeatherStrategy(Strategy):
         consensus = max(temps)
         return threshold - consensus
 
-    def _cancel_ladder_orders(self, ticker: str):
-        """Cancel all Phase 2 ladder buy orders for a ticker."""
-        order_ids = set(self._ladder_orders.get(ticker, []))
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
-            if (
-                order.client_order_id in order_ids
-                and order.side == OrderSide.BUY
-            ):
-                self.cancel_order(order)
-        # Pop AFTER cancellation attempts
-        self._ladder_orders.pop(ticker, None)
-
     def _cancel_all_resting_buys(self):
         """Cancel all open BUY orders across all instruments (back-off)."""
-        open_orders = self.cache.orders_open(strategy_id=self.id)
-        for order in open_orders:
+        for order in self.cache.orders_open(strategy_id=self.id):
             if order.side == OrderSide.BUY:
                 self.cancel_order(order)
-        # Clear tracked buy order lists — forces redeployment after back-off
-        self._open_spread_orders.clear()
-        self._ladder_orders.clear()
+        self._open_spread_placed.clear()
         self._last_ladder_bid.clear()
 
     def on_stop(self):
@@ -969,13 +913,21 @@ class WeatherStrategy(Strategy):
         if self._feature_actor is not None:
             self._feature_actor.update_positions(self._positions_info)
 
-    def get_state(self) -> dict:
-        """Return serializable strategy state for persistence."""
-        return {"danger_exited": list(self._danger_exited)}
+    def on_save(self) -> dict[str, bytes]:
+        """Persist danger_exited set via NT state mechanism."""
+        import json
+        return {
+            "danger_exited": json.dumps(list(self._danger_exited)).encode(),
+        }
 
-    def set_state(self, state: dict):
-        """Restore strategy state from a previously saved snapshot."""
-        self._danger_exited = set(state.get("danger_exited", []))
+    def on_load(self, state: dict[str, bytes]) -> None:
+        """Restore danger_exited set from NT state mechanism."""
+        import json
+        raw = state.get(b"danger_exited") or state.get("danger_exited")
+        if raw:
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            self._danger_exited = set(json.loads(raw))
 
     @property
     def signals_received(self) -> int:
