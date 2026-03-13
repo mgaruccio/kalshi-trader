@@ -132,10 +132,96 @@ class WeatherStrategy(Strategy):
             callback=self._on_refresh,
         )
 
+        # Reconcile positions and orders from previous session
+        self._reconcile_existing_state()
+
         self.log.info(
             f"WeatherStrategy started, subscribed to {len(instruments)} instruments, "
             f"refresh interval={self._cfg.refresh_interval_minutes}m"
         )
+
+    def _reconcile_existing_state(self):
+        """Seed strategy state from positions and orders surviving a restart.
+
+        NT's exec client reconciliation populates cache.positions() and
+        cache.orders_open() before on_start is called.  We read those to
+        rebuild _positions_info (so capital/concentration math is correct)
+        and _resting_sells (so we don't double-post sell targets).
+        """
+        # --- Positions ---
+        for position in self.cache.positions():
+            if position.is_closed:
+                continue
+            inst_str = position.instrument_id.symbol.value
+            if inst_str.endswith("-YES"):
+                ticker, side = inst_str[:-4], "yes"
+            elif inst_str.endswith("-NO"):
+                ticker, side = inst_str[:-3], "no"
+            else:
+                continue
+
+            parsed = parse_ticker(ticker)
+            city, threshold = "", 0.0
+            if parsed:
+                threshold = parsed["threshold"]
+                series_to_city = {s: c for s, c in SERIES_CONFIG}
+                city = series_to_city.get(parsed["series"], "")
+
+            contracts = int(abs(position.signed_qty))
+            self._positions_info[ticker] = {
+                "side": side,
+                "threshold": threshold,
+                "city": city,
+                "contracts": contracts,
+            }
+            self.log.info(
+                f"Reconciled position: {ticker} {side} {contracts} contracts"
+            )
+
+        # --- Resting sell orders ---
+        for order in self.cache.orders_open(strategy_id=self.id):
+            if order.side != OrderSide.SELL:
+                continue
+            inst_str = order.instrument_id.symbol.value
+            if inst_str.endswith("-YES"):
+                ticker = inst_str[:-4]
+            elif inst_str.endswith("-NO"):
+                ticker = inst_str[:-3]
+            else:
+                continue
+            self._resting_sells.setdefault(ticker, []).append(order.client_order_id)
+            self.log.info(
+                f"Reconciled resting sell: {ticker} order {order.client_order_id}"
+            )
+
+        # --- Resting buy orders (ladder) ---
+        for order in self.cache.orders_open(strategy_id=self.id):
+            if order.side != OrderSide.BUY:
+                continue
+            inst_str = order.instrument_id.symbol.value
+            if inst_str.endswith("-YES"):
+                ticker = inst_str[:-4]
+            elif inst_str.endswith("-NO"):
+                ticker = inst_str[:-3]
+            else:
+                continue
+            self._ladder_orders.setdefault(ticker, []).append(order.client_order_id)
+            price_cents = int(round(order.price.as_double() * 100)) if order.price else 0
+            # Use highest price as bid estimate for repricing logic
+            existing = self._last_ladder_bid.get(ticker, 0)
+            if price_cents > existing:
+                self._last_ladder_bid[ticker] = price_cents
+            self.log.info(
+                f"Reconciled resting buy: {ticker} order {order.client_order_id} @ {price_cents}c"
+            )
+
+        if self._positions_info:
+            self._sync_positions_to_actor()
+            self.log.info(
+                f"Reconciliation complete: {len(self._positions_info)} positions, "
+                f"{sum(len(v) for v in self._resting_sells.values())} resting sells, "
+                f"{sum(len(v) for v in self._ladder_orders.values())} resting buys"
+            )
 
     def on_data(self, data):
         """Route incoming data to appropriate handler."""
@@ -335,13 +421,16 @@ class WeatherStrategy(Strategy):
 
         bid_cents = int(round(quote.bid_price.as_double() * 100))
 
-        # Already has a deployed ladder — leave it alone. Cancel+redeploy
-        # is incompatible with async order management (old orders stay live
-        # until exchange confirms cancel, causing duplicate exposure).
-        # The ladder's offset range (0-10c) absorbs normal bid movement.
-        # Fresh deployment happens after backoff window cancels everything.
+        # If ladder exists and bid hasn't moved, skip (idempotent).
+        # If bid changed, cancel old ladder and redeploy at new price.
         if ticker in self._ladder_orders:
-            return 0
+            last_bid = self._last_ladder_bid.get(ticker)
+            if last_bid == bid_cents:
+                return 0
+            self.log.info(
+                f"Bid moved {ticker}: {last_bid}c -> {bid_cents}c, redeploying ladder"
+            )
+            self._cancel_ladder_orders(ticker)
 
         instrument_id = InstrumentId(
             Symbol(f"{ticker}-{signal.side.upper()}"),

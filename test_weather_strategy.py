@@ -124,6 +124,7 @@ class _TestableWeatherStrategy:
     _today = WeatherStrategy._today
     set_feature_actor = WeatherStrategy.set_feature_actor
     _sync_positions_to_actor = WeatherStrategy._sync_positions_to_actor
+    _reconcile_existing_state = WeatherStrategy._reconcile_existing_state
 
     @property
     def signals_received(self) -> int:
@@ -987,33 +988,43 @@ class TestGlobalRebalance:
         strategy.cache.instrument.return_value = _mock_instrument()
         return strategy
 
-    def test_refresh_skips_existing_ladder(self):
-        """Refresh skips tickers that already have a deployed ladder."""
+    def test_refresh_skips_when_bid_unchanged(self):
+        """Refresh skips tickers whose bid hasn't moved since last deployment."""
         strategy = self._make_refresh_strategy()
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(85, 87)
         strategy._ladder_orders[ticker] = [MagicMock()]  # has existing ladder
-        strategy._last_ladder_bid[ticker] = 85
+        strategy._last_ladder_bid[ticker] = 85  # bid unchanged
 
         strategy._on_refresh()
 
         strategy.submit_order.assert_not_called()
 
-    def test_refresh_skips_even_when_bid_changes(self):
-        """Existing ladder is kept even when bid moves — no cancel+redeploy."""
-        strategy = self._make_refresh_strategy()
+    def test_refresh_redeploys_when_bid_changes(self):
+        """Bid movement triggers cancel+redeploy of the ladder."""
+        strategy = self._make_refresh_strategy(
+            stable_ladder_offsets_cents=(0,),
+            stable_size=2,
+            max_cost_cents=95,
+            max_total_deployed_cents=5000,
+        )
         ticker = "KXHIGHCHI-26MAR15-T55"
         strategy._eligible_signals[ticker] = _make_signal(p_win=0.97)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(88, 90)
-        strategy._ladder_orders[ticker] = [MagicMock()]  # has existing ladder
+        old_order = MagicMock()
+        old_order.client_order_id = MagicMock()
+        old_order.side = OrderSide.BUY
+        strategy._ladder_orders[ticker] = [old_order.client_order_id]
         strategy._last_ladder_bid[ticker] = 85  # old bid was 85, now 88
+        strategy.cache.orders_open.return_value = [old_order]
 
         strategy._on_refresh()
 
-        # No new orders — ladder stays as-is
-        strategy.submit_order.assert_not_called()
-        strategy.cancel_order.assert_not_called()
+        # Old ladder cancelled, new one deployed at 88c
+        strategy.cancel_order.assert_called()
+        strategy.submit_order.assert_called()
+        assert strategy._last_ladder_bid[ticker] == 88
 
     def test_cheapest_first(self):
         """On refresh, cheapest contracts get laddered before expensive ones."""
@@ -1064,8 +1075,8 @@ class TestGlobalRebalance:
         assert "KXHIGHSFO-26MAR15-T71" in strategy._ladder_orders
         assert "KXHIGHNY-26MAR15-T52" not in strategy._ladder_orders
 
-    def test_repeated_refresh_no_order_accumulation(self):
-        """Multiple refreshes must NOT accumulate orders — ladder deployed once."""
+    def test_repeated_refresh_no_accumulation_when_bid_stable(self):
+        """Multiple refreshes with stable bid deploy once, then skip."""
         strategy = self._make_refresh_strategy(
             stable_ladder_offsets_cents=(0, 2),
             stable_size=2,
@@ -1079,14 +1090,15 @@ class TestGlobalRebalance:
         first_count = strategy.submit_order.call_count
         assert first_count == 2
 
-        # Second refresh: ladder exists → skip, zero new orders
+        # Second refresh: bid unchanged → skip, zero new orders
         strategy._on_refresh()
         assert strategy.submit_order.call_count == first_count
 
-        # Third refresh: bid changes but ladder exists → still skip
+        # Third refresh: bid changes → cancel old + redeploy (2 new orders)
         strategy._latest_quotes["KXHIGHCHI-26MAR15-T55-NO.KALSHI"] = _mock_quote(90, 92)
         strategy._on_refresh()
-        assert strategy.submit_order.call_count == first_count
+        assert strategy.submit_order.call_count == first_count + 2
+        assert strategy._last_ladder_bid[ticker] == 90
 
     def test_evaluate_entry_stores_only(self):
         """_evaluate_entry stores signal but does not place orders."""
@@ -1713,3 +1725,94 @@ class TestCapitalCap:
         strategy._on_refresh()
         # Only 1 rung should place (160c fits in 300c, 156c doesn't fit in 140c)
         assert strategy.submit_order.call_count == 1
+
+
+class TestReconciliation:
+    """Tests for startup reconciliation of positions and orders."""
+
+    def test_reconcile_positions(self):
+        """Existing positions are loaded into _positions_info on startup."""
+        strategy = _make_strategy()
+
+        # Mock a cached open position
+        pos = MagicMock()
+        pos.is_closed = False
+        pos.instrument_id.symbol.value = "KXHIGHCHI-26MAR15-T55-NO"
+        pos.signed_qty = -3  # NO side = negative
+        strategy.cache.positions.return_value = [pos]
+        strategy.cache.orders_open.return_value = []
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._reconcile_existing_state()
+
+        assert "KXHIGHCHI-26MAR15-T55" in strategy._positions_info
+        info = strategy._positions_info["KXHIGHCHI-26MAR15-T55"]
+        assert info["contracts"] == 3
+        assert info["side"] == "no"
+
+    def test_reconcile_resting_sells(self):
+        """Resting sell orders are tracked in _resting_sells."""
+        strategy = _make_strategy()
+        strategy.cache.positions.return_value = []
+
+        sell_order = MagicMock()
+        sell_order.side = OrderSide.SELL
+        sell_order.instrument_id.symbol.value = "KXHIGHCHI-26MAR15-T55-NO"
+        sell_order.client_order_id = MagicMock()
+        sell_order.price = MagicMock()
+        sell_order.price.as_double.return_value = 0.97
+        strategy.cache.orders_open.return_value = [sell_order]
+
+        strategy._reconcile_existing_state()
+
+        assert "KXHIGHCHI-26MAR15-T55" in strategy._resting_sells
+        assert sell_order.client_order_id in strategy._resting_sells["KXHIGHCHI-26MAR15-T55"]
+
+    def test_reconcile_resting_buys(self):
+        """Resting buy orders are tracked in _ladder_orders."""
+        strategy = _make_strategy()
+        strategy.cache.positions.return_value = []
+
+        buy_order = MagicMock()
+        buy_order.side = OrderSide.BUY
+        buy_order.instrument_id.symbol.value = "KXHIGHTBOS-26MAR13-T45-NO"
+        buy_order.client_order_id = MagicMock()
+        buy_order.price = MagicMock()
+        buy_order.price.as_double.return_value = 0.83
+        strategy.cache.orders_open.return_value = [buy_order]
+
+        strategy._reconcile_existing_state()
+
+        assert "KXHIGHTBOS-26MAR13-T45" in strategy._ladder_orders
+        assert strategy._last_ladder_bid["KXHIGHTBOS-26MAR13-T45"] == 83
+
+    def test_reconcile_prevents_capital_overspend(self):
+        """Reconciled positions count toward capital at risk."""
+        strategy = _make_strategy(max_cost_cents=92, max_total_deployed_cents=500)
+        strategy.cache.instrument.return_value = _mock_instrument()
+        strategy.clock.utc_now.return_value = datetime(2026, 3, 15, 15, 0, tzinfo=timezone.utc)
+
+        # Reconcile 5 contracts — at 92c max that's 460c at risk
+        pos = MagicMock()
+        pos.is_closed = False
+        pos.instrument_id.symbol.value = "KXHIGHCHI-26MAR15-T55-NO"
+        pos.signed_qty = -5
+        strategy.cache.positions.return_value = [pos]
+        strategy.cache.orders_open.return_value = []
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-15", "threshold": 55, "series": "KXHIGHCHI"}
+            strategy._reconcile_existing_state()
+
+        # Now try to deploy a new ladder — should be blocked by capital cap
+        strategy._eligible_signals["KXHIGHTBOS-26MAR13-T45"] = _make_signal(
+            ticker="KXHIGHTBOS-26MAR13-T45", p_win=0.97)
+        strategy._latest_quotes["KXHIGHTBOS-26MAR13-T45-NO.KALSHI"] = _mock_quote(85, 87)
+
+        with patch("weather_strategy.parse_ticker") as mock_parse:
+            mock_parse.return_value = {"settlement_date": "2026-03-13", "threshold": 45, "series": "KXHIGHTBOS"}
+            strategy._on_refresh()
+
+        # 460c at risk + 255c (85*3) > 500c → skip
+        strategy.submit_order.assert_not_called()
