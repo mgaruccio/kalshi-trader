@@ -337,7 +337,7 @@ def write_danger_exited(
     ticker: str,
     reason: str,
     rule_name: str,
-    p_win: float,
+    p_win: float | None,
 ) -> None:
     """Record a danger-exited ticker. INSERT OR IGNORE — first write wins."""
     now = datetime.now(timezone.utc).isoformat()
