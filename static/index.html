@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kalshi Weather Trader — Dashboard</title>
+<style>
+:root {
+    --bg: #1a1a2e;
+    --card-bg: #16213e;
+    --card-bg2: #0f172a;
+    --text: #e0e0e0;
+    --text-muted: #888;
+    --green: #00cc66;
+    --red: #ff4444;
+    --yellow: #ffaa00;
+    --border: #2a2a4a;
+    --hover: rgba(255,255,255,0.08);
+    --stripe: rgba(255,255,255,0.03);
+}
+
+* { box-sizing: border-box; }
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif;
+    margin: 0;
+    padding: 16px;
+    font-size: 14px;
+    min-width: 900px;
+}
+
+/* ---- Header ---- */
+#header {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 12px 20px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+#header h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--text);
+    flex-shrink: 0;
+}
+
+#heartbeats {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.hb-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+.hb-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.hb-time {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
+.status-ok   { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.status-stale { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+.status-dead  { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.status-unknown { background: #555; }
+
+#refresh-bar {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+#refresh-btn {
+    background: #2a2a5a;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+#refresh-btn:hover { background: #3a3a7a; }
+
+#countdown {
+    font-family: monospace;
+    color: var(--green);
+    min-width: 24px;
+    text-align: right;
+}
+
+/* ---- Layout grid ---- */
+#main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+#main-grid .card { margin-bottom: 0; }
+
+/* ---- Cards ---- */
+.card {
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    border: 1px solid var(--border);
+}
+
+.card-full { grid-column: 1 / -1; }
+
+.card h2 {
+    margin: 0 0 12px;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.card h2 .count-badge {
+    background: #2a2a5a;
+    color: var(--text);
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-family: monospace;
+    font-weight: normal;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+/* ---- Tables ---- */
+.tbl-wrap {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+th {
+    cursor: pointer;
+    text-align: left;
+    padding: 8px 8px;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    user-select: none;
+    background: var(--card-bg2);
+}
+
+th:hover { color: var(--text); }
+
+th.sort-asc::after  { content: " ▲"; color: var(--green); }
+th.sort-desc::after { content: " ▼"; color: var(--green); }
+
+td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+}
+
+tr:nth-child(even) td { background: var(--stripe); }
+tr:hover td { background: var(--hover) !important; }
+
+.no-data {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 13px;
+    padding: 16px 0;
+    text-align: center;
+}
+
+/* ---- Eval table row states ---- */
+tr.row-pass td { opacity: 1; }
+tr.row-filtered td { opacity: 0.45; }
+
+/* ---- Badges ---- */
+.badge {
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-family: monospace;
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+.badge-pass     { background: var(--green); color: #000; }
+.badge-filtered { background: var(--red);   color: #fff; }
+.badge-side-no  { background: #1e3a5f; color: #7ec8e3; border: 1px solid #2a5a8f; }
+.badge-side-yes { background: #1a3a1a; color: #7ec87e; border: 1px solid #2a6a2a; }
+
+/* p_win coloring */
+.pwin-high  { color: var(--green); font-weight: 600; }
+.pwin-mid   { color: var(--yellow); }
+.pwin-low   { color: var(--red); }
+
+/* danger row */
+tr.row-danger td { background: rgba(255,68,68,0.08) !important; }
+
+/* ---- Events log ---- */
+#events-toggle {
+    cursor: pointer;
+    user-select: none;
+}
+
+#events-toggle::before {
+    content: "▶ ";
+    font-size: 11px;
+}
+
+#events-toggle.open::before {
+    content: "▼ ";
+}
+
+#events-body { display: none; }
+#events-body.open { display: block; }
+
+.event-row {
+    display: flex;
+    gap: 12px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    font-family: monospace;
+    font-size: 12px;
+    align-items: flex-start;
+}
+
+.event-ts    { color: var(--text-muted); white-space: nowrap; flex-shrink: 0; }
+.event-src   { color: #7ec8e3; white-space: nowrap; flex-shrink: 0; min-width: 80px; }
+.event-level { flex-shrink: 0; min-width: 40px; }
+.event-level-info  { color: var(--text-muted); }
+.event-level-warn  { color: var(--yellow); }
+.event-level-error { color: var(--red); }
+.event-msg   { color: var(--text); word-break: break-all; }
+
+/* ---- Config table ---- */
+#config-wrap {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 6px 16px;
+}
+
+.cfg-row {
+    display: flex;
+    gap: 8px;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    align-items: baseline;
+}
+
+.cfg-key { color: var(--text-muted); flex: 0 0 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cfg-val { color: var(--text); font-weight: 600; }
+
+/* ---- Danger exited list ---- */
+.danger-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 4px;
+}
+
+.danger-tag {
+    background: rgba(255,68,68,0.15);
+    border: 1px solid rgba(255,68,68,0.4);
+    color: var(--red);
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+}
+
+/* ---- Forecasts table ---- */
+/* reuses generic table styles */
+</style>
+</head>
+<body>
+
+<!-- ============================== HEADER ============================== -->
+<div id="header">
+    <h1>Kalshi Weather Trader</h1>
+
+    <div id="heartbeats">
+        <!-- populated by renderHealth() -->
+        <div class="hb-entry">
+            <span class="status-dot status-unknown"></span>
+            <span class="hb-label">loading…</span>
+        </div>
+    </div>
+
+    <div id="refresh-bar">
+        <span>Next refresh in <span id="countdown">30</span>s</span>
+        <button id="refresh-btn" onclick="triggerRefresh()">↻ Refresh</button>
+    </div>
+</div>
+
+<!-- ============================== TOP GRID (positions + orders) ============================== -->
+<div id="main-grid">
+
+    <!-- Positions -->
+    <div class="card" id="positions-card">
+        <h2>Positions <span class="count-badge" id="pos-count">0</span></h2>
+        <div class="tbl-wrap">
+            <div id="positions-content" class="no-data">Loading…</div>
+        </div>
+    </div>
+
+    <!-- Desired Orders -->
+    <div class="card" id="orders-card">
+        <h2>Desired Orders <span class="count-badge" id="orders-count">0</span></h2>
+        <div class="tbl-wrap">
+            <div id="orders-content" class="no-data">Loading…</div>
+        </div>
+    </div>
+
+</div>
+
+<!-- ============================== EVALUATIONS (centerpiece) ============================== -->
+<div class="card">
+    <h2>Signal Evaluations <span class="count-badge" id="evals-count">0</span></h2>
+    <div class="tbl-wrap">
+        <div id="evals-content" class="no-data">Loading…</div>
+    </div>
+</div>
+
+<!-- ============================== BOTTOM GRID (fills + danger + forecasts) ============================== -->
+<div id="main-grid">
+
+    <!-- Fills -->
+    <div class="card" id="fills-card">
+        <h2>Recent Fills <span class="count-badge" id="fills-count">0</span></h2>
+        <div class="tbl-wrap">
+            <div id="fills-content" class="no-data">Loading…</div>
+        </div>
+    </div>
+
+    <!-- Danger Exited -->
+    <div class="card" id="danger-card">
+        <h2>Danger Exited <span class="count-badge" id="danger-count">0</span></h2>
+        <div id="danger-content" class="no-data">Loading…</div>
+    </div>
+
+</div>
+
+<!-- ============================== FORECASTS ============================== -->
+<div class="card">
+    <h2>Live Forecasts <span class="count-badge" id="forecasts-count">0</span></h2>
+    <div class="tbl-wrap">
+        <div id="forecasts-content" class="no-data">Loading…</div>
+    </div>
+</div>
+
+<!-- ============================== CONFIG ============================== -->
+<div class="card">
+    <h2>Config</h2>
+    <div id="config-content" class="no-data">Loading…</div>
+</div>
+
+<!-- ============================== EVENTS ============================== -->
+<div class="card">
+    <h2 id="events-toggle" onclick="toggleEvents()">Events Log <span class="count-badge" id="events-count">0</span></h2>
+    <div id="events-body">
+        <div id="events-content" class="no-data">Loading…</div>
+    </div>
+</div>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+let sortColumn = 'p_win';
+let sortAsc = false;
+let refreshInterval = 30;
+let countdown = refreshInterval;
+let countdownTimer = null;
+let refreshTimer = null;
+
+// ============================================================
+// Utilities
+// ============================================================
+function fmtPwin(v) {
+    if (v == null) return '—';
+    const pct = v * 100;
+    const cls = pct >= 90 ? 'pwin-high' : pct >= 70 ? 'pwin-mid' : 'pwin-low';
+    return `<span class="${cls}">${pct.toFixed(1)}%</span>`;
+}
+
+function fmtMargin(v) {
+    if (v == null) return '—';
+    const sign = v >= 0 ? '+' : '';
+    return `${sign}${v.toFixed(1)}\u00b0F`;
+}
+
+function fmtCents(v) {
+    if (v == null) return '—';
+    return `$${(v / 100).toFixed(2)}`;
+}
+
+function fmtTemp(v) {
+    if (v == null) return '—';
+    return `${v.toFixed(1)}\u00b0F`;
+}
+
+function fmtTS(ts) {
+    if (!ts) return '—';
+    // ts is ISO string, possibly without Z
+    const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z');
+    if (isNaN(d)) return ts;
+    return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+}
+
+function fmtTSShort(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z');
+    if (isNaN(d)) return ts;
+    return d.toLocaleString([], {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+}
+
+function heartbeatAge(ts) {
+    if (!ts) return Infinity;
+    const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z');
+    return (Date.now() - d.getTime()) / 60000; // minutes
+}
+
+function heartbeatClass(ts) {
+    const age = heartbeatAge(ts);
+    if (age < 10) return 'status-ok';
+    if (age < 30) return 'status-stale';
+    return 'status-dead';
+}
+
+function sideBadge(side) {
+    if (!side) return '—';
+    const cls = side.toLowerCase() === 'no' ? 'badge-side-no' : 'badge-side-yes';
+    return `<span class="badge ${cls}">${side.toUpperCase()}</span>`;
+}
+
+function escHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function noDataRow(cols, msg='No data') {
+    return `<tr><td colspan="${cols}" style="text-align:center;color:var(--text-muted);padding:20px;font-style:italic;">${msg}</td></tr>`;
+}
+
+// ============================================================
+// Sort evaluations
+// ============================================================
+function sortEvaluations(evals) {
+    return [...evals].sort((a, b) => {
+        let va = a[sortColumn], vb = b[sortColumn];
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        if (typeof va === 'number' && typeof vb === 'number') {
+            return sortAsc ? va - vb : vb - va;
+        }
+        const sa = String(va), sb = String(vb);
+        return sortAsc ? sa.localeCompare(sb) : sb.localeCompare(sa);
+    });
+}
+
+function setSort(col) {
+    if (sortColumn === col) {
+        sortAsc = !sortAsc;
+    } else {
+        sortColumn = col;
+        // numeric cols default descending, string cols ascending
+        sortAsc = !['p_win', 'margin', 'consensus', 'ecmwf', 'gfs'].includes(col);
+    }
+    // Re-render with current data
+    if (lastEvals !== null) renderEvaluations(lastEvals);
+}
+
+let lastEvals = null;
+
+// ============================================================
+// Render: Health
+// ============================================================
+function renderHealth(data) {
+    const hbs = data.heartbeats ?? [];
+    const el = document.getElementById('heartbeats');
+
+    if (hbs.length === 0) {
+        el.innerHTML = '<span style="color:var(--text-muted);font-size:12px;">No heartbeats</span>';
+        return;
+    }
+
+    el.innerHTML = hbs.map(hb => {
+        const cls = heartbeatClass(hb.last_beat);
+        const age = heartbeatAge(hb.last_beat);
+        const ageStr = age === Infinity ? 'never' :
+            age < 1 ? '<1m ago' :
+            age < 60 ? `${Math.floor(age)}m ago` :
+            `${Math.floor(age/60)}h ago`;
+        const msgShort = hb.message ? escHtml(hb.message.substring(0, 60)) : '';
+        return `
+            <div class="hb-entry" title="${escHtml(hb.message)}">
+                <span class="status-dot ${cls}"></span>
+                <div>
+                    <div style="display:flex;gap:6px;align-items:center;">
+                        <span class="hb-label">${escHtml(hb.process_name)}</span>
+                        <span class="hb-time">${ageStr}</span>
+                    </div>
+                    ${msgShort ? `<div style="font-size:11px;color:var(--text-muted);font-family:monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${msgShort}</div>` : ''}
+                </div>
+            </div>`;
+    }).join('');
+}
+
+// ============================================================
+// Render: Evaluations
+// ============================================================
+function renderEvaluations(evals) {
+    lastEvals = evals;
+    const sorted = sortEvaluations(evals);
+
+    document.getElementById('evals-count').textContent = sorted.length;
+
+    const cols = [
+        { key: 'ticker',        label: 'Ticker' },
+        { key: 'city',          label: 'City' },
+        { key: 'side',          label: 'Side' },
+        { key: 'p_win',         label: 'P(win)' },
+        { key: 'margin',        label: 'Margin' },
+        { key: 'ecmwf',         label: 'ECMWF' },
+        { key: 'gfs',           label: 'GFS' },
+        { key: 'consensus',     label: 'Consensus' },
+        { key: 'threshold',     label: 'Threshold' },
+        { key: 'filter_result', label: 'Filter' },
+        { key: 'model_scores',  label: 'Models' },
+    ];
+
+    const thHtml = cols.map(c => {
+        let cls = '';
+        if (sortColumn === c.key) cls = sortAsc ? 'sort-asc' : 'sort-desc';
+        return `<th class="${cls}" onclick="setSort('${c.key}')">${c.label}</th>`;
+    }).join('');
+
+    let bodyHtml = '';
+    if (sorted.length === 0) {
+        bodyHtml = noDataRow(cols.length);
+    } else {
+        for (const row of sorted) {
+            const pass = row.filter_result === 'pass';
+            const rowCls = pass ? 'row-pass' : 'row-filtered';
+
+            // Parse model_scores
+            let modelsHtml = '—';
+            if (row.model_scores) {
+                try {
+                    const ms = typeof row.model_scores === 'string'
+                        ? JSON.parse(row.model_scores)
+                        : row.model_scores;
+                    modelsHtml = Object.entries(ms)
+                        .map(([k, v]) => {
+                            const pct = (v * 100).toFixed(0);
+                            return `<span style="white-space:nowrap;">${escHtml(k)}:<b>${pct}%</b></span>`;
+                        })
+                        .join('<span style="color:var(--border);"> | </span>');
+                } catch(e) {
+                    modelsHtml = escHtml(String(row.model_scores));
+                }
+            }
+
+            const filterBadge = pass
+                ? `<span class="badge badge-pass">PASS</span>`
+                : `<span class="badge badge-filtered" title="${escHtml(row.filter_reason || '')}">${escHtml(row.filter_result || 'filtered')}</span>`;
+
+            bodyHtml += `
+                <tr class="${rowCls}">
+                    <td style="font-family:monospace;font-size:12px;">${escHtml(row.ticker ?? '—')}</td>
+                    <td>${escHtml(row.city ?? '—')}</td>
+                    <td>${sideBadge(row.side)}</td>
+                    <td>${fmtPwin(row.p_win)}</td>
+                    <td>${fmtMargin(row.margin)}</td>
+                    <td>${fmtTemp(row.ecmwf)}</td>
+                    <td>${fmtTemp(row.gfs)}</td>
+                    <td>${fmtTemp(row.consensus)}</td>
+                    <td>${row.threshold != null ? row.threshold + '\u00b0F' : '—'}</td>
+                    <td>${filterBadge}</td>
+                    <td>${modelsHtml}</td>
+                </tr>`;
+        }
+    }
+
+    document.getElementById('evals-content').outerHTML = `
+        <div id="evals-content">
+            <table>
+                <thead><tr>${thHtml}</tr></thead>
+                <tbody>${bodyHtml}</tbody>
+            </table>
+        </div>`;
+}
+
+// ============================================================
+// Render: Positions
+// ============================================================
+function renderPositions(positions) {
+    document.getElementById('pos-count').textContent = positions.length;
+    const el = document.getElementById('positions-content');
+
+    if (positions.length === 0) {
+        el.outerHTML = `<div id="positions-content" class="no-data">No open positions</div>`;
+        return;
+    }
+
+    // We'll mark danger if we have danger-exited info (stored in window.lastDanger)
+    const dangerSet = new Set((window.lastDanger || []).map(t => t.toLowerCase()));
+
+    const rows = positions.map(p => {
+        const isDanger = dangerSet.has((p.ticker || '').toLowerCase());
+        const rowCls = isDanger ? 'row-danger' : '';
+        return `
+            <tr class="${rowCls}">
+                <td style="font-family:monospace;font-size:12px;">${escHtml(p.ticker ?? '—')}</td>
+                <td>${escHtml(p.city ?? '—')}</td>
+                <td>${sideBadge(p.side)}</td>
+                <td style="text-align:right;">${p.contracts ?? '—'}</td>
+                <td style="text-align:right;">${fmtCents(p.avg_price_cents)}</td>
+                <td>${p.threshold != null ? p.threshold + '\u00b0F' : '—'}</td>
+                ${isDanger ? '<td><span class="badge badge-filtered">DANGER</span></td>' : '<td></td>'}
+            </tr>`;
+    }).join('');
+
+    el.outerHTML = `
+        <div id="positions-content">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Ticker</th>
+                        <th>City</th>
+                        <th>Side</th>
+                        <th style="text-align:right;">Qty</th>
+                        <th style="text-align:right;">Avg Price</th>
+                        <th>Threshold</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// ============================================================
+// Render: Desired Orders
+// ============================================================
+function renderDesiredOrders(orders) {
+    document.getElementById('orders-count').textContent = orders.length;
+    const el = document.getElementById('orders-content');
+
+    if (orders.length === 0) {
+        el.outerHTML = `<div id="orders-content" class="no-data">No desired orders</div>`;
+        return;
+    }
+
+    const rows = orders.map(o => {
+        const statusColor = o.status === 'pending' ? 'var(--yellow)' :
+                            o.status === 'submitted' ? 'var(--green)' :
+                            o.status === 'cancelled' ? 'var(--text-muted)' : 'var(--text)';
+        return `
+            <tr>
+                <td style="font-family:monospace;font-size:12px;">${escHtml(o.ticker ?? '—')}</td>
+                <td>${sideBadge(o.side)}</td>
+                <td style="text-align:right;">${fmtCents(o.price_cents)}</td>
+                <td style="text-align:right;">${o.qty ?? '—'}</td>
+                <td><span style="color:${statusColor};font-family:monospace;font-size:12px;">${escHtml(o.status ?? '—')}</span></td>
+                <td style="color:var(--text-muted);font-size:11px;">${escHtml((o.reason || '').substring(0, 40))}</td>
+            </tr>`;
+    }).join('');
+
+    el.outerHTML = `
+        <div id="orders-content">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Ticker</th>
+                        <th>Side</th>
+                        <th style="text-align:right;">Price</th>
+                        <th style="text-align:right;">Qty</th>
+                        <th>Status</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// ============================================================
+// Render: Fills
+// ============================================================
+function renderFills(fills) {
+    document.getElementById('fills-count').textContent = fills.length;
+    const el = document.getElementById('fills-content');
+
+    if (fills.length === 0) {
+        el.outerHTML = `<div id="fills-content" class="no-data">No fills yet</div>`;
+        return;
+    }
+
+    const rows = fills.map(f => {
+        const actionColor = f.action === 'buy' ? 'var(--green)' : 'var(--red)';
+        const pnlHtml = f.pnl_cents != null
+            ? `<span style="color:${f.pnl_cents >= 0 ? 'var(--green)' : 'var(--red)'};">${f.pnl_cents >= 0 ? '+' : ''}${f.pnl_cents}c</span>`
+            : '—';
+        return `
+            <tr>
+                <td style="font-family:monospace;font-size:11px;">${escHtml(f.ticker ?? '—')}</td>
+                <td>${sideBadge(f.side)}</td>
+                <td><span style="color:${actionColor};font-family:monospace;">${escHtml(f.action ?? '—').toUpperCase()}</span></td>
+                <td style="text-align:right;">${fmtCents(f.price_cents)}</td>
+                <td style="text-align:right;">${f.qty ?? '—'}</td>
+                <td style="text-align:right;color:var(--text-muted);font-size:11px;">${f.fee_cents != null ? f.fee_cents + 'c' : '—'}</td>
+                <td style="text-align:right;">${pnlHtml}</td>
+                <td style="color:var(--text-muted);font-size:11px;">${fmtTS(f.created_at)}</td>
+            </tr>`;
+    }).join('');
+
+    el.outerHTML = `
+        <div id="fills-content">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Ticker</th>
+                        <th>Side</th>
+                        <th>Action</th>
+                        <th style="text-align:right;">Price</th>
+                        <th style="text-align:right;">Qty</th>
+                        <th style="text-align:right;">Fee</th>
+                        <th style="text-align:right;">P&amp;L</th>
+                        <th>Time</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// ============================================================
+// Render: Danger Exited
+// ============================================================
+function renderDanger(data) {
+    const tickers = data.tickers ?? [];
+    window.lastDanger = tickers;
+    document.getElementById('danger-count').textContent = tickers.length;
+    const el = document.getElementById('danger-content');
+
+    if (tickers.length === 0) {
+        el.outerHTML = `<div id="danger-content" class="no-data">None</div>`;
+        return;
+    }
+
+    const tags = tickers.map(t =>
+        `<span class="danger-tag">${escHtml(t)}</span>`
+    ).join('');
+
+    el.outerHTML = `<div id="danger-content"><div class="danger-list">${tags}</div></div>`;
+}
+
+// ============================================================
+// Render: Events
+// ============================================================
+function renderEvents(events) {
+    document.getElementById('events-count').textContent = events.length;
+    const el = document.getElementById('events-content');
+
+    if (events.length === 0) {
+        el.outerHTML = `<div id="events-content" class="no-data">No events</div>`;
+        return;
+    }
+
+    // Show most recent first, limit to 200
+    const recent = [...events].reverse().slice(0, 200);
+
+    const rows = recent.map(ev => {
+        const lvl = (ev.level || 'info').toLowerCase();
+        const lvlCls = lvl === 'warn' || lvl === 'warning' ? 'event-level-warn' :
+                       lvl === 'error' || lvl === 'critical' ? 'event-level-error' :
+                       'event-level-info';
+        return `
+            <div class="event-row">
+                <span class="event-ts">${fmtTS(ev.created_at)}</span>
+                <span class="event-src">${escHtml((ev.source || '').substring(0,12))}</span>
+                <span class="event-level ${lvlCls}">${escHtml(lvl).toUpperCase().substring(0,4)}</span>
+                <span class="event-msg">${escHtml(ev.message ?? '')}</span>
+            </div>`;
+    }).join('');
+
+    el.outerHTML = `<div id="events-content">${rows}</div>`;
+}
+
+// ============================================================
+// Render: Config
+// ============================================================
+function renderConfig(config) {
+    const el = document.getElementById('config-content');
+    const entries = Object.entries(config ?? {});
+
+    if (entries.length === 0) {
+        el.outerHTML = `<div id="config-content" class="no-data">No config loaded</div>`;
+        return;
+    }
+
+    const rows = entries.sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) =>
+        `<div class="cfg-row"><span class="cfg-key">${escHtml(k)}</span><span class="cfg-val">${escHtml(String(v))}</span></div>`
+    ).join('');
+
+    el.outerHTML = `<div id="config-content"><div id="config-wrap">${rows}</div></div>`;
+}
+
+// ============================================================
+// Render: Forecasts
+// ============================================================
+function renderForecasts(forecasts) {
+    document.getElementById('forecasts-count').textContent = forecasts.length;
+    const el = document.getElementById('forecasts-content');
+
+    if (forecasts.length === 0) {
+        el.outerHTML = `<div id="forecasts-content" class="no-data">No forecasts</div>`;
+        return;
+    }
+
+    const rows = forecasts.map(f => `
+        <tr>
+            <td>${escHtml(f.city ?? '—')}</td>
+            <td>${escHtml(f.date ?? '—')}</td>
+            <td>${fmtTemp(f.ecmwf)}</td>
+            <td>${fmtTemp(f.gfs)}</td>
+            <td>${fmtTemp(f.icon)}</td>
+            <td>${f.model_std != null ? f.model_std.toFixed(2) : '—'}</td>
+            <td>${f.model_range != null ? f.model_range.toFixed(2) : '—'}</td>
+        </tr>`).join('');
+
+    el.outerHTML = `
+        <div id="forecasts-content">
+            <table>
+                <thead>
+                    <tr>
+                        <th>City</th>
+                        <th>Date</th>
+                        <th>ECMWF</th>
+                        <th>GFS</th>
+                        <th>ICON</th>
+                        <th>Std</th>
+                        <th>Range</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+// ============================================================
+// Toggle events log
+// ============================================================
+function toggleEvents() {
+    const toggle = document.getElementById('events-toggle');
+    const body = document.getElementById('events-body');
+    toggle.classList.toggle('open');
+    body.classList.toggle('open');
+}
+
+// ============================================================
+// Fetch all
+// ============================================================
+async function fetchAll() {
+    try {
+        const [health, evals, positions, orders, fills, danger, events, config, forecasts] =
+            await Promise.all([
+                fetch('/api/health').then(r => r.ok ? r.json() : {heartbeats:[]}),
+                fetch('/api/evaluations/latest').then(r => r.ok ? r.json() : []),
+                fetch('/api/positions').then(r => r.ok ? r.json() : []),
+                fetch('/api/orders/desired').then(r => r.ok ? r.json() : []),
+                fetch('/api/fills').then(r => r.ok ? r.json() : []),
+                fetch('/api/danger-exited').then(r => r.ok ? r.json() : {tickers:[]}),
+                fetch('/api/events').then(r => r.ok ? r.json() : []),
+                fetch('/api/config').then(r => r.ok ? r.json() : {}),
+                fetch('/api/forecasts').then(r => r.ok ? r.json() : []),
+            ]);
+
+        renderHealth(health);
+        renderEvaluations(evals);
+        renderPositions(positions);
+        renderDesiredOrders(orders);
+        renderFills(fills);
+        renderDanger(danger);
+        renderEvents(events);
+        renderConfig(config);
+        renderForecasts(forecasts);
+
+    } catch(err) {
+        console.error('fetchAll error:', err);
+        // Update header to show error
+        document.getElementById('heartbeats').innerHTML =
+            `<span style="color:var(--red);font-size:12px;">API error: ${escHtml(String(err))}</span>`;
+    }
+}
+
+// ============================================================
+// Countdown + auto-refresh
+// ============================================================
+function startCountdown() {
+    countdown = refreshInterval;
+    if (countdownTimer) clearInterval(countdownTimer);
+    countdownTimer = setInterval(() => {
+        countdown--;
+        document.getElementById('countdown').textContent = countdown;
+        if (countdown <= 0) {
+            triggerRefresh();
+        }
+    }, 1000);
+}
+
+function triggerRefresh() {
+    countdown = refreshInterval;
+    document.getElementById('countdown').textContent = refreshInterval;
+    fetchAll().then(() => {
+        // reset countdown after fetch completes
+        countdown = refreshInterval;
+        document.getElementById('countdown').textContent = countdown;
+    });
+}
+
+// ============================================================
+// Bootstrap
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+    fetchAll();
+    startCountdown();
+});
+</script>
+</body>
+</html>
