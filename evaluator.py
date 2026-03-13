@@ -496,7 +496,7 @@ def main():
             config=msgbus_config,
         )
         # Register ModelSignal as a publishable + streaming type
-        msgbus.register_streaming_type(ModelSignal)
+        msgbus.add_streaming_type(ModelSignal)
         log.info(f"NT MessageBus connected to Redis: {args.redis_host}:{args.redis_port}")
     except Exception as e:
         log.warning(f"MessageBus setup failed — signals will only be written to DB: {e}")
