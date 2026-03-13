@@ -309,18 +309,30 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
         write_evaluations(db_conn, all_evals)
 
     # 5. Compute desired orders for passing signals and publish to Redis
+    #    Sort cheapest-first (matches _on_refresh global rebalance logic)
+    #    and track global budget across all tickers.
+    max_budget = getattr(config, "max_total_deployed_cents", 4000)
+    remaining_budget = max_budget
+
+    # Sort by bid price ascending (cheapest first)
+    for sig_info in passing_signals:
+        s = sig_info["score"]
+        m = sig_info["market"]
+        if s.side == "no":
+            sig_info["bid_cents"] = 100 - m.get("yes_ask", 50)
+        else:
+            sig_info["bid_cents"] = m.get("yes_bid", 50)
+    passing_signals.sort(key=lambda x: x["bid_cents"])
+
     desired = []
     for sig_info in passing_signals:
         s = sig_info["score"]
         m = sig_info["market"]
         sig_features = sig_info["features"]
+        bid_cents = sig_info["bid_cents"]
 
-        # Bid price depends on side
-        if s.side == "no":
-            # NO cost = 100 - yes_bid (buy at the NO ask, which is 100 - yes_bid)
-            bid_cents = 100 - m.get("yes_ask", 50)
-        else:
-            bid_cents = m.get("yes_bid", 50)
+        if remaining_budget <= 0:
+            break
 
         ladder = compute_desired_ladder(
             bid_cents=bid_cents,
@@ -331,8 +343,11 @@ def evaluate_cycle(db_conn, redis_client, models, model_names, model_weights, co
             thin_margin_size_factor=getattr(config, "thin_margin_size_factor", 0.5),
             margin=s.margin,
             capacity=getattr(config, "max_contracts_per_ticker", 20),
-            budget=getattr(config, "max_total_deployed_cents", 4000),
+            budget=remaining_budget,
         )
+
+        ladder_cost = sum(o["price_cents"] * o["qty"] for o in ladder)
+        remaining_budget -= ladder_cost
 
         for order in ladder:
             desired.append({

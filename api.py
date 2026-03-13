@@ -54,8 +54,8 @@ def create_app(db_path: str = "data/trading.db") -> FastAPI:
         return _query(db_path, get_positions)
 
     @app.get("/api/orders/desired")
-    def desired_orders():
-        return _query(db_path, get_desired_orders)
+    def desired_orders(status: str = "pending"):
+        return _query(db_path, get_desired_orders, status=status)
 
     @app.get("/api/fills")
     def fills(limit: int = 50):
