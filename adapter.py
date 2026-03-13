@@ -32,7 +32,7 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.data import QuoteTick
-from nautilus_trader.model.objects import Price, Quantity, Currency
+from nautilus_trader.model.objects import Price, Quantity, Currency, Money, AccountBalance
 from nautilus_trader.model.enums import (
     AccountType,
     CurrencyType,
@@ -321,8 +321,32 @@ class KalshiExecutionClient(LiveExecutionClient):
         self._auth = KalshiAuth(config.api_key_id, config.private_key_path)
         self._accepted_orders: set[ClientOrderId] = set()
 
+    def _fetch_balance(self) -> int:
+        """Fetch account balance in cents from Kalshi API."""
+        resp = self.k_portfolio.get_balance()
+        return getattr(resp, "balance", 0) or 0
+
     async def _connect(self):
         self._log.info("Connecting to Kalshi Execution...")
+
+        # Seed account state so Portfolio can process reconciliation fills
+        try:
+            balance_cents = await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._fetch_balance
+            )
+            usd = Currency.from_str("USD")
+            total = Money(balance_cents / 100.0, usd)
+            balance = AccountBalance(total=total, locked=Money(0, usd), free=total)
+            self.generate_account_state(
+                balances=[balance],
+                margins=[],
+                reported=True,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            self._log.info(f"Account state seeded: ${balance_cents / 100:.2f}")
+        except Exception as e:
+            self._log.error(f"Failed to seed account state: {e}")
+
         self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def _disconnect(self):
