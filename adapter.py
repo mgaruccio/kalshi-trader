@@ -11,6 +11,8 @@ import kalshi_python
 from kalshi_python.api_client import KalshiAuth
 from kalshi_python.api.markets_api import MarketsApi
 from kalshi_python.api.portfolio_api import PortfolioApi
+from kalshi_python.models.create_order_request import CreateOrderRequest
+from kalshi_python.exceptions import ApiException
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.live.data_client import LiveMarketDataClient
@@ -324,6 +326,14 @@ class KalshiExecutionClient(LiveExecutionClient):
         self._auth = KalshiAuth(config.api_key_id, config.private_key_path)
         self._accepted_orders: set[ClientOrderId] = set()
 
+        # Batch order state
+        self._pending_submits: list[SubmitOrder] = []
+        self._pending_cancels: list[CancelOrder] = []
+        self._submit_flush_handle: asyncio.TimerHandle | None = None
+        self._cancel_flush_handle: asyncio.TimerHandle | None = None
+        self._BATCH_MAX = 20
+        self._BATCH_WINDOW_S = 0.05  # 50ms
+
     def _fetch_balance(self) -> int:
         """Fetch account balance in cents from Kalshi API."""
         resp = self.k_portfolio.get_balance()
@@ -353,6 +363,10 @@ class KalshiExecutionClient(LiveExecutionClient):
         self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def _disconnect(self):
+        if self._pending_submits:
+            await self._flush_submits()
+        if self._pending_cancels:
+            await self._flush_cancels()
         if self._ws_task:
             self._ws_task.cancel()
         if self._ws:
@@ -621,26 +635,18 @@ class KalshiExecutionClient(LiveExecutionClient):
     async def generate_fill_reports(self, command) -> list:
         return []
 
-    def _do_submit_order(self, command: SubmitOrder):
-        instrument_id = command.instrument_id
-        ticker, side = _get_ticker_and_side(instrument_id)
+    def _command_to_create_request(self, command: SubmitOrder) -> CreateOrderRequest:
+        """Build a Kalshi CreateOrderRequest from an NT SubmitOrder command."""
+        ticker, side = _get_ticker_and_side(command.instrument_id)
         action = "buy" if command.order.side == OrderSide.BUY else "sell"
         count = int(command.order.quantity.as_double())
-        order_type = (
-            "market" if command.order.order_type == OrderType.MARKET else "limit"
-        )
-        client_order_id = command.order.client_order_id.value
+        order_type = "market" if command.order.order_type == OrderType.MARKET else "limit"
 
         kwargs = dict(
-            ticker=ticker,
-            action=action,
-            side=side,
-            count=count,
-            type=order_type,
-            client_order_id=client_order_id,
+            ticker=ticker, action=action, side=side,
+            count=count, type=order_type,
+            client_order_id=command.order.client_order_id.value,
         )
-
-        # Don't pass limit prices for market orders
         if order_type == "limit" and command.order.price:
             price_cents = int(command.order.price.as_decimal() * 100)
             if side == "yes":
@@ -648,58 +654,200 @@ class KalshiExecutionClient(LiveExecutionClient):
             else:
                 kwargs["no_price"] = price_cents
 
-        # kwargs["_request_timeout"] = 5
-        resp = self.k_portfolio.create_order(**kwargs)
-        return resp
+        return CreateOrderRequest(**kwargs)
+
+    # -- Submit batching --
 
     async def _submit_order(self, command: SubmitOrder) -> None:
-        try:
-            resp = await asyncio.get_running_loop().run_in_executor(
-                self._executor, self._do_submit_order, command
+        self._pending_submits.append(command)
+        if len(self._pending_submits) >= self._BATCH_MAX:
+            if self._submit_flush_handle is not None:
+                self._submit_flush_handle.cancel()
+                self._submit_flush_handle = None
+            await self._flush_submits()
+        elif self._submit_flush_handle is None:
+            loop = asyncio.get_running_loop()
+            self._submit_flush_handle = loop.call_later(
+                self._BATCH_WINDOW_S,
+                lambda: asyncio.ensure_future(self._flush_submits()),
             )
-            ts = self._clock.timestamp_ns()
-            # Fast-path acceptance if not already accepted via WS
-            if command.order.client_order_id not in self._accepted_orders:
-                self.generate_order_accepted(
-                    strategy_id=command.strategy_id,
-                    instrument_id=command.instrument_id,
-                    client_order_id=command.order.client_order_id,
-                    venue_order_id=VenueOrderId(resp.order.order_id),
+
+    async def _flush_submits(self) -> None:
+        if self._submit_flush_handle is not None:
+            self._submit_flush_handle.cancel()
+            self._submit_flush_handle = None
+
+        batch = self._pending_submits[:]
+        self._pending_submits.clear()
+        if not batch:
+            return
+
+        self._log.info(f"Flushing {len(batch)} orders in batch")
+
+        # Build CreateOrderRequest objects, reject any that fail to build
+        pairs: list[tuple[SubmitOrder, CreateOrderRequest]] = []
+        for cmd in batch:
+            try:
+                req = self._command_to_create_request(cmd)
+                pairs.append((cmd, req))
+            except Exception as e:
+                self._log.error(f"Failed to build order request: {e}")
+                self.generate_order_rejected(
+                    strategy_id=cmd.strategy_id,
+                    instrument_id=cmd.instrument_id,
+                    client_order_id=cmd.order.client_order_id,
+                    reason=str(e),
+                    ts_event=self._clock.timestamp_ns(),
+                )
+
+        # Send in chunks of BATCH_MAX
+        for i in range(0, len(pairs), self._BATCH_MAX):
+            chunk = pairs[i:i + self._BATCH_MAX]
+            commands = [c for c, _ in chunk]
+            requests = [r for _, r in chunk]
+            await self._send_batch_submit(commands, requests)
+
+    async def _send_batch_submit(
+        self, commands: list[SubmitOrder], requests: list[CreateOrderRequest],
+    ) -> None:
+        try:
+            responses = await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                lambda: self.k_portfolio.batch_create_orders(orders=requests),
+            )
+            self._process_batch_results(commands, responses.responses or [])
+        except ApiException as e:
+            if e.status == 429:
+                self._log.warning(f"Batch submit 429, retrying {len(requests)} orders after 1s")
+                await asyncio.sleep(1.0)
+                try:
+                    responses = await asyncio.get_running_loop().run_in_executor(
+                        self._executor,
+                        lambda: self.k_portfolio.batch_create_orders(orders=requests),
+                    )
+                    self._process_batch_results(commands, responses.responses or [])
+                except Exception as retry_e:
+                    self._log.error(f"Batch submit retry failed: {retry_e}")
+                    self._reject_all(commands, str(retry_e))
+            else:
+                self._log.error(f"Batch submit error: {e}")
+                self._reject_all(commands, str(e))
+        except Exception as e:
+            self._log.error(f"Batch submit error: {e}")
+            self._reject_all(commands, str(e))
+
+    def _process_batch_results(self, commands, responses) -> None:
+        ts = self._clock.timestamp_ns()
+        for i, cmd in enumerate(commands):
+            if i >= len(responses):
+                self.generate_order_rejected(
+                    strategy_id=cmd.strategy_id,
+                    instrument_id=cmd.instrument_id,
+                    client_order_id=cmd.order.client_order_id,
+                    reason="No response from batch API",
                     ts_event=ts,
                 )
-                self._accepted_orders.add(command.order.client_order_id)
+                continue
+            resp = responses[i]
+            if resp.order is not None:
+                if cmd.order.client_order_id not in self._accepted_orders:
+                    self.generate_order_accepted(
+                        strategy_id=cmd.strategy_id,
+                        instrument_id=cmd.instrument_id,
+                        client_order_id=cmd.order.client_order_id,
+                        venue_order_id=VenueOrderId(resp.order.order_id),
+                        ts_event=ts,
+                    )
+                    self._accepted_orders.add(cmd.order.client_order_id)
+            else:
+                error_msg = str(resp.error) if resp.error else "Unknown batch error"
+                self.generate_order_rejected(
+                    strategy_id=cmd.strategy_id,
+                    instrument_id=cmd.instrument_id,
+                    client_order_id=cmd.order.client_order_id,
+                    reason=error_msg,
+                    ts_event=ts,
+                )
 
-        except Exception as e:
-            self._log.error(f"Submit error: {e}")
+    def _reject_all(self, commands: list[SubmitOrder], reason: str) -> None:
+        ts = self._clock.timestamp_ns()
+        for cmd in commands:
             self.generate_order_rejected(
-                strategy_id=command.strategy_id,
-                instrument_id=command.instrument_id,
-                client_order_id=command.order.client_order_id,
-                reason=str(e),
-                ts_event=self._clock.timestamp_ns(),
+                strategy_id=cmd.strategy_id,
+                instrument_id=cmd.instrument_id,
+                client_order_id=cmd.order.client_order_id,
+                reason=reason,
+                ts_event=ts,
             )
 
-    def _do_cancel_order(self, command: CancelOrder):
-        resp = self.k_portfolio.cancel_order(
-            order_id=command.venue_order_id.value
-        )
-        return resp
+    # -- Cancel batching --
 
     async def _cancel_order(self, command: CancelOrder) -> None:
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                self._executor, self._do_cancel_order, command
+        self._pending_cancels.append(command)
+        if len(self._pending_cancels) >= self._BATCH_MAX:
+            if self._cancel_flush_handle is not None:
+                self._cancel_flush_handle.cancel()
+                self._cancel_flush_handle = None
+            await self._flush_cancels()
+        elif self._cancel_flush_handle is None:
+            loop = asyncio.get_running_loop()
+            self._cancel_flush_handle = loop.call_later(
+                self._BATCH_WINDOW_S,
+                lambda: asyncio.ensure_future(self._flush_cancels()),
             )
-            # Actual cancel confirmation will arrive via WebSocket `user_order` stream
-        except Exception as e:
-            self._log.error(f"Cancel error: {e}")
+
+    async def _flush_cancels(self) -> None:
+        if self._cancel_flush_handle is not None:
+            self._cancel_flush_handle.cancel()
+            self._cancel_flush_handle = None
+
+        batch = self._pending_cancels[:]
+        self._pending_cancels.clear()
+        if not batch:
+            return
+
+        self._log.info(f"Flushing {len(batch)} cancels in batch")
+
+        order_ids = [cmd.venue_order_id.value for cmd in batch]
+
+        for i in range(0, len(order_ids), self._BATCH_MAX):
+            chunk_ids = order_ids[i:i + self._BATCH_MAX]
+            chunk_cmds = batch[i:i + self._BATCH_MAX]
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    self._executor,
+                    lambda ids=chunk_ids: self.k_portfolio.batch_cancel_orders(order_ids=ids),
+                )
+                # Cancel confirmation arrives via WebSocket, same as before
+            except ApiException as e:
+                if e.status == 429:
+                    self._log.warning("Batch cancel 429, retrying after 1s")
+                    await asyncio.sleep(1.0)
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            self._executor,
+                            lambda ids=chunk_ids: self.k_portfolio.batch_cancel_orders(order_ids=ids),
+                        )
+                    except Exception as retry_e:
+                        self._log.error(f"Batch cancel retry failed: {retry_e}")
+                        self._reject_all_cancels(chunk_cmds, str(retry_e))
+                else:
+                    self._log.error(f"Batch cancel error: {e}")
+                    self._reject_all_cancels(chunk_cmds, str(e))
+            except Exception as e:
+                self._log.error(f"Batch cancel error: {e}")
+                self._reject_all_cancels(chunk_cmds, str(e))
+
+    def _reject_all_cancels(self, commands: list[CancelOrder], reason: str) -> None:
+        ts = self._clock.timestamp_ns()
+        for cmd in commands:
             self.generate_order_cancel_rejected(
-                strategy_id=command.strategy_id,
-                instrument_id=command.instrument_id,
-                client_order_id=command.client_order_id,
-                venue_order_id=command.venue_order_id,
-                reason=str(e),
-                ts_event=self._clock.timestamp_ns(),
+                strategy_id=cmd.strategy_id,
+                instrument_id=cmd.instrument_id,
+                client_order_id=cmd.client_order_id,
+                venue_order_id=cmd.venue_order_id,
+                reason=reason,
+                ts_event=ts,
             )
 
 

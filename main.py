@@ -99,8 +99,9 @@ def main():
         node.add_exec_client_factory("KALSHI", KalshiExecutionClientFactory)
     node.build()
 
-    # Register custom data types for external_streams deserialization.
-    # CRITICAL: must be called after node.build() and before node.run().
+    # Register ModelSignal/DangerAlert for external stream consumption.
+    # Without this, node.py:publish_bus_message() silently drops deserialized
+    # messages from Redis (is_streaming_type check fails).
     node.kernel.msgbus.add_streaming_type(ModelSignal)
     node.kernel.msgbus.add_streaming_type(DangerAlert)
 
