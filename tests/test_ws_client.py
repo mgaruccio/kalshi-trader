@@ -1,6 +1,7 @@
 """Tests for KalshiWebSocketClient — subscription management and auth."""
 import asyncio
-from unittest.mock import MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 
 from kalshi.websocket.client import KalshiWebSocketClient
 
@@ -62,3 +63,24 @@ def test_sequence_different_sids_independent():
     assert client._check_sequence(sid=2, seq=1) is True
     assert client._check_sequence(sid=1, seq=2) is True
     assert client._check_sequence(sid=2, seq=2) is True
+
+
+def test_subscribe_ticker_sends_correct_json_when_connected():
+    """subscribe_ticker sends a subscribe cmd when _ws_client is active."""
+    async def _run():
+        client = _make_client()
+        mock_ws = MagicMock()
+        mock_ws.send_text = AsyncMock()
+        client._ws_client = mock_ws
+
+        await client.subscribe_ticker("KXHIGHCHI-26MAR14-T55")
+
+        assert "KXHIGHCHI-26MAR14-T55" in client._subscribed_tickers
+        mock_ws.send_text.assert_called_once()
+        raw = mock_ws.send_text.call_args[0][0]
+        payload = json.loads(raw)
+        assert payload["cmd"] == "subscribe"
+        assert "KXHIGHCHI-26MAR14-T55" in payload["params"]["market_tickers"]
+        assert payload["params"]["channels"] == ["orderbook_delta"]
+
+    asyncio.run(_run())

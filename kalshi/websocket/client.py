@@ -59,7 +59,7 @@ class KalshiWebSocketClient:
     async def _build_and_connect(self) -> None:
         # Correction #2: Fresh RSA-PSS auth headers each time (timestamps expire)
         auth = self._get_auth()
-        headers = auth.create_auth_headers("GET", self._base_url)
+        headers = auth.create_auth_headers("GET", "/trade-api/ws/v2")
         header_list = list(headers.items())
         config = WebSocketConfig(
             url=self._base_url,
