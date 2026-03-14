@@ -57,6 +57,11 @@ class MockKalshiServer:
             self._http_server.close()
             await self._http_server.wait_closed()
 
+    @property
+    def rest_url(self) -> str:
+        """Base URL for adapter REST config (e.g. http://127.0.0.1:PORT)."""
+        return f"http://127.0.0.1:{self.port}"
+
     # ------------------------------------------------------------------
     # Raw HTTP protocol
     # ------------------------------------------------------------------
@@ -153,6 +158,9 @@ class MockKalshiServer:
             payload = json.loads(body) if body else {}
             return 201, self._handle_create_order(payload)
 
+        if method == "DELETE" and path == "/portfolio/orders/batched":
+            return 200, self._handle_cancel_all_orders()
+
         if method == "GET" and path.startswith("/portfolio/orders/"):
             order_id = path[len("/portfolio/orders/"):]
             return 200, self._handle_get_single_order(order_id)
@@ -237,6 +245,14 @@ class MockKalshiServer:
             return {"order": self._order_to_dict(o)}
         return {"order": {}}
 
+    def _handle_cancel_all_orders(self) -> dict:
+        canceled = []
+        for o in self._orders.values():
+            if o.status == "resting":
+                o.status = "canceled"
+                canceled.append(self._order_to_dict(o))
+        return {"orders": canceled}
+
     def _handle_get_fills(self) -> dict:
         return {"fills": self._fills}
 
@@ -261,6 +277,21 @@ class MockKalshiServer:
             "no_price": order.no_price,
             "time_in_force": order.time_in_force,
         }
+
+    # ------------------------------------------------------------------
+    # Test helpers
+    # ------------------------------------------------------------------
+
+    def get_orders(self) -> dict[str, MockOrder]:
+        """Return the live orders dict (for test assertions)."""
+        return self._orders
+
+    def add_fill(self, fill: dict) -> None:
+        """Inject a fill into the server's fill list."""
+        self._fills.append(fill)
+
+    def set_balance(self, cents: int) -> None:
+        self._balance = cents
 
     # ------------------------------------------------------------------
     # WebSocket placeholder (implemented in Task 4)

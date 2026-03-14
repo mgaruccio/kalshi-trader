@@ -103,3 +103,26 @@ class TestMockRESTServer:
     def test_get_positions_empty(self, server_url):
         data = _get(f"{server_url}/trade-api/v2/portfolio/positions")
         assert data["market_exposures"] == []
+
+    def test_batch_cancel_all_orders(self, server_url):
+        # Create two resting orders
+        _, d1 = _post(f"{server_url}/trade-api/v2/portfolio/orders", {
+            "ticker": TEST_TICKER, "action": "buy", "side": "no",
+            "count": 1, "type": "limit", "time_in_force": "good_till_canceled",
+            "client_order_id": "C-BATCH-001", "no_price": 10,
+        })
+        _, d2 = _post(f"{server_url}/trade-api/v2/portfolio/orders", {
+            "ticker": TEST_TICKER, "action": "buy", "side": "no",
+            "count": 1, "type": "limit", "time_in_force": "good_till_canceled",
+            "client_order_id": "C-BATCH-002", "no_price": 11,
+        })
+        # Batch cancel
+        req = urllib.request.Request(
+            f"{server_url}/trade-api/v2/portfolio/orders/batched",
+            method="DELETE",
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+        # Both orders should now be canceled
+        orders = _get(f"{server_url}/trade-api/v2/portfolio/orders?status=resting")
+        assert orders["orders"] == []
