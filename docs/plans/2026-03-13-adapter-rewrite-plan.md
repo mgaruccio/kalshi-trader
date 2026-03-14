@@ -4,23 +4,60 @@
 
 **Goal:** Replace the current broken Kalshi adapter with a properly-architected one following NautilusTrader's canonical adapter pattern (Polymarket-style).
 
-**Architecture:** Two-layer design. The `kalshi-python` SDK handles RSA-PSS auth and HTTP transport (called via `asyncio.to_thread`). Responses are parsed from raw JSON (avoiding SDK deserialization bugs). WebSocket connections use `nautilus_pyo3.WebSocketClient` (Rust networking). Message parsing uses `msgspec` typed schemas.
+**Architecture:** Two-layer design. The `kalshi-python` SDK handles RSA-PSS auth and HTTP transport (called via `asyncio.to_thread`). Responses are parsed from raw JSON (avoiding SDK deserialization bugs). WebSocket connections use `nautilus_pyo3.WebSocketClient` (Rust networking). Message parsing uses `msgspec.Raw` two-pass decode for Kalshi's nested envelope format.
 
 **Tech Stack:** nautilus-trader 1.224.0, kalshi-python 2.1.4, msgspec 0.20.0 (NT dependency), Python 3.12
 
 **Required Skills:**
 - `forge:writing-tests`: Invoke before every test-writing step — covers assertion quality, edge case selection
 - `forge:verification-before-completion`: Invoke before any milestone — verify test output before claiming success
-- `forge:nautilus-testing`: Invoke before Tasks 12, 16, 20 — covers NT Cython mocking patterns
+- `forge:nautilus-testing`: Invoke before Tasks 12, 16, 20 — covers NT Cython mocking, `--noconftest`, test stubs (TestComponentStubs, TestIdStubs)
+
+## Enhancement Summary (from 10-agent parallel review)
+
+**Deepened on:** 2026-03-13
+**Agents:** architecture-strategist, security-sentinel, performance-oracle, error-propagation-reviewer, python-reviewer, pattern-recognition-specialist, + 4 skill/research agents
+
+### Critical Fixes (will crash or lose money if not applied)
+1. **msgspec union type replaced with `msgspec.Raw` two-pass decode** — union of multiple Structs + dict crashes on import. Use `WsEnvelope(msg: msgspec.Raw)` for zero-copy first pass, then per-type decoders.
+2. **Stale WS auth headers on reconnect** — RSA-PSS signatures include a timestamp. `WebSocketConfig` bakes headers at connect time; auto-reconnect reuses stale headers → silent auth failure. Must tear down and rebuild the `WebSocketClient` with fresh headers.
+3. **`RetryManagerPool.run()` returns `None` on exhaustion** — callers MUST check for `None` and call `generate_order_rejected()`. Without this, failed orders silently vanish from NT's state machine.
+4. **Settlement fills leave phantom positions** — "skip" is not safe. Must trigger `generate_position_status_reports()` to reconcile positions. Skipping leaves NT tracking a position that no longer exists.
+5. **`MAX_BATCH_CREATE` must be 9, not 20** — API allows 20 per batch, but each order = 1 write against 10 writes/sec Basic tier limit.
+6. **Batch retry creates duplicate orders** — 429 can arrive after partial processing. Must check order status by `client_order_id` before resubmitting.
+
+### High-Priority Additions (will produce incorrect behavior)
+7. **Sequence gap recovery** — `_check_sequence` returning False must clear local book and resubscribe. Stale book = garbage quotes = wrong trading signals.
+8. **`time_in_force` mapping** — must use full strings: `"fill_or_kill"` not `"fok"`, `"good_till_canceled"` not `"gtc"`. Kalshi rejects shorthand.
+9. **Token-bucket rate limiter** — replace batch-and-sleep with `TokenBucket(rate=10.0, capacity=10)`. Current approach is fragile under bursty submission.
+10. **`_stop()` method** on execution client — `self._retry_manager_pool.shutdown()`. NT calls this during shutdown lifecycle.
+11. **`asyncio.ensure_future` → tracked tasks** in reconnect handler — add `done_callback` for error logging. Fire-and-forget silently loses resubscription failures.
+12. **All pytest commands: add `--noconftest`** — NT's global conftest triggers Cython import chains.
+13. **Execution client tests: use NT test stubs** — `TestComponentStubs.cache()`, `TestIdStubs.trader_id()`, register exec engine + strategy + instruments.
+14. **Call `initialize()` not `load_all_async()` directly** — NT's `InstrumentProvider` base handles idempotent initialization.
+15. **`BinaryOption.description`** — use `None` not `""`. `Condition.valid_string` rejects empty strings.
+16. **Capital locking** — Kalshi locks capital at order placement. `AccountBalance` must use `balance` field (already net of resting order collateral). Add `_update_account_state()`.
+17. **Observation date from ticker, not `close_time`** — `close_time` is the day AFTER observation. Parse from ticker, store in `info["observation_date"]`.
+18. **`lru_cache` must not cache credentials as dict keys** — use module-level singleton variable instead.
+19. **REST call timeouts** — set `api_config.request_timeout = 10` to prevent thread pool exhaustion.
+20. **ACK timeout with REST fallback** — on `asyncio.wait_for` timeout, query REST for order status.
+21. **Instrument loading failures are fatal** — do not catch; let propagate from `_connect()`.
+22. **Bounded deduplication caches** — `OrderedDict`-based, 10K cap for `seen_trade_ids`.
+23. **Duplicate `no_price_dollars` field** removed from `FillMsg` schema.
+24. **Config test assertions** — use `config.ws_url` (property) not `config.base_url_ws` (field, defaults to `None`).
+25. **`asyncio.Lock`** on WS client for thread-safe subscription management.
+26. **`name` parameter** — factories pass it but client constructors must accept it: `ClientId(name or "KALSHI")`.
 
 ## Context for Executor
 
 ### Open Questions Resolved
 
-1. **BinaryOption exists in NT 1.224** — use it instead of CurrencyPair. Import: `from nautilus_trader.model.instruments import BinaryOption`
-2. **Two WebSocket connections** — one for market data (`orderbook_delta`, `market_lifecycle_v2`), one for user data (`user_orders`, `fill`). Both connect to the same Kalshi WS URL but subscribe to different channels.
-3. **Settlement on demo** — cannot be controlled. Test settlement fill handling with unit test fixtures. Opportunistic integration test if a market settles during test window.
-4. **msgspec is already a dependency** of nautilus-trader. Do NOT add it to pyproject.toml. It is available via the NT install.
+1. **BinaryOption exists in NT 1.224** — use it instead of CurrencyPair. Import: `from nautilus_trader.model.instruments import BinaryOption`. Use `price_precision=2` with `Price.from_str("0.01")` for dollar amounts (confirmed correct for `_dollars` field migration).
+2. **Two WebSocket connections** — one for market data, one for user data. **CRITICAL: Must tear down and rebuild with fresh RSA-PSS auth headers on reconnect** (timestamps expire).
+3. **Settlement fills must trigger position reconciliation** — not just be skipped. Call `generate_position_status_reports()` to sync state.
+4. **msgspec is already a dependency** of nautilus-trader. Do NOT add it to pyproject.toml.
+5. **msgspec union types do NOT work** for Kalshi's nested envelope. Use `msgspec.Raw` two-pass decode (see Task 5).
+6. **`@property` works on frozen msgspec Structs** — verified against NT's `NautilusConfig` base class.
 
 ### Key Imports (verified from installed NT 1.224.0)
 
