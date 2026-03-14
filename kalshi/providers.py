@@ -66,7 +66,7 @@ class KalshiInstrumentProvider(InstrumentProvider):
         """Synchronous market loading — called via asyncio.to_thread."""
         filters = filters or {}
         series_ticker = filters.get("series_ticker")
-        statuses = filters.get("statuses", ["open", "unopened"])
+        statuses = filters.get("statuses", ["active", "open", "unopened"])
 
         for status in statuses:
             cursor = None
