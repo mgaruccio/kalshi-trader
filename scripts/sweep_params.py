@@ -133,8 +133,10 @@ def _run_single(
         start=start,
         end=end,
     )
-    results = extract_results(engine, strategy)
-    engine.dispose()
+    try:
+        results = extract_results(engine, strategy)
+    finally:
+        engine.dispose()
 
     return {
         "param_name":   param_name,
