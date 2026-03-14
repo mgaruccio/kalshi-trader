@@ -125,7 +125,7 @@ class TestScenarioSemantics:
 
     def test_market_order_immediate_has_no_updates(self):
         from tests.mock_exchange.scenarios import MARKET_ORDER_IMMEDIATE
-        assert MARKET_ORDER_IMMEDIATE.updates == []
+        assert MARKET_ORDER_IMMEDIATE.updates == ()
         assert MARKET_ORDER_IMMEDIATE.expect_market_fill is True
         assert MARKET_ORDER_IMMEDIATE.expect_limit_fill is False
 

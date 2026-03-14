@@ -10,7 +10,7 @@ A limit BUY NO order fills when the NO ask drops to or below the limit price.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ class Scenario:
     description: str
     initial_no_bid_cents: int
     initial_yes_bid_cents: int
-    updates: list[BookUpdate]
+    updates: tuple[BookUpdate, ...]
     expect_market_fill: bool = True
     expect_limit_fill: bool = False
     expect_limit_fill_price_cents: int | None = None
@@ -50,12 +50,12 @@ STEADY_FILL = Scenario(
     ),
     initial_no_bid_cents=35,
     initial_yes_bid_cents=58,
-    updates=[
+    updates=(
         BookUpdate(delay_ms=200, no_bid_cents=35, yes_bid_cents=60),
         BookUpdate(delay_ms=200, no_bid_cents=35, yes_bid_cents=63),
         # NO bid drops to 34c so YES+NO=100c (no crossed book); NO ask still=34c.
         BookUpdate(delay_ms=200, no_bid_cents=34, yes_bid_cents=66),
-    ],
+    ),
     expect_market_fill=True,
     expect_limit_fill=True,
     expect_limit_fill_price_cents=34,
@@ -75,14 +75,14 @@ CHASE_UP = Scenario(
     ),
     initial_no_bid_cents=30,
     initial_yes_bid_cents=58,
-    updates=[
+    updates=(
         BookUpdate(delay_ms=200, no_bid_cents=31, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=32, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=33, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=34, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=35, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=34, yes_bid_cents=66),
-    ],
+    ),
     expect_market_fill=True,
     expect_limit_fill=True,
     expect_limit_fill_price_cents=34,
@@ -101,7 +101,7 @@ MARKET_ORDER_IMMEDIATE = Scenario(
     ),
     initial_no_bid_cents=35,
     initial_yes_bid_cents=58,
-    updates=[],
+    updates=(),
     expect_market_fill=True,
     expect_limit_fill=False,
 )
@@ -119,11 +119,11 @@ NO_FILL_TIMEOUT = Scenario(
     ),
     initial_no_bid_cents=35,
     initial_yes_bid_cents=58,
-    updates=[
+    updates=(
         BookUpdate(delay_ms=200, no_bid_cents=36, yes_bid_cents=58),
         BookUpdate(delay_ms=200, no_bid_cents=37, yes_bid_cents=57),
         BookUpdate(delay_ms=200, no_bid_cents=38, yes_bid_cents=56),
-    ],
+    ),
     expect_market_fill=True,
     expect_limit_fill=False,
     expect_cancel_count=3,
