@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import pathlib
 import sys
+import urllib.parse
 
 from dotenv import load_dotenv
 
@@ -47,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--signal-url",
         default="http://localhost:8000",
-        help="Base URL of the signal server (HTTP for REST bootstrap)",
+        help="Base URL of the signal server, no trailing path (e.g. http://localhost:8000)",
     )
     parser.add_argument(
         "--i-accept-risk",
@@ -144,8 +146,15 @@ def _build_strategy_config(args: argparse.Namespace):
 
 
 def _signal_ws_url(http_url: str) -> str:
-    """Derive WebSocket URL from HTTP base URL."""
-    return http_url.replace("http://", "ws://").replace("https://", "wss://") + "/v1/stream"
+    """Derive WebSocket URL from HTTP base URL.
+
+    Strips any existing path component so a URL like http://host:8000/extra
+    doesn't produce http://host:8000/extra/v1/stream.
+    """
+    parsed = urllib.parse.urlparse(http_url)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    base = urllib.parse.urlunparse((ws_scheme, parsed.netloc, "", "", "", ""))
+    return base + "/v1/stream"
 
 
 def _heartbeat_path() -> str:
@@ -168,8 +177,6 @@ def main() -> None:
     )
     from kalshi.signal_actor import SignalActor, SignalActorConfig
     from kalshi.strategy import WeatherMakerStrategy
-
-    import kalshi.factories
 
     # --- Configs ---
     data_cfg = KalshiDataClientConfig(
@@ -227,7 +234,6 @@ def main() -> None:
     def _write_heartbeat(event=None) -> None:
         path = _heartbeat_path()
         try:
-            import pathlib
             pathlib.Path(path).touch()
         except OSError:
             pass
