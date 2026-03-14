@@ -358,7 +358,9 @@ class TestNoFillTimeout:
     """NO_FILL_TIMEOUT: NO ask stays > 40c throughout; limit canceled 3 times."""
 
     def test_market_fill_received(self, no_fill_timeout_strategy):
-        assert no_fill_timeout_strategy.filled_orders, "Expected market order to fill"
+        assert len(no_fill_timeout_strategy.filled_orders) == 1, (
+            f"Expected exactly 1 fill (market only), got {len(no_fill_timeout_strategy.filled_orders)}"
+        )
 
     def test_limit_not_filled(self, no_fill_timeout_strategy):
         """NO ask never reaches the limit price — strategy should not signal done."""
