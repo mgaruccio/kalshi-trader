@@ -1,0 +1,15 @@
+[Unit]
+Description=Kalshi WeatherMaker Trader
+After=network.target collector.service
+
+[Service]
+WorkingDirectory=/root/kalshi-trader
+ExecStart=/root/kalshi-trader/.venv/bin/python scripts/run_trader.py --environment demo
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/root/kalshi-trader/trader.log
+StandardError=append:/root/kalshi-trader/trader.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
