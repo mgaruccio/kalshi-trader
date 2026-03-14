@@ -11,3 +11,13 @@ def test_dummy_rsa_key_creates_valid_pem():
         assert b"BEGIN PRIVATE KEY" in data
     finally:
         os.unlink(path)
+
+
+def test_dummy_rsa_key_loadable_by_kalshi_auth():
+    path = create_dummy_rsa_key()
+    try:
+        from kalshi_python.api_client import KalshiAuth
+        auth = KalshiAuth(key_id="test-key-id", private_key_path=path)
+        assert auth is not None
+    finally:
+        os.unlink(path)

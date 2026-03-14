@@ -19,4 +19,5 @@ dependencies = [
 [dependency-groups]
 dev = [
     "allpairspy>=2.5.1",
+    "pytest>=9.0.2",
 ]
