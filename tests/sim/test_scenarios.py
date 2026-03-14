@@ -59,6 +59,13 @@ def _make_adapter_stub():
     )
     stub._instrument_provider.find.return_value = instrument
 
+    # Mock cache: orders are looked up by _strategy_id_for for WS event routing.
+    # Default: return a mock order with a strategy_id so fills route correctly.
+    mock_order = MagicMock()
+    mock_order.strategy_id = MagicMock()
+    stub._cache = MagicMock()
+    stub._cache.order.return_value = mock_order
+
     # Bind the FULL dispatch method (not individual handlers)
     stub._handle_ws_message = types.MethodType(
         KalshiExecutionClient._handle_ws_message, stub,
@@ -69,6 +76,9 @@ def _make_adapter_stub():
     )
     stub._handle_fill = types.MethodType(
         KalshiExecutionClient._handle_fill, stub,
+    )
+    stub._strategy_id_for = types.MethodType(
+        KalshiExecutionClient._strategy_id_for, stub,
     )
 
     return stub
@@ -139,6 +149,7 @@ class TestDedupCacheEviction:
         msg = factory.fill(
             trade_id="T-NEW", order_id="O-NEW", ticker="KXHIGH-T55",
             side="yes", action="buy", count=1, price_cents=50,
+            client_order_id="C-NEW",
         )
         with patch("kalshi.execution.asyncio.create_task"):
             stub._handle_ws_message(msg)
@@ -150,6 +161,7 @@ class TestDedupCacheEviction:
         replay = factory.fill(
             trade_id="T-000000", order_id="O-OLD", ticker="KXHIGH-T55",
             side="yes", action="buy", count=1, price_cents=50,
+            client_order_id="C-OLD",
         )
         with patch("kalshi.execution.asyncio.create_task"):
             stub._handle_ws_message(replay)

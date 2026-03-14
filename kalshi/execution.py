@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections import OrderedDict
 from decimal import Decimal
 
@@ -114,14 +115,13 @@ class TokenBucket:
         self._rate = rate
         self._capacity = capacity
         self._tokens: float = capacity
-        self._updated_at: float | None = None
+        # Use monotonic clock for consistent elapsed-time calculation.
+        # Safe to call at construction — no running loop required.
+        self._updated_at: float = time.monotonic()
 
     async def acquire(self, cost: float = 1.0) -> None:
         while True:
-            loop = asyncio.get_running_loop()
-            now = loop.time()
-            if self._updated_at is None:
-                self._updated_at = now
+            now = time.monotonic()
             elapsed = now - self._updated_at
             self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
             self._updated_at = now
@@ -130,7 +130,6 @@ class TokenBucket:
                 return
             sleep_time = (cost - self._tokens) / self._rate
             await asyncio.sleep(sleep_time)
-            now = asyncio.get_running_loop().time()
 
 
 class KalshiExecutionClient(LiveExecutionClient):
@@ -315,6 +314,14 @@ class KalshiExecutionClient(LiveExecutionClient):
                     self._accepted_orders[c_oid] = VenueOrderId(order_id)
         except Exception as e:
             log.error(f"ACK fallback failed: {e}")
+            # Escalate: strategy must know the order's fate (not silently lost)
+            self.generate_order_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.order.client_order_id,
+                reason=f"ACK fallback failed: {e}",
+                ts_event=self._clock.timestamp_ns(),
+            )
 
     async def _cancel_order(self, command) -> None:
         # Correction #9: rate-limit write operations
@@ -457,7 +464,12 @@ class KalshiExecutionClient(LiveExecutionClient):
 
         fill_sid = self._strategy_id_for(c_oid)
         if fill_sid is None:
-            log.warning(f"Fill for unknown order {c_oid} — cannot route to strategy")
+            log.error(
+                f"Fill for order {c_oid} not in cache — "
+                "triggering reconciliation to recover position state"
+            )
+            asyncio.create_task(self.generate_fill_reports(None))
+            asyncio.create_task(self.generate_position_status_reports(None))
             return
 
         # Generate accepted first if not yet done
@@ -564,6 +576,8 @@ class KalshiExecutionClient(LiveExecutionClient):
                         if order.get("action") == "buy"
                         else OrderSide.SELL,
                         order_type=OrderType.LIMIT,
+                        # Resting orders are always GTC — FOK/IOC execute or
+                        # cancel immediately and never appear in status=resting.
                         time_in_force=TimeInForce.GTC,
                         order_status=OrderStatus.ACCEPTED,
                         quantity=instrument.make_qty(order.get("count", 0)),

@@ -125,15 +125,25 @@ def _make_fill_stub():
     import types as _types
     from kalshi.execution import KalshiExecutionClient
 
+    # Mock cache: orders are looked up by _strategy_id_for for WS event routing.
+    mock_order = MagicMock()
+    mock_order.strategy_id = MagicMock()
+    mock_cache = MagicMock()
+    mock_cache.order.return_value = mock_order
+
     stub = _types.SimpleNamespace(
         _seen_trade_ids=OrderedDict(),
         _accepted_orders={},
         _instrument_provider=MagicMock(),
+        _cache=mock_cache,
+        _clock=MagicMock(timestamp_ns=MagicMock(return_value=1_000_000)),
         generate_order_accepted=MagicMock(),
         generate_order_filled=MagicMock(),
         generate_position_status_reports=AsyncMock(return_value=[]),
+        generate_fill_reports=AsyncMock(return_value=[]),
     )
     stub._handle_fill = _types.MethodType(KalshiExecutionClient._handle_fill, stub)
+    stub._strategy_id_for = _types.MethodType(KalshiExecutionClient._strategy_id_for, stub)
     return stub
 
 
