@@ -13,7 +13,7 @@ from kalshi.common.constants import KALSHI_VENUE
 
 def make_mock_order(
     side: OrderSide,
-    price_cents: int,
+    price_cents: int | None,
     qty: int = 5,
     tif: TimeInForce = TimeInForce.GTC,
     order_type: OrderType = OrderType.LIMIT,

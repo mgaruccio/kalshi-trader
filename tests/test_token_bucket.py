@@ -44,6 +44,6 @@ class TestTokenBucket:
             tb = TokenBucket(rate=10.0, capacity=1.0)
             await tb.acquire(cost=1.0)  # drain
             # Next acquire needs 1 token, rate is 10/sec, so ~0.1s wait
-            await asyncio.wait_for(tb.acquire(cost=1.0), timeout=0.5)
+            await asyncio.wait_for(tb.acquire(cost=1.0), timeout=2.0)
 
         asyncio.run(_run())

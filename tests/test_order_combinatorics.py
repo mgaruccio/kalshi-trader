@@ -8,6 +8,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.execution import _order_to_kalshi_params, _parse_fill_commission
+from tests.helpers import make_mock_order
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +169,14 @@ class TestMarketOrders:
     """Market orders (no price) must produce params without price fields."""
 
     def test_market_order_buy_yes(self):
-        order = MagicMock()
-        order.side = OrderSide.BUY
-        order.order_type = OrderType.MARKET
-        order.time_in_force = TimeInForce.FOK
-        order.price = None
-        order.quantity = Quantity.from_int(5)
-        order.client_order_id = ClientOrderId("C-MKT")
-
+        order = make_mock_order(
+            side=OrderSide.BUY,
+            price_cents=None,
+            qty=5,
+            tif=TimeInForce.FOK,
+            order_type=OrderType.MARKET,
+            client_order_id="C-MKT",
+        )
         params = _order_to_kalshi_params(order, _instr("YES"))
         assert params["type"] == "market"
         assert params["action"] == "buy"
@@ -185,17 +186,18 @@ class TestMarketOrders:
         assert params["count"] == 5
 
     def test_market_order_sell_no(self):
-        order = MagicMock()
-        order.side = OrderSide.SELL
-        order.order_type = OrderType.MARKET
-        order.time_in_force = TimeInForce.FOK
-        order.price = None
-        order.quantity = Quantity.from_int(10)
-        order.client_order_id = ClientOrderId("C-MKT2")
-
+        order = make_mock_order(
+            side=OrderSide.SELL,
+            price_cents=None,
+            qty=10,
+            tif=TimeInForce.FOK,
+            order_type=OrderType.MARKET,
+            client_order_id="C-MKT2",
+        )
         params = _order_to_kalshi_params(order, _instr("NO"))
         assert params["type"] == "market"
         assert params["action"] == "sell"
         assert params["side"] == "no"
         assert "yes_price" not in params
         assert "no_price" not in params
+        assert params["count"] == 10

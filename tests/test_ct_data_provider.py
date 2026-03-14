@@ -20,12 +20,7 @@ QUOTE_PARAMS = OrderedDict({
 })
 
 
-def _quote_filter(row: list) -> bool:
-    """No constraints — all combos are valid for _derive_quotes."""
-    return True
-
-
-QUOTE_CASES = list(AllPairs(QUOTE_PARAMS, filter_func=_quote_filter, n=2))
+QUOTE_CASES = list(AllPairs(QUOTE_PARAMS, n=2))
 
 
 def _build_book(state: str, price: float) -> dict[float, float]:
@@ -36,7 +31,7 @@ def _build_book(state: str, price: float) -> dict[float, float]:
     else:  # multi
         lower = round(price - 0.01, 2)
         book = {price: 5.0}
-        if lower > 0:
+        if lower >= 0.01:
             book[lower] = 2.5
         return book
 
