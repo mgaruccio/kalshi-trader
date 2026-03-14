@@ -16,64 +16,34 @@ uv run python -m pytest tests/test_execution.py tests/sim/ -v  # adapter unit te
 # Run all tests (excluding confidence tests which need isolation due to event loop)
 uv run python -m pytest --ignore=tests/test_live_confidence.py -v
 
-# Run live trading (requires .env with Kalshi credentials + Redis running)
-uv run main.py                          # live trading
-uv run main.py --dry-run                # paper trade (no orders)
-uv run main.py --capital 2000 --max-per-ticker 10
-
-# Run standalone evaluator (requires KALSHI_WEATHER_ROOT pointing to kalshi-weather repo)
-uv run evaluator.py --db data/trading.db
-
 # Run data collector
 uv run collector.py
-
-# Query trading state via CLI
-uv run cli.py status
-uv run cli.py evals
-uv run cli.py positions
-uv run cli.py fills
 ```
 
 ## Architecture
 
-This is a **three-process trading system** for Kalshi KXHIGH (daily high temperature) prediction markets, built on NautilusTrader:
+This repo contains the **Kalshi NautilusTrader adapter** and a **data collector** for KXHIGH (daily high temperature) prediction markets. The evaluator, trading node, and supporting modules are not yet on master.
 
-### Process 1: Evaluator (`evaluator.py`)
-Standalone ML scoring loop. Loads ensemble models (EMOS, NGBoost, DRN) from the **external** `kalshi-weather` repo (path via `KALSHI_WEATHER_ROOT` env var). Fetches open markets from Kalshi REST API, scores each with weather forecast data, writes evaluations to SQLite, and publishes `ModelSignal` to Redis streams.
-
-### Process 2: Trading Node (`main.py`)
-NautilusTrader live engine. Consumes `ModelSignal` and `DangerAlert` from Redis `external_streams`. Runs `WeatherStrategy` (2-phase market-making with GTC ladder orders) and `FeatureActor` (climate data polling). Executes orders via `KalshiExecutionClient`.
-
-### Process 3: Collector (`collector.py`)
-Silent WebSocket data ingestion into ParquetDataCatalog for backtesting archives.
-
-### Key data flow
-```
-Evaluator → Redis stream → Trading Node → Kalshi adapter → REST API
-                                ↓
-                        SQLite (shared state)
-```
+### Collector (`collector.py`)
+WebSocket data ingestion into ParquetDataCatalog for backtesting archives. Runs as a systemd service on the production droplet (161.35.114.105). Discovery strategy finds KXHIGH series, subscribes to quote ticks, and persists via StreamingFeatherWriter. Production-hardened: heartbeat timer (tick count/60s), event loop reference caching, background thread error surfacing, consecutive failure escalation, unopened market discovery.
 
 ### Critical modules
 - **`kalshi/`**: Kalshi ↔ NautilusTrader adapter package. `KalshiDataClient` (WebSocket market data), `KalshiExecutionClient` (order routing), `KalshiInstrumentProvider` (market discovery). REST calls offloaded to `asyncio.to_thread()`. Config overrides via `base_url_http`/`base_url_ws`. Factory singleton `_SHARED_PROVIDER` must be reset to `None` between test runs.
-- **`weather_strategy.py`**: 2-phase strategy — Phase 1 places spread orders in an opening window for next-day contracts; Phase 2 places laddered GTC buy orders below bid with immediate sell-on-fill at target price.
-- **`data_types.py`**: Custom NT `Data` subclasses (`ModelSignal`, `DangerAlert`, `ClimateEvent`) that flow through the message bus. NT 1.224+ pattern: private `_ts_event`/`_ts_init` with `@property` accessors, no `super().__init__()`.
-- **`db.py`**: SQLite with WAL mode. Shared by evaluator and trading node. All writes via named functions (`write_evaluations`, `upsert_position`, `write_fill`, etc.).
-- **`shared_features.py`**: Single source of truth for derived feature computation — imported by both evaluator and feature_actor.
-- **`exit_rules.py`**: Climate-specific exit conditions that emit `DangerAlert`.
+- **`collector.py`**: Discovery strategy + TradingNode bootstrap. Uses `KalshiInstrumentProvider(load_all=False)` since the strategy discovers markets itself. Must call `cache.add_instrument(inst)` before subscribing to quote ticks — StreamingFeatherWriter silently drops ticks for instruments not in cache.
 
-### External dependency: `kalshi_weather_ml`
-The ML models, market parsing (`parse_ticker`, `SERIES_CONFIG`), and forecast fetching live in a **separate repo** at `$KALSHI_WEATHER_ROOT/src`. This is added to `sys.path` at runtime in both `main.py` and `evaluator.py`. It is not a pip package.
+### Deployment
+Production droplet at `161.35.114.105`. Collector runs via `systemctl {start,stop,restart} collector.service`. Logs at `/root/kalshi-trader/collector.log`. Data at `kalshi_data_catalog/` (3.6GB+). Deploy by pushing to master and pulling on the droplet (or scp for hotfixes).
 
 ## Key Conventions
 
 - **Prices are in cents** (1-99 range for Kalshi contracts). Variables use `_cents` suffix.
 - **Kalshi rate limits**: Basic tier allows 10 writes/sec. Batch submissions are capped at 9 orders per request.
+- **Kalshi API status filters**: Only `"open"`, `"unopened"`, `"closed"`, `"settled"` are valid for `get_markets()`. `"active"` is a response field but NOT a valid query parameter.
 - **NautilusTrader Cython gotchas**: Strategy/Actor attributes (`log`, `clock`, `cache`) are Cython read-only descriptors. Tests use a `_TestableWeatherStrategy` stand-in that binds real methods onto a plain Python object with mocked NT attributes.
 - **Async discipline**: Synchronous Kalshi SDK calls must go through `run_in_executor()` to avoid blocking the NT event loop.
 - **Environment**: Demo (`demo-api.kalshi.co`) vs Production (`api.elections.kalshi.com`) controlled by `.env` / `KalshiConfig`.
-- **SQLite WAL mode** enables concurrent reads from CLI/dashboard while evaluator and trading node write.
 - **Currency**: Kalshi contracts use a synthetic `CONTRACT` currency registered at adapter import time.
+- **StreamingFeatherWriter**: Requires instruments in NT cache to persist per-instrument data (QuoteTick, TradeTick, Bar). Use `cache.add_instrument()` before subscribing.
 
 ## Testing
 
