@@ -19,6 +19,7 @@ class TestWsMessageFactory:
         assert isinstance(msg, FillMsg)
         assert msg.trade_id == "T-001"
         assert msg.yes_price_dollars == "0.50"
+        assert msg.no_price_dollars == "0.50"
         assert msg.count_fp == "5.00"
         assert msg.is_taker is True
 
@@ -73,7 +74,7 @@ class TestWsMessageFactory:
         _, sid, _, _ = decode_ws_msg(raw)
         assert sid == 1  # user_order channel
 
-    def test_duplicate_fill_produces_identical_bytes(self):
+    def test_duplicate_fill_preserves_trade_id(self):
         factory = WsMessageFactory()
         raw1 = factory.fill(
             trade_id="T-DUP", order_id="O-1", ticker="T",

@@ -95,6 +95,7 @@ class WsMessageFactory:
         msg = {
             "trade_id": trade_id,
             "order_id": order_id,
+            "market_ticker": None,
             "side": side,
             "action": action,
             "count_fp": f"{count:.2f}",

@@ -9,6 +9,7 @@ import types
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgspec
 import pytest
 
 from kalshi.execution import KalshiExecutionClient, _DEDUP_MAX
@@ -216,8 +217,8 @@ class TestSequenceGap:
         with patch("kalshi.execution.asyncio.create_task") as mock_task:
             stub._handle_ws_message(msg2)
 
-        # Sequence gap should trigger reconciliation (2 tasks: order reports + fill reports)
-        assert mock_task.call_count >= 1
+        # Sequence gap triggers 2 tasks: generate_order_status_reports + generate_fill_reports
+        assert mock_task.call_count == 2
 
     def test_independent_sids_dont_interfere(self):
         """Sequence on SID 1 (user_order) should not affect SID 2 (fill)."""
@@ -265,8 +266,7 @@ class TestFillBeforeAck:
         with patch("kalshi.execution.asyncio.create_task"):
             stub._handle_ws_message(fill_msg)
 
-        # _handle_fill should have emitted accepted (line 394-402 of execution.py)
-        # because c_oid was not in _accepted_orders yet
+        # _handle_fill emits accepted first because c_oid was not yet in _accepted_orders
         assert stub.generate_order_accepted.call_count == 1
         assert stub.generate_order_filled.call_count == 1
 
@@ -331,9 +331,7 @@ class TestMalformedMessage:
 
     def test_unknown_message_type_does_not_crash(self):
         stub = _make_adapter_stub()
-        import msgspec as ms
-
-        raw = ms.json.encode({"type": "unknown_type", "sid": 1, "seq": 1, "msg": {}})
+        raw = msgspec.json.encode({"type": "unknown_type", "sid": 1, "seq": 1, "msg": {}})
         with patch("kalshi.execution.asyncio.create_task"):
             stub._handle_ws_message(raw)
 
