@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cryptography>=46.0.5",
+    "httpx>=0.28.1",
     "kalshi-python>=2.1.4",
     "nautilus-trader>=1.224.0",
     "pydantic-settings>=2.13.1",
