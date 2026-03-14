@@ -1,9 +1,12 @@
 [Unit]
 Description=Kalshi WeatherMaker Trader
-After=network.target collector.service
+After=network-online.target collector.service
+Wants=network-online.target
 
 [Service]
+Type=simple
 WorkingDirectory=/root/kalshi-trader
+EnvironmentFile=/root/kalshi-trader/.env
 ExecStart=/root/kalshi-trader/.venv/bin/python scripts/run_trader.py --environment demo
 Restart=on-failure
 RestartSec=30
