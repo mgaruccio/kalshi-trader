@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+from nautilus_trader.backtest.models import BestPriceFillModel
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import AccountType, AssetClass, OmsType
@@ -67,6 +68,7 @@ def build_backtest_engine(
         account_type=AccountType.CASH,
         base_currency=USD,
         starting_balances=[Money(starting_balance_usd, USD)],
+        fill_model=BestPriceFillModel(),  # Fill limit orders resting inside the spread
     )
 
     return engine
