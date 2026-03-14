@@ -88,6 +88,37 @@ def should_quote(
     return side, True
 
 
+def check_risk_caps(
+    market_exposure_cents: int,
+    city_exposure_cents: int,
+    quantity: int,
+    price_cents: int,
+    account_balance_cents: int,
+    market_cap_pct: float,
+    city_cap_pct: float,
+) -> int:
+    """Return max allowed quantity given risk caps.
+
+    Caller derives market_exposure_cents and city_exposure_cents from
+    cache.positions() and cache.orders_open() — no ExposureTracker needed.
+
+    Returns a value between 0 and quantity (inclusive).
+    """
+    if account_balance_cents <= 0 or price_cents <= 0:
+        return 0
+
+    market_cap = int(account_balance_cents * market_cap_pct)
+    city_cap = int(account_balance_cents * city_cap_pct)
+
+    market_remaining = max(0, market_cap - market_exposure_cents)
+    city_remaining = max(0, city_cap - city_exposure_cents)
+
+    max_by_market = market_remaining // price_cents
+    max_by_city = city_remaining // price_cents
+
+    return min(quantity, max_by_market, max_by_city)
+
+
 def compute_ladder(
     anchor_bid_cents: int,
     depth: int,

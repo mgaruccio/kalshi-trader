@@ -1,8 +1,8 @@
-"""Tests for WeatherMakerStrategy filter layer and quote ladder."""
+"""Tests for WeatherMakerStrategy filter layer, quote ladder, and risk caps."""
 import pytest
 
 from kalshi.signals import SignalScore
-from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder
+from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps
 
 
 def _make_score(
@@ -205,3 +205,101 @@ class TestComputeLadder:
         levels = compute_ladder(anchor_bid_cents=99, depth=3, spacing=1, qty=10)
         assert levels[0] == (99, 10)
         assert len(levels) == 3
+
+
+class TestCheckRiskCaps:
+    """check_risk_caps takes pre-computed exposure values derived from NT cache."""
+
+    def test_within_caps_full_quantity_allowed(self):
+        allowed = check_risk_caps(
+            market_exposure_cents=0,
+            city_exposure_cents=0,
+            quantity=10,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert allowed == 10
+
+    def test_market_cap_reduces_quantity(self):
+        # Market cap = 20,000 cents. Already exposed 14,940 (166 * 90).
+        # Remaining = 5,060. At 90c = 56 contracts.
+        allowed = check_risk_caps(
+            market_exposure_cents=166 * 90,
+            city_exposure_cents=166 * 90,
+            quantity=100,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert 0 <= allowed < 100
+
+    def test_city_cap_reduces_quantity(self):
+        # City exposure = 18,000 (two markets, 100*90 each).
+        # City cap = 33,000. Remaining = 15,000. At 90c = 166 contracts.
+        allowed = check_risk_caps(
+            market_exposure_cents=0,
+            city_exposure_cents=100 * 90 + 100 * 90,
+            quantity=200,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert 0 < allowed < 200
+
+    def test_zero_balance_allows_nothing(self):
+        allowed = check_risk_caps(
+            market_exposure_cents=0,
+            city_exposure_cents=0,
+            quantity=10,
+            price_cents=90,
+            account_balance_cents=0,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert allowed == 0
+
+    def test_market_cap_fully_consumed(self):
+        # Market exposure already at cap — no room.
+        market_cap = int(100_000 * 0.20)  # 20,000
+        allowed = check_risk_caps(
+            market_exposure_cents=market_cap,
+            city_exposure_cents=market_cap,
+            quantity=10,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert allowed == 0
+
+    def test_city_cap_fully_consumed(self):
+        city_cap = int(100_000 * 0.33)  # 33,000
+        allowed = check_risk_caps(
+            market_exposure_cents=0,
+            city_exposure_cents=city_cap,
+            quantity=10,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert allowed == 0
+
+    def test_quantity_limited_by_stricter_cap(self):
+        """Market cap is tighter than city cap — market cap applies."""
+        # Market: 18,000 exposed of 20,000 cap → 2,000 remaining → 22 contracts at 90c
+        # City: 0 exposed of 33,000 cap → 33,000 remaining → 366 contracts
+        allowed = check_risk_caps(
+            market_exposure_cents=18_000,
+            city_exposure_cents=18_000,
+            quantity=100,
+            price_cents=90,
+            account_balance_cents=100_000,
+            market_cap_pct=0.20,
+            city_cap_pct=0.33,
+        )
+        assert allowed == 22  # floor(2000/90) = 22
