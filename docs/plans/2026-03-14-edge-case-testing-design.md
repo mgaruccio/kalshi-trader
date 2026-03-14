@@ -220,11 +220,11 @@ These components have clean interfaces and can be built concurrently:
 | NT test harness | NT test_kit, adapter code | wires real NT infra + fake exchange |
 | Invariant checkers | NT Cache/MessageBus types | assertion functions |
 
-## Open Questions
+## Resolved Questions
 
-- Should the fake exchange support multiple concurrent markets, or is single-market sufficient for initial testing?
-- What initial book states should be seeded? (empty, thin, deep, crossed)
-- Should we run sequence tests in CI on every commit, or only on a schedule (they may be slow at 100 seeds × 50 ops)?
+- **Multiple concurrent markets:** Yes — cross-market testing catches dedup/position bugs that single-market misses. Fake exchange maintains independent books per ticker.
+- **Initial book states:** Empty, thin (1 level each side), deep (5+ levels), one-sided (only YES or only NO bids).
+- **CI cadence:** CT tests run in CI on every commit. Simulation tests (Layer 2+3) are manual/local only for now — not in CI.
 
 ## Next Steps
 
