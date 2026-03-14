@@ -114,6 +114,22 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
     strategy_id: str = "WeatherMaker-001"
 ```
 
+### Best Practices Research (from market making literature and post-mortems)
+
+**External watchdog (CRITICAL for production):** Kalshi has NO cancel-on-disconnect feature. If the trading process crashes, resting orders stay live on the exchange indefinitely. Need a separate `watchdog.py` process that monitors a heartbeat file written every 30s by the strategy. If heartbeat goes stale >60s, watchdog cancels all orders via Kalshi REST API. This is a production deployment requirement, not a strategy code requirement.
+
+**Inventory skew:** The plan's `compute_ladder` places symmetric quantity at each level regardless of existing inventory. Professional market makers skew quotes away from their inventory direction (Avellaneda-Stoikov model). If long NO, decrease bid (discourage more NO accumulation). Add `inventory_skew_factor` to config, adjust anchor price by `inventory * skew_factor` cents. Start with 0 (disabled) and calibrate in backtesting.
+
+**Fill rate realism in backtesting:** NT's default fill model assumes fills at limit price when market trades through. For KXHIGH's 25-contract median depth, this is dangerously optimistic — queue position, market impact, and maker/taker distinction are not modeled. Recommend adding `fill_rate_adjustment: float = 0.5` to backtest config that reduces expected fill quantities proportionally. Calibrate by running live in observation mode for 1-2 weeks.
+
+**reprice_threshold default:** Starting at 1c is too aggressive for 10 writes/sec rate limit. A 1c oscillation triggers 6 API calls (3 cancels + 3 creates = 3.6 tokens). With 10+ active contracts, this exhausts the rate budget. Start at `reprice_threshold=2`.
+
+**Real-world post-mortem reference:** A Kalshi market maker lost $150 in 20 minutes due to miscalibrated sigma parameter that collapsed all spreads to a 2c minimum. Validates the circuit breaker requirement — without a P&L breaker, a bug can drain the account before human intervention. Source: rlafuente.com/posts/2025-3-5-i-lost-150-market-making-on-kalshi
+
+**Stale book protection:** On WebSocket sequence gaps, mark books as "stale" (not empty). Block new quotes until fresh snapshot arrives. The current data client clears ALL books on any gap, which briefly leaves the strategy without price reference.
+
+**Dual-WS health flags:** Strategy should track health of both data WS and execution WS independently. If exec WS is down >10s, cancel all orders via REST as precaution (fills not being processed = position state unknown).
+
 ### Key Pattern Corrections
 
 | Plan Says | Should Be | Reason |
