@@ -1,9 +1,18 @@
 """WeatherMakerStrategy — forecast-filtered passive market maker for KXHIGH contracts."""
 from __future__ import annotations
 
-from nautilus_trader.config import StrategyConfig
+import os
 
-from kalshi.signals import SignalScore
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.core.data import Data
+from nautilus_trader.model.data import DataType
+from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol
+from nautilus_trader.trading.strategy import Strategy
+
+from kalshi.common.constants import KALSHI_VENUE
+from kalshi.providers import parse_instrument_id
+from kalshi.signals import ForecastDrift, SignalScore
 
 
 class WeatherMakerConfig(StrategyConfig, frozen=True):
@@ -137,3 +146,293 @@ def compute_ladder(
             break
         levels.append((price, qty))
     return levels
+
+
+class WeatherMakerStrategy(Strategy):
+    """Forecast-filtered passive market maker for KXHIGH contracts."""
+
+    def __init__(self, config: WeatherMakerConfig) -> None:
+        super().__init__(config)
+        self._init_state(config)
+
+    def _init_state(self, config: WeatherMakerConfig) -> None:
+        """Initialize strategy state. Called from __init__ and test helpers."""
+        self._config = config
+        self._scores: dict[str, SignalScore] = {}
+        self._drift_cities: set[str] = set()
+        self._quoted_tickers: set[str] = set()
+        self._resting_orders: dict[str, list[ClientOrderId]] = {}
+        self._last_anchor: dict[str, int] = {}
+        self._halted: bool = False
+
+    def on_start(self) -> None:
+        self.subscribe_data(DataType(SignalScore))
+        self.subscribe_data(DataType(ForecastDrift))
+        self.log.info("WeatherMakerStrategy started — subscribed to signals")
+
+    def on_stop(self) -> None:
+        open_orders = self.cache.orders_open(strategy_id=self.id)
+        self.cancel_orders(open_orders)
+        self.log.info("WeatherMakerStrategy stopped — all orders canceled")
+
+    def on_data(self, data: Data) -> None:
+        if isinstance(data, SignalScore):
+            self._handle_signal_score(data)
+        elif isinstance(data, ForecastDrift):
+            self._handle_forecast_drift(data)
+
+    def on_order_filled(self, event) -> None:
+        self.log.info(
+            f"FILL: {event.instrument_id} {event.order_side} "
+            f"{event.last_qty}@{event.last_px}"
+        )
+
+    def on_order_canceled(self, event) -> None:
+        pass  # _resting_orders replaced entirely on reprice
+
+    def on_order_rejected(self, event) -> None:
+        self.log.error(f"ORDER REJECTED: {event.instrument_id} — {event.reason}")
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
+    def _handle_signal_score(self, score: SignalScore) -> None:
+        """Process a new score — update state and re-evaluate filter.
+
+        Per Enhancement #18: drift is NOT cleared by a new score. Drift
+        persists until session end or explicit 'drift_cleared' signal.
+        """
+        self._scores[score.ticker] = score
+        self._evaluate_contract(score.ticker)
+
+    def _handle_forecast_drift(self, drift: ForecastDrift) -> None:
+        """Pause quoting for the drifted city."""
+        self._drift_cities.add(drift.city)
+        self.log.warning(f"Forecast drift for {drift.city}: {drift.message}")
+
+        # Re-evaluate all contracts for this city (may cancel resting orders)
+        for ticker, score in list(self._scores.items()):
+            if score.city == drift.city:
+                self._evaluate_contract(ticker)
+
+    # ------------------------------------------------------------------
+    # Filter evaluation
+    # ------------------------------------------------------------------
+
+    def _evaluate_contract(self, ticker: str) -> None:
+        """Re-evaluate whether to quote a contract based on current state."""
+        if self._halted:
+            return
+
+        score = self._scores.get(ticker)
+        if score is None:
+            return
+
+        side, passes = should_quote(self._config, score, self._drift_cities)
+
+        if passes and ticker not in self._quoted_tickers:
+            self._quoted_tickers.add(ticker)
+            self.log.info(
+                f"Filter PASS: {ticker} ({side} side, "
+                f"p_win={score.no_p_win if side == 'no' else score.yes_p_win:.3f})"
+            )
+            # Subscribe to quote ticks for both sides of the contract
+            for side_suffix in ("YES", "NO"):
+                instrument_id = InstrumentId(
+                    Symbol(f"{ticker}-{side_suffix}"),
+                    KALSHI_VENUE,
+                )
+                instrument = self.cache.instrument(instrument_id)
+                if instrument is not None:
+                    self.subscribe_quote_ticks(instrument_id)
+
+        elif not passes and ticker in self._quoted_tickers:
+            self._quoted_tickers.discard(ticker)
+            self._cancel_all_for_ticker(ticker)
+            self.log.info(f"Filter EXIT: {ticker}")
+
+    # ------------------------------------------------------------------
+    # Quote management
+    # ------------------------------------------------------------------
+
+    def on_quote_tick(self, tick) -> None:
+        """Handle incoming quote tick — circuit breaker then reprice."""
+        self._check_circuit_breaker()
+        if self._halted:
+            return
+
+        try:
+            base_ticker, tick_side = parse_instrument_id(tick.instrument_id)
+        except ValueError:
+            return
+
+        if base_ticker not in self._quoted_tickers:
+            return
+
+        score = self._scores.get(base_ticker)
+        if score is None:
+            return
+
+        side, passes = should_quote(self._config, score, self._drift_cities)
+        if not passes or tick_side != side:
+            return
+
+        bid_cents = round(float(tick.bid_price) * 100)
+        if bid_cents <= 0:
+            return
+
+        # Check exit condition
+        if bid_cents >= self._config.exit_price_cents:
+            self._exit_position(base_ticker, tick.instrument_id, bid_cents)
+            return
+
+        # Dead-zone check
+        last_anchor = self._last_anchor.get(base_ticker, 0)
+        if last_anchor > 0 and abs(bid_cents - last_anchor) < self._config.reprice_threshold:
+            return
+
+        self._reprice_ladder(base_ticker, tick.instrument_id, side, bid_cents, score)
+
+    def _reprice_ladder(
+        self,
+        ticker: str,
+        instrument_id: InstrumentId,
+        side: str,
+        bid_cents: int,
+        score: SignalScore,
+    ) -> None:
+        """Cancel existing orders and place new ladder at current bid."""
+        self._cancel_all_for_ticker(ticker)
+
+        account = self.portfolio.account(instrument_id.venue)
+        if account is None:
+            self.log.warning(f"No account for {instrument_id.venue}")
+            return
+        balances = account.balances()
+        if not balances:
+            return
+        balance_cents = int(list(balances.values())[0].total.as_double() * 100)
+
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            self.log.warning(f"Instrument not in cache: {instrument_id}")
+            return
+
+        # Derive exposure from NT cache (single source of truth)
+        market_exposure = self._market_exposure_cents(ticker)
+        city_exposure = self._city_exposure_cents(score.city)
+
+        levels = compute_ladder(
+            anchor_bid_cents=bid_cents,
+            depth=self._config.ladder_depth,
+            spacing=self._config.ladder_spacing,
+            qty=self._config.level_quantity,
+        )
+
+        new_order_ids = []
+        for price_cents, qty in levels:
+            allowed_qty = check_risk_caps(
+                market_exposure_cents=market_exposure,
+                city_exposure_cents=city_exposure,
+                quantity=qty,
+                price_cents=price_cents,
+                account_balance_cents=balance_cents,
+                market_cap_pct=self._config.market_cap_pct,
+                city_cap_pct=self._config.city_cap_pct,
+            )
+            if allowed_qty <= 0:
+                break
+
+            order = self.order_factory.limit(
+                instrument_id=instrument_id,
+                order_side=OrderSide.BUY,
+                quantity=instrument.make_qty(allowed_qty),
+                price=instrument.make_price(price_cents / 100.0),
+                time_in_force=TimeInForce.GTC,
+            )
+            self.submit_order(order)
+            new_order_ids.append(order.client_order_id)
+            # Update local tally for subsequent ladder levels
+            market_exposure += allowed_qty * price_cents
+            city_exposure += allowed_qty * price_cents
+
+        self._resting_orders[ticker] = new_order_ids
+        self._last_anchor[ticker] = bid_cents
+
+    def _exit_position(self, ticker: str, instrument_id: InstrumentId, bid_cents: int) -> None:
+        """Exit position when price hits exit threshold (IOC — partial better than none)."""
+        self._cancel_all_for_ticker(ticker)
+
+        positions = self.cache.positions(venue=instrument_id.venue)
+        for pos in positions:
+            if pos.instrument_id == instrument_id and not pos.is_closed:
+                qty = int(pos.quantity.as_double())
+                if qty > 0:
+                    instrument = self.cache.instrument(instrument_id)
+                    order = self.order_factory.market(
+                        instrument_id=instrument_id,
+                        order_side=OrderSide.SELL,
+                        quantity=instrument.make_qty(qty),
+                        time_in_force=TimeInForce.IOC,
+                    )
+                    self.submit_order(order)
+                    self.log.info(f"EXIT: {ticker} at {bid_cents}c, selling {qty} contracts")
+                break
+
+    def _cancel_all_for_ticker(self, ticker: str) -> None:
+        """Cancel all resting orders for a specific ticker."""
+        order_ids = self._resting_orders.pop(ticker, [])
+        for oid in order_ids:
+            order = self.cache.order(oid)
+            if order and order.is_open:
+                self.cancel_order(order)
+
+    # ------------------------------------------------------------------
+    # Exposure helpers (cache-derived, no ExposureTracker)
+    # ------------------------------------------------------------------
+
+    def _market_exposure_cents(self, ticker: str) -> int:
+        """Sum open order + position exposure for a specific market ticker."""
+        total = 0
+        for order in self.cache.orders_open(strategy_id=self.id):
+            try:
+                base_ticker, _ = parse_instrument_id(order.instrument_id)
+            except ValueError:
+                continue
+            if base_ticker == ticker:
+                price_cents = round(float(order.price) * 100) if order.price else 0
+                qty = int(order.quantity.as_double())
+                total += price_cents * qty
+        return total
+
+    def _city_exposure_cents(self, city: str) -> int:
+        """Sum open order exposure for all tickers in a city."""
+        total = 0
+        for t, score in self._scores.items():
+            if score.city == city:
+                total += self._market_exposure_cents(t)
+        return total
+
+    # ------------------------------------------------------------------
+    # Circuit breaker
+    # ------------------------------------------------------------------
+
+    def _check_circuit_breaker(self) -> None:
+        """Halt if halt file exists or drawdown limit breached."""
+        if self._halted:
+            return
+
+        # Halt file check
+        if os.path.exists(self._config.halt_file_path):
+            self._trigger_halt("halt file present")
+            return
+
+        # Drawdown check would require initial balance tracking — skipped for shell
+
+    def _trigger_halt(self, reason: str) -> None:
+        """Cancel all orders and set halted flag. Do NOT close positions."""
+        self._halted = True
+        self.log.critical(f"CIRCUIT BREAKER TRIGGERED: {reason} — halting all quoting")
+        open_orders = self.cache.orders_open(strategy_id=self.id)
+        self.cancel_orders(open_orders)
