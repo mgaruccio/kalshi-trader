@@ -56,7 +56,8 @@ class TestParseBackfillResponse:
         assert len(scores) == 1
         assert isinstance(scores[0], SignalScore)
         assert scores[0].ticker == "KXHIGHNY-26MAR15-T54"
-        assert scores[0].ts_event > 0  # parsed from timestamp
+        # ts_event must match the exact parsed timestamp, not just be > 0
+        assert scores[0].ts_event == _iso_to_ns("2026-03-14T12:00:00Z")
 
     def test_sorted_by_timestamp(self):
         data = [

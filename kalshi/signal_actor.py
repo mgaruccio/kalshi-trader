@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 
@@ -89,6 +90,7 @@ class SignalActor(Actor):
         super().__init__(config)
         self._config = config
         self._ws_task: asyncio.Task | None = None
+        self._ws: websockets.asyncio.client.ClientConnection | None = None
         self._ws_dead = False  # set by done_callback if task exits unexpectedly
         self._score_data_type = DataType(SignalScore)
         self._drift_data_type = DataType(ForecastDrift)
@@ -101,7 +103,6 @@ class SignalActor(Actor):
         # Enhancement #14: done_callback surfaces silent WS task death
         self._ws_task.add_done_callback(self._on_ws_task_done)
         # Enhancement #12: heartbeat ping every 30s
-        import datetime
         self.clock.set_timer(
             "signal_ping",
             interval=datetime.timedelta(seconds=30),
@@ -119,12 +120,18 @@ class SignalActor(Actor):
         exc = task.exception()
         if exc is not None:
             self._ws_dead = True
-            self.log.error(f"Signal WS task died with exception: {exc}")
+            self.log.critical(f"Signal WS task died with exception: {exc}")
 
     def _send_ping(self, event=None) -> None:
         """Send ping to signal server; track missed pongs (Enhancement #12)."""
         if self._ws_task is None or self._ws_task.done():
             return
+        # Actually send the ping — server responds with pong which decrements _pong_missed
+        if self._ws is not None:
+            asyncio.ensure_future(
+                self._ws.send(json.dumps({"type": "ping"})),
+                loop=self._loop,
+            )
         self._pong_missed += 1
         if self._pong_missed >= 2:
             self.log.warning(
@@ -136,7 +143,7 @@ class SignalActor(Actor):
             self._ws_task.add_done_callback(self._on_ws_task_done)
             self._pong_missed = 0
 
-    async def _bootstrap(self, ws) -> None:
+    async def _bootstrap(self) -> None:
         """Fetch initial scores from REST endpoint and publish.
 
         Enhancement #15: called inside reconnect loop after subscribing.
@@ -160,6 +167,7 @@ class SignalActor(Actor):
     async def _run_ws(self) -> None:
         """Connect to signal server WebSocket and process messages (Enhancement #15: re-bootstrap after reconnect)."""
         async for ws in websockets.asyncio.client.connect(self._config.signal_ws_url):
+            self._ws = ws
             try:
                 subscribe_msg = json.dumps({
                     "type": "subscribe",
@@ -170,7 +178,7 @@ class SignalActor(Actor):
                 self.log.info("Subscribed to signal server [scores, alerts]")
 
                 # Enhancement #15: bootstrap inside reconnect loop
-                await self._bootstrap(ws)
+                await self._bootstrap()
                 self._pong_missed = 0
 
                 async for raw in ws:
@@ -179,6 +187,8 @@ class SignalActor(Actor):
             except Exception as e:
                 self.log.warning(f"Signal server WS error: {e}, reconnecting...")
                 continue
+            finally:
+                self._ws = None
 
     def _handle_ws_message(self, raw: str | bytes) -> None:
         """Route incoming WS message to appropriate handler.

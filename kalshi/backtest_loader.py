@@ -21,7 +21,7 @@ def _iso_to_ns(ts_str: str) -> int:
 def parse_backfill_response(data: list[dict]) -> list[SignalScore]:
     """Parse backfill response into chronologically sorted list of SignalScore events.
 
-    Items that fail validation in parse_score_msg are silently dropped.
+    Items that fail validation in parse_score_msg are logged at WARNING and dropped.
     """
     scores: list[SignalScore] = []
     for item in data:
