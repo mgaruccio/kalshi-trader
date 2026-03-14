@@ -13,6 +13,120 @@
 - `escalate-not-accommodate`: Invoke during error handling implementation — never silently drop financial events
 - `kalshi-weather-markets`: Invoke before Task 4 (quote manager) — KXHIGH microstructure specifics
 - `geek-finance`: Invoke before Task 6 (risk manager) — position sizing, exposure management
+- `kalshi-tails`: Invoke before Task 4 (filter layer) — multi-model consensus, hours-based margins
+
+## Enhancement Summary
+
+**Deepened on:** 2026-03-14
+**Agents used:** 13 (architecture-strategist, security-sentinel, performance-oracle, error-propagation-reviewer, python-reviewer, code-simplicity-reviewer, pattern-recognition-specialist, spec-flow-analyzer, kalshi-tails methodology, kalshi-weather-markets domain, nautilus-testing patterns, framework-docs-researcher, best-practices-researcher)
+
+### Blocking Issues (system won't work without fixes)
+
+1. **Config syntax crash** — `@dataclass(frozen=True)` on msgspec.Struct subclasses (ActorConfig, StrategyConfig) crashes at import. Must use `class Config(StrategyConfig, frozen=True):` keyword form. See `kalshi/config.py` for the correct pattern.
+
+2. **No QuoteTick subscription** — `on_start()` subscribes to SignalScore and ForecastDrift but never calls `subscribe_quote_ticks()`. The strategy will never receive tick data and never place orders. Must add: when `_evaluate_contract()` adds a ticker to `_quoted_tickers`, resolve the instrument from cache and call `self.subscribe_quote_ticks(instrument_id)`. Use `cache.add_instrument()` before subscribing (StreamingFeatherWriter requirement).
+
+3. **ExposureTracker is append-only** — `_exposure.add()` is called at order submission but `remove()` is never called on cancel, fill, or exit. After one reprice cycle, phantom exposure accumulates and `check_risk_caps()` returns 0 for everything. **Resolution: delete ExposureTracker entirely. Derive exposure from `self.cache.positions()` and `self.cache.orders_open()` on each risk check.** This is always correct, eliminates drift by construction, and saves ~60 LOC. The NT cache is the single source of truth for position state.
+
+### Critical Issues (financial risk)
+
+4. **No circuit breaker / kill switch** — No drawdown limit, no daily loss cap, no halt file. Add to config: `max_drawdown_pct: float = 0.15`, `halt_file_path: str = "/tmp/kalshi-halt"`. Check at top of `on_quote_tick()` and `_evaluate_contract()`. On trigger: cancel all orders, set `_halted = True`, log CRITICAL. Do NOT close positions (hold to settlement per kalshi-tails principle).
+
+5. **No model agreement check** — `should_quote()` checks `n_models >= min_models` but ignores spread between models. Add `max_model_spread: float = 0.15` to config. Compute `spread = max(emos_no, ngboost_no, drn_no) - min(emos_no, ngboost_no, drn_no)` (excluding zero values). Reject if spread exceeds threshold. The per-model scores exist in SignalScore but are never used by the filter.
+
+6. **Fire-and-forget WS task** — `self._loop.create_task(self._run_ws())` without `done_callback` means signal pipeline death is silent. Add `self._ws_task.add_done_callback(self._on_ws_task_done)` following the existing pattern at `kalshi/websocket/client.py:121-122`. The callback should log CRITICAL and set a flag the strategy can check.
+
+7. **No re-bootstrap after WS reconnect** — `_bootstrap()` runs once before the WS loop. After reconnect, scores are stale until the next server push. Move `_bootstrap()` inside the reconnect loop, after subscribing.
+
+8. **FOK exit = stuck position on rejection** — If the FOK sell is killed (no liquidity), resting orders are already canceled, position is open, no retry mechanism. Use IOC instead of FOK (partial exit better than no exit), add exit-in-progress flag, retry on next tick if position still open.
+
+9. **Today vs tomorrow contracts** — KXHIGH has two distinct regimes. Tomorrow contracts have 21c mean opening moves, need delayed entry. Add `status: str = ""` and derive cohort from ticker date. Add `tomorrow_min_age_minutes: int = 30` to config. Gate new ladders on tomorrow contracts until price discovery settles.
+
+10. **No time-of-day gating** — Strategy quotes during volatile 10:00-10:30 ET open when spreads are widest. Add `entry_phase_start_et: str = "10:30"` and `entry_phase_end_et: str = "15:00"` to config. Before `entry_phase_start_et`, honor exit logic only.
+
+11. **OmsType mismatch** — Backtest uses `NETTING`, live adapter uses `HEDGING` (YES/NO are separate instruments). Change backtest to `OmsType.HEDGING` to match live, or backtest results are invalid.
+
+### High Priority Issues
+
+12. **Backtest OOM** — `load_catalog_data()` loads entire 23GB catalog. Add `start`/`end` datetime parameters, pass through to `catalog.quote_ticks()` for predicate pushdown. Without this, backtesting is impossible.
+
+13. **Rate limit over-counting** — Cancel operations charge 1.0 token in the execution client but Kalshi's actual cost is 0.2 (per `WRITE_COST_CANCEL` in constants.py). Pass `cost=WRITE_COST_CANCEL` to `acquire()` in `_cancel_order`. This wastes 67% of rate limit capacity.
+
+14. **No input validation** — `parse_score_msg()` trusts all signal server data. Validate: `0 <= p_win <= 1`, `1 <= n_models <= 3`, `0 <= yes_bid <= 99`. Return `None` for invalid messages, log WARNING. Financial system must reject malformed inputs.
+
+15. **No heartbeat/ping** — SignalActor never sends pings to signal server. Add timer in `on_start()` sending `{"type": "ping"}` every 30s. Track pong responses; if 2 missed, close and reconnect.
+
+16. **Contract status missing** — Design doc requires status="open" check but SignalScore has no `status` field. Add `status: str = ""` to SignalScore, capture in `parse_score_msg()`, check in `should_quote()`.
+
+17. **`_handle_ws_message` has no try/except** — Malformed JSON kills the entire WS task permanently. Add try/except around message parsing body (log + continue, not swallow), following `kalshi/data.py` pattern.
+
+18. **Drift auto-clear defeats purpose** — New score immediately clears drift, but drift alerts indicate forecast instability. Remove auto-clear. Let drift persist until session end or explicit signal server "drift_cleared" message.
+
+19. **Fragile ticker parsing** — `on_quote_tick()` uses `rsplit("-", 1)` instead of the existing `parse_instrument_id()` from `kalshi/providers.py`. Reuse the existing utility (DRY, handles format changes).
+
+### Simplification Opportunities (YAGNI)
+
+20. **Drift response modes** — Start with "pause" only. Remove "tighten" and "ignore" modes (speculative, untested). Eliminates `drift_response` and `drift_threshold_delta` config fields, ~25 LOC.
+
+21. **LadderLevel dataclass** — Replace with `tuple[int, int]`. A frozen dataclass wrapping two ints is unnecessary. `compute_ladder()` returns `list[tuple[int, int]]`, caller destructures.
+
+22. **Integration test deferral** — Replace `MockSignalServer` + full integration test with synthetic-data strategy test (feed `SignalScore` + mock QuoteTick directly). Defer full integration to after demo deployment. Saves ~100 LOC of test infrastructure.
+
+23. **Use `self._config` not `self._cfg`** — Match existing adapter convention (`data.py:92`, `execution.py:165`).
+
+24. **`_latest_scores` in SignalActor** — Populated but never read. Remove or document purpose.
+
+25. **`on_dispose` override** — Default no-op exists in Cython base class. Remove `pass` override.
+
+### Additional Config Parameters (from domain skills)
+
+```python
+class WeatherMakerConfig(StrategyConfig, frozen=True):
+    # Filter
+    confidence_threshold: float = 0.95
+    min_models: int = 2
+    max_model_spread: float = 0.15       # NEW: max spread between per-model probabilities
+
+    # Quote ladder
+    ladder_depth: int = 3
+    ladder_spacing: int = 1
+    level_quantity: int = 10
+    reprice_threshold: int = 1
+    max_entry_cents: int = 96            # NEW: hard cap on anchor price (from weather markets skill)
+
+    # Risk
+    market_cap_pct: float = 0.20
+    city_cap_pct: float = 0.33
+
+    # Exit
+    exit_price_cents: int = 97
+
+    # Time-of-day gating
+    entry_phase_start_et: str = "10:30"  # NEW: earliest ET to place ladders
+    entry_phase_end_et: str = "15:00"    # NEW: latest ET to place ladders
+    tomorrow_min_age_minutes: int = 30   # NEW: delay for tomorrow contract entry
+
+    # Circuit breaker
+    max_drawdown_pct: float = 0.15       # NEW: halt if balance drops this fraction
+    halt_file_path: str = "/tmp/kalshi-halt"  # NEW: manual kill switch
+
+    # Strategy identity
+    strategy_id: str = "WeatherMaker-001"
+```
+
+### Key Pattern Corrections
+
+| Plan Says | Should Be | Reason |
+|-----------|-----------|--------|
+| `@dataclass(frozen=True) class Config(StrategyConfig):` | `class Config(StrategyConfig, frozen=True):` | msgspec.Struct keyword form |
+| `self._cfg = config` | `self._config = config` | Match adapter convention |
+| `websockets.WebSocketClientProtocol` | `websockets.asyncio.client.ClientConnection` | Deprecated in websockets v16 |
+| `json.loads(raw)` in SignalActor | msgspec typed decoder | 5-10x faster, consistent with adapter |
+| `TimeInForce.FOK` for exit | `TimeInForce.IOC` | Partial exit > no exit on thin books |
+| `self.cancel_all_orders(self.id)` | Verify NT API — may need `self.cancel_all_orders()` | API may not take strategy_id |
+| `list(balances.values())[0].total` | `account.balance(USD).total` | Explicit currency lookup |
+| `OmsType.NETTING` in backtest | `OmsType.HEDGING` | Match live adapter |
+| Test file `tests/test_integration.py` | `tests/test_maker_integration.py` | File already exists |
 
 ## Context for Executor
 
