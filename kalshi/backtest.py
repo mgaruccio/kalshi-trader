@@ -14,6 +14,7 @@ from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.signals import SignalScore
+from kalshi.strategy import WeatherMakerConfig, WeatherMakerStrategy
 
 
 def build_backtest_engine(
@@ -92,3 +93,42 @@ def load_signal_data(
     """
     if scores:
         engine.add_data(scores, client_id=ClientId("SIGNAL"), sort=False)
+
+
+def run_full_backtest(
+    catalog_path: str | Path,
+    scores: list[SignalScore],
+    strategy_config: WeatherMakerConfig | None = None,
+    starting_balance_usd: int = 10_000,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> tuple[BacktestEngine, WeatherMakerStrategy]:
+    """Orchestrate a complete backtest run.
+
+    Builds the engine, loads catalog and signal data, sorts, adds the strategy,
+    runs, and returns the engine and strategy for results extraction.
+
+    Args:
+        catalog_path: Path to the ParquetDataCatalog directory.
+        scores: Historical SignalScore events (from fetch_backfill / parse).
+        strategy_config: Optional WeatherMakerConfig; uses defaults if None.
+        starting_balance_usd: Starting account balance in USD.
+        start: Optional earliest timestamp for catalog predicate pushdown.
+        end: Optional latest timestamp for catalog predicate pushdown.
+
+    Returns:
+        (engine, strategy) — engine after run(), strategy with diagnostic counters.
+    """
+    engine = build_backtest_engine(starting_balance_usd=starting_balance_usd)
+
+    load_catalog_data(engine, catalog_path, start=start, end=end)
+    load_signal_data(engine, scores)
+    engine.sort_data()
+
+    config = strategy_config or WeatherMakerConfig()
+    strategy = WeatherMakerStrategy(config=config)
+    engine.add_strategy(strategy)
+
+    engine.run()
+
+    return engine, strategy

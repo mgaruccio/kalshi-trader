@@ -199,7 +199,8 @@ class WeatherMakerStrategy(Strategy):
 
     def on_stop(self) -> None:
         open_orders = self.cache.orders_open(strategy_id=self.id)
-        self.cancel_orders(open_orders)
+        if open_orders:
+            self.cancel_orders(open_orders)
         self.log.info("WeatherMakerStrategy stopped — all orders canceled")
 
     def on_data(self, data: Data) -> None:
