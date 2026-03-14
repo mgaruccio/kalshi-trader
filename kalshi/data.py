@@ -1,4 +1,5 @@
 """Kalshi data client — orderbook subscription and QuoteTick emission."""
+
 import asyncio
 import logging
 
@@ -47,12 +48,16 @@ def _derive_quotes(
 
     return {
         "YES": {
-            "bid": yes_bid, "ask": yes_ask,
-            "bid_size": yes_bid_size, "ask_size": yes_ask_size,
+            "bid": yes_bid,
+            "ask": yes_ask,
+            "bid_size": yes_bid_size,
+            "ask_size": yes_ask_size,
         },
         "NO": {
-            "bid": no_bid, "ask": no_ask,
-            "bid_size": no_bid_size, "ask_size": no_ask_size,
+            "bid": no_bid,
+            "ask": no_ask,
+            "bid_size": no_bid_size,
+            "ask_size": no_ask_size,
         },
     }
 

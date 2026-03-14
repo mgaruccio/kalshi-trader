@@ -1,4 +1,5 @@
 """Kalshi WebSocket client wrapping nautilus_pyo3.WebSocketClient."""
+
 import asyncio
 import logging
 
@@ -10,7 +11,9 @@ log = logging.getLogger(__name__)
 
 
 class KalshiWebSocketClient:
-    def __init__(self, clock, base_url, channels, handler, api_key_id, private_key_path, loop):
+    def __init__(
+        self, clock, base_url, channels, handler, api_key_id, private_key_path, loop
+    ):
         self._clock = clock
         self._base_url = base_url
         self._channels = channels
@@ -32,6 +35,7 @@ class KalshiWebSocketClient:
         """Lazily construct KalshiAuth to avoid PEM load at init time."""
         if self._auth is None:
             from kalshi_python.api_client import KalshiAuth
+
             self._auth = KalshiAuth(self._api_key_id, self._private_key_path)
         return self._auth
 
@@ -78,8 +82,14 @@ class KalshiWebSocketClient:
         )
 
     async def _subscribe_all(self) -> None:
+        # Correction #34: user_orders / fill channels don't need market_tickers.
+        # Subscribe whenever there are channels to subscribe to, even with no
+        # tickers (exec client case). Data channels without tickers are no-ops
+        # on the server but harmless.
         async with self._sub_lock:
-            if not self._ws_client or not self._subscribed_tickers:
+            if not self._ws_client or (
+                not self._channels and not self._subscribed_tickers
+            ):
                 return
             cmd = {
                 "id": self._next_cmd_id,

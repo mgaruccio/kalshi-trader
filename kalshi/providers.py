@@ -1,4 +1,5 @@
 """Kalshi instrument provider — loads markets and creates BinaryOption instruments."""
+
 import asyncio
 import logging
 import re
@@ -8,6 +9,7 @@ from decimal import Decimal
 import kalshi_python
 from kalshi_python.api.markets_api import MarketsApi
 
+from nautilus_trader.common.config import InstrumentProviderConfig
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.identifiers import InstrumentId, Symbol
@@ -42,13 +44,15 @@ class KalshiInstrumentProvider(InstrumentProvider):
         private_key_path: str,
         rest_host: str,
     ):
-        super().__init__()
+        # Correction #29: load_all=True so initialize() calls load_all_async()
+        super().__init__(InstrumentProviderConfig(load_all=True))
         self._api_config = kalshi_python.Configuration()
         self._api_config.host = rest_host
         self._api_config.request_timeout = 10  # Correction #19
         self._client = kalshi_python.KalshiClient(self._api_config)
         self._client.set_kalshi_auth(
-            key_id=api_key_id, private_key_path=private_key_path,
+            key_id=api_key_id,
+            private_key_path=private_key_path,
         )
         self._markets_api = MarketsApi(self._client)
 
@@ -93,7 +97,8 @@ class KalshiInstrumentProvider(InstrumentProvider):
         """Create a BinaryOption instrument from a Kalshi market object."""
         ticker = market.ticker
         instrument_id = InstrumentId(
-            Symbol(f"{ticker}-{side}"), KALSHI_VENUE,
+            Symbol(f"{ticker}-{side}"),
+            KALSHI_VENUE,
         )
 
         # Correction #17: Parse observation date from ticker, not close_time
@@ -101,12 +106,21 @@ class KalshiInstrumentProvider(InstrumentProvider):
 
         # Parse expiration from market close_time
         expiration_ns = 0
-        close_time = getattr(market, "close_time", None) or getattr(market, "expiration_time", None)
+        close_time = getattr(market, "close_time", None) or getattr(
+            market, "expiration_time", None
+        )
         if close_time:
             try:
-                dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                # Correction #30: kalshi_python may return close_time as a
+                # datetime object (not a string); handle both forms.
+                if isinstance(close_time, str):
+                    dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                else:
+                    dt = close_time  # already a datetime (possibly naive UTC)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
                 expiration_ns = int(dt.timestamp() * 1_000_000_000)
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError, TypeError):
                 pass
 
         ts_now = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
@@ -148,9 +162,18 @@ class KalshiInstrumentProvider(InstrumentProvider):
             return None
         year, month_str, day = match.groups()  # ticker format: YYMONDD
         months = {
-            "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
-            "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
-            "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+            "JAN": "01",
+            "FEB": "02",
+            "MAR": "03",
+            "APR": "04",
+            "MAY": "05",
+            "JUN": "06",
+            "JUL": "07",
+            "AUG": "08",
+            "SEP": "09",
+            "OCT": "10",
+            "NOV": "11",
+            "DEC": "12",
         }
         month = months.get(month_str)
         if not month:

@@ -4,6 +4,7 @@ Correction #18: Do NOT use lru_cache with credential dict keys.
 Use module-level singleton variable instead.
 Correction #26: Factories pass `name` — constructors must accept it.
 """
+
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 
 from kalshi.config import KalshiDataClientConfig, KalshiExecClientConfig
@@ -35,7 +36,9 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
         from kalshi.data import KalshiDataClient  # deferred to avoid circular import
 
         provider = get_kalshi_instrument_provider(
-            config.api_key_id, config.private_key_path, config.rest_url,
+            config.api_key_id,
+            config.private_key_path,
+            config.rest_url,
         )
         return KalshiDataClient(
             loop=loop,
@@ -51,10 +54,14 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
 class KalshiLiveExecClientFactory(LiveExecClientFactory):
     @staticmethod
     def create(loop, name, config, msgbus, cache, clock):
-        from kalshi.execution import KalshiExecutionClient  # deferred to avoid circular import
+        from kalshi.execution import (
+            KalshiExecutionClient,
+        )  # deferred to avoid circular import
 
         provider = get_kalshi_instrument_provider(
-            config.api_key_id, config.private_key_path, config.rest_url,
+            config.api_key_id,
+            config.private_key_path,
+            config.rest_url,
         )
         return KalshiExecutionClient(
             loop=loop,
