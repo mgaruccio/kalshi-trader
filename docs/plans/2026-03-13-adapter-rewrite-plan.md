@@ -11,7 +11,7 @@
 **Required Skills:**
 - `forge:writing-tests`: Invoke before every test-writing step — covers assertion quality, edge case selection
 - `forge:verification-before-completion`: Invoke before any milestone — verify test output before claiming success
-- `forge:nautilus-testing`: Invoke before Tasks 12, 16, 20 — covers NT Cython mocking, `--noconftest`, test stubs (TestComponentStubs, TestIdStubs)
+- `forge:nautilus-testing`: Invoke before Phase 3 (instrument provider) and Phase 4 (clients) — covers NT Cython mocking, `--noconftest`, test stubs (TestComponentStubs, TestIdStubs)
 
 ## Enhancement Summary (from 10-agent parallel review)
 
@@ -56,7 +56,7 @@
 2. **Two WebSocket connections** — one for market data, one for user data. **CRITICAL: Must tear down and rebuild with fresh RSA-PSS auth headers on reconnect** (timestamps expire).
 3. **Settlement fills must trigger position reconciliation** — not just be skipped. Call `generate_position_status_reports()` to sync state.
 4. **msgspec is already a dependency** of nautilus-trader. Do NOT add it to pyproject.toml.
-5. **msgspec union types do NOT work** for Kalshi's nested envelope. Use `msgspec.Raw` two-pass decode (see Task 5).
+5. **msgspec union types do NOT work** for Kalshi's nested envelope. Use `msgspec.Raw` two-pass decode (see Phase 2, Task 3).
 6. **`@property` works on frozen msgspec Structs** — verified against NT's `NautilusConfig` base class.
 
 ### Key Imports (verified from installed NT 1.224.0)
@@ -195,7 +195,93 @@ finally:
 
 ---
 
-## Task 1: Archive existing code and set up package structure
+## Execution Protocol
+
+> **For Claude (leader):** You are the coordinator. You NEVER write code. You spawn
+> a team, dispatch tasks to the dev agent, dispatch reviews to reviewer agents,
+> and present milestones to the user. Use `forge:executing-plans` skill.
+
+### Team Composition
+
+| Role | Agent | Model | Responsibility |
+|------|-------|-------|----------------|
+| **Leader** | You (opus) | opus | Coordinate, dispatch, present milestones. NEVER implement. |
+| **Developer** | `dev-1` | sonnet | Implement tasks, write tests, commit. Fix review findings. |
+| **Spec Reviewer** | `spec-reviewer` | sonnet | Verify implementation matches spec. Sequential after dev commits. |
+| **Quality Reviewer** | `quality-reviewer` | sonnet | Verify code quality. Sequential after spec reviewer passes. |
+
+### Team Setup
+
+```
+TeamCreate({ team_name: "kalshi-adapter" })
+
+Agent({
+  team_name: "kalshi-adapter",
+  name: "dev-1",
+  model: "sonnet",
+  subagent_type: "general-purpose",
+  prompt: "[developer prompt template from executing-plans/references/developer-prompt.md]",
+  run_in_background: true
+})
+```
+
+### Pipeline Flow
+
+```
+Dev implements Task 1 → commits → Task 1 goes to spec-reviewer (background)
+Dev implements Task 2 → commits → Task 2 goes to spec-reviewer (background)
+                                   Task 1 spec passes → goes to quality-reviewer (background)
+Dev implements Task 3 → commits → ...
+                                   Task 1 quality passes → Task 1 APPROVED
+                                   Task 2 spec fails → dev gets Task 2 back for fixes
+MILESTONE: All tasks in phase must have both reviewers "Approved" before presenting to user
+```
+
+### Review Pipeline (per completed task)
+
+1. Dev commits Task N
+2. Leader spawns spec-reviewer on Task N (background):
+   ```
+   Agent({
+     description: "Spec review Task N",
+     subagent_type: "general-purpose",
+     model: "sonnet",
+     run_in_background: true,
+     prompt: "[spec reviewer prompt with task requirements + validation pointers]"
+   })
+   ```
+3. On spec-reviewer completion:
+   - If "Approved" → spawn quality-reviewer (background)
+   - If issues → assign back to dev via SendMessage, re-review after fixes
+4. On quality-reviewer completion:
+   - If "Approved" → Task N fully approved
+   - If issues → assign back to dev via SendMessage, re-review after fixes
+
+Dev does NOT wait. Dev picks up the next task immediately after committing.
+
+### Milestone Gates
+
+At each milestone, the leader:
+1. Waits for ALL reviews in the phase to reach "Approved" status
+2. Collects all review findings and resolutions
+3. Presents to user: what was built, review outcomes, test results
+4. Says: "Here's where we are — thoughts before I continue?"
+5. **DOES NOT dispatch the next phase's tasks until user responds**
+
+### Re-assignment on Review Failure
+
+When a reviewer finds issues:
+1. Leader routes the findings to dev-1 via SendMessage
+2. Dev-1 fixes the issues and re-commits
+3. Leader re-dispatches the same reviewer
+4. This loop continues until "Approved"
+5. Dev-1 may be working on a later task when pulled back — that's fine, the task system tracks priority
+
+---
+
+## Phase 1: Foundation
+
+### Task 1: Archive existing code and set up package structure
 
 **Files:**
 - Move to `archive/`: `adapter.py`, `weather_strategy.py`, `feature_actor.py`, `evaluator.py`, `exit_rules.py`, `shared_features.py`, `backtest_runner.py`, `strategy.py`, `main.py`, `cli.py`, `db.py`, `data_types.py`, `api.py`, all `test_*.py` files
@@ -237,7 +323,7 @@ git commit -m "chore: archive strategy/ML code, scaffold kalshi adapter package"
 
 ---
 
-## Task 2: Implement constants and errors modules
+### Task 2: Implement constants and errors modules
 
 **Files:**
 - Create: `kalshi/common/constants.py`
@@ -270,7 +356,7 @@ def test_base_urls_are_strings():
 **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest tests/test_constants.py -v
+pytest tests/test_constants.py --noconftest -v
 ```
 
 Expected: `ModuleNotFoundError: No module named 'kalshi.common.constants'` (file doesn't exist yet)
@@ -297,8 +383,8 @@ WRITE_COST_CREATE = 1.0
 WRITE_COST_CANCEL = 0.2
 WRITE_COST_AMEND = 1.0
 
-# Max batch sizes (API limit)
-MAX_BATCH_CREATE = 20
+# Max batch sizes (rate-limit-safe: 9 orders × 1 write each = 9 writes/sec < 10 limit)
+MAX_BATCH_CREATE = 9
 MAX_BATCH_CANCEL = 20
 ```
 
@@ -366,7 +452,7 @@ def should_retry(exc: BaseException) -> bool:
 **Step 6: Run all tests**
 
 ```bash
-pytest tests/test_constants.py tests/test_errors.py -v
+pytest tests/test_constants.py tests/test_errors.py --noconftest -v
 ```
 
 Expected: All PASS
@@ -380,24 +466,28 @@ git commit -m "feat(kalshi): add constants and error handling modules"
 
 ---
 
-## Task 3: Review Tasks 1-2
+### Phase 1 Review Gate
 
-**Spec Review — verify these specific items:**
+After dev commits Tasks 1-2, dispatch both reviewers sequentially per task.
+
+**Spec Reviewer — verify these specific items:**
 - [ ] All archived files exist in `archive/` — `ls archive/` should show all files from the move list
 - [ ] No strategy/ML imports remain at top level — `ls *.py` should show only `collector.py`, `check_orders.py`, `get_schemas.py` (and any untracked test files that weren't committed)
 - [ ] `kalshi/` package structure matches the design doc file tree
 - [ ] `KALSHI_VENUE.value` equals `"KALSHI"` (not `"Kalshi"` or `"kalshi"`)
 - [ ] `should_retry()` returns `True` for status 429, 500, 502, 503 — returns `False` for 400, 401, 403, 404
 - [ ] All `__init__.py` files exist: `kalshi/`, `kalshi/common/`, `kalshi/websocket/`, `tests/`
+- [ ] **Correction #5**: `MAX_BATCH_CREATE` is `9`, not `20`
+- [ ] **Correction #12**: All `pytest` commands use `--noconftest`
 
-**Code Quality Review — verify these specific items:**
+**Quality Reviewer — verify these specific items:**
 - [ ] No hardcoded URLs outside `constants.py`
 - [ ] `should_retry()` handles both `ApiException` and `KalshiApiError` (two different exception types)
 - [ ] Tests assert on specific values, not just `assert result` or `assert result is not None`
 
 ---
 
-## Task 4: Milestone — Project reset and foundation
+### Milestone 1: Project reset and foundation
 
 **Present to user:**
 - All strategy/ML code archived to `archive/`
@@ -405,12 +495,15 @@ git commit -m "feat(kalshi): add constants and error handling modules"
 - Constants module with venue, URLs, rate limit costs
 - Error handling with retry logic for 429/5xx
 - Test results for constants and errors
+- Review outcomes and any findings resolved
 
-**Wait for user response before proceeding to Task 5.**
+**DOES NOT dispatch Phase 2 tasks until user responds.**
 
 ---
 
-## Task 5: Implement WebSocket message schemas (msgspec)
+## Phase 2: WebSocket Layer
+
+### Task 3: Implement WebSocket message schemas (msgspec)
 
 **Files:**
 - Create: `kalshi/websocket/types.py`
@@ -424,11 +517,11 @@ Create `tests/test_ws_types.py`:
 import msgspec
 
 from kalshi.websocket.types import (
-    OrderbookSnapshot,
-    OrderbookDelta,
+    OrderbookSnapshotMsg,
+    OrderbookDeltaMsg,
     UserOrderMsg,
     FillMsg,
-    WsMessage,
+    decode_ws_msg,
 )
 
 
@@ -448,15 +541,15 @@ SNAPSHOT_JSON = b'''{
 
 
 def test_decode_orderbook_snapshot():
-    msg = msgspec.json.decode(SNAPSHOT_JSON, type=WsMessage)
-    assert msg.type == "orderbook_snapshot"
-    assert msg.sid == 2
-    assert msg.seq == 1
-    snap = msg.msg
-    assert snap.market_ticker == "KXHIGHCHI-26MAR14-T55"
-    assert len(snap.yes_dollars_fp) == 2
-    assert snap.yes_dollars_fp[0] == ["0.3200", "5.00"]
-    assert len(snap.no_dollars_fp) == 1
+    msg_type, sid, seq, msg = decode_ws_msg(SNAPSHOT_JSON)
+    assert msg_type == "orderbook_snapshot"
+    assert sid == 2
+    assert seq == 1
+    assert isinstance(msg, OrderbookSnapshotMsg)
+    assert msg.market_ticker == "KXHIGHCHI-26MAR14-T55"
+    assert len(msg.yes_dollars_fp) == 2
+    assert msg.yes_dollars_fp[0] == ["0.3200", "5.00"]
+    assert len(msg.no_dollars_fp) == 1
 
 
 # -- Orderbook Delta --
@@ -475,11 +568,12 @@ DELTA_JSON = b'''{
 
 
 def test_decode_orderbook_delta():
-    msg = msgspec.json.decode(DELTA_JSON, type=WsMessage)
-    assert msg.type == "orderbook_delta"
-    assert msg.msg.side == "yes"
-    assert msg.msg.price_dollars == "0.3200"
-    assert msg.msg.delta_fp == "-5.00"
+    msg_type, sid, seq, msg = decode_ws_msg(DELTA_JSON)
+    assert msg_type == "orderbook_delta"
+    assert isinstance(msg, OrderbookDeltaMsg)
+    assert msg.side == "yes"
+    assert msg.price_dollars == "0.3200"
+    assert msg.delta_fp == "-5.00"
 
 
 # -- User Order --
@@ -502,12 +596,13 @@ USER_ORDER_JSON = b'''{
 
 
 def test_decode_user_order():
-    msg = msgspec.json.decode(USER_ORDER_JSON, type=WsMessage)
-    assert msg.type == "user_order"
-    assert msg.msg.order_id == "uuid-123"
-    assert msg.msg.status == "resting"
-    assert msg.msg.side == "yes"
-    assert msg.msg.remaining_count_fp == "10.00"
+    msg_type, sid, seq, msg = decode_ws_msg(USER_ORDER_JSON)
+    assert msg_type == "user_order"
+    assert isinstance(msg, UserOrderMsg)
+    assert msg.order_id == "uuid-123"
+    assert msg.status == "resting"
+    assert msg.side == "yes"
+    assert msg.remaining_count_fp == "10.00"
 
 
 # -- Fill --
@@ -534,14 +629,15 @@ FILL_JSON = b'''{
 
 
 def test_decode_fill():
-    msg = msgspec.json.decode(FILL_JSON, type=WsMessage)
-    assert msg.type == "fill"
-    assert msg.msg.trade_id == "trade-uuid"
-    assert msg.msg.market_ticker == "KXHIGHCHI-26MAR14-T55"
-    assert msg.msg.count_fp == "5.00"
-    assert msg.msg.fee_cost == "0.0056"
-    assert msg.msg.is_taker is False
-    assert msg.msg.ts == 1703123456
+    msg_type, sid, seq, msg = decode_ws_msg(FILL_JSON)
+    assert msg_type == "fill"
+    assert isinstance(msg, FillMsg)
+    assert msg.trade_id == "trade-uuid"
+    assert msg.market_ticker == "KXHIGHCHI-26MAR14-T55"
+    assert msg.count_fp == "5.00"
+    assert msg.fee_cost == "0.0056"
+    assert msg.is_taker is False
+    assert msg.ts == 1703123456
 
 
 # -- Settlement fill (no ticker) --
@@ -565,9 +661,10 @@ SETTLEMENT_FILL_JSON = b'''{
 
 
 def test_settlement_fill_has_no_ticker():
-    msg = msgspec.json.decode(SETTLEMENT_FILL_JSON, type=WsMessage)
-    assert msg.type == "fill"
-    assert msg.msg.market_ticker is None  # settlement fills omit ticker
+    msg_type, sid, seq, msg = decode_ws_msg(SETTLEMENT_FILL_JSON)
+    assert msg_type == "fill"
+    assert isinstance(msg, FillMsg)
+    assert msg.market_ticker is None  # settlement fills omit ticker
 
 
 # -- Edge: delta_fp of "0.00" means remove level --
@@ -586,27 +683,29 @@ DELTA_REMOVE_JSON = b'''{
 
 
 def test_delta_zero_means_remove():
-    msg = msgspec.json.decode(DELTA_REMOVE_JSON, type=WsMessage)
-    assert float(msg.msg.delta_fp) == 0.0
+    msg_type, sid, seq, msg = decode_ws_msg(DELTA_REMOVE_JSON)
+    assert isinstance(msg, OrderbookDeltaMsg)
+    assert float(msg.delta_fp) == 0.0
 ```
 
 **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest tests/test_ws_types.py -v
+pytest tests/test_ws_types.py --noconftest -v
 ```
 
 Expected: `ModuleNotFoundError`
 
 **Step 3: Implement WebSocket message schemas**
 
-Write `kalshi/websocket/types.py`:
+Write `kalshi/websocket/types.py` using the `msgspec.Raw` two-pass decode pattern (NOT union types — see Correction #1):
+
 ```python
 """msgspec schema classes for Kalshi WebSocket messages.
 
-All fields use the exact names from the Kalshi WS API.
-Optional fields are typed as such to handle settlement fills
-and other edge cases where fields may be absent.
+Uses msgspec.Raw two-pass decode: first pass extracts the envelope (type, sid, seq),
+second pass decodes the inner msg based on the type field. This avoids the union-of-Structs
+crash documented in Correction #1.
 """
 import msgspec
 
@@ -645,7 +744,10 @@ class UserOrderMsg(msgspec.Struct):
 
 
 class FillMsg(msgspec.Struct):
-    """Fill notification."""
+    """Fill notification.
+
+    NOTE: no_price_dollars appears exactly ONCE (Correction #23).
+    """
     trade_id: str
     order_id: str
     side: str
@@ -658,67 +760,50 @@ class FillMsg(msgspec.Struct):
     yes_price_dollars: str | None = None
     no_price_dollars: str | None = None
     fee_cost: str | None = None
-    no_price_dollars: str | None = None
 
 
-class WsMessage(msgspec.Struct):
-    """Top-level WebSocket message envelope."""
+class WsEnvelope(msgspec.Struct):
+    """First-pass envelope — msg is raw bytes for deferred decoding."""
     type: str
     sid: int = 0
     seq: int = 0
-    msg: (
-        OrderbookSnapshotMsg
-        | OrderbookDeltaMsg
-        | UserOrderMsg
-        | FillMsg
-        | dict  # fallback for unknown message types
-    ) = {}
-```
+    msg: msgspec.Raw = msgspec.Raw(b"{}")
 
-Note: The `WsMessage.msg` union type may need adjustment depending on how `msgspec` handles tagged unions. If decoding fails because msgspec can't distinguish between the union members, you'll need to decode `msg` as `dict` first and then decode the inner type based on the `type` field. Test this — if the union approach doesn't work, switch to:
 
-```python
-class WsMessage(msgspec.Struct):
-    type: str
-    sid: int = 0
-    seq: int = 0
-    msg: dict = {}  # manually decode based on type field
-```
-
-And add decoder helper:
-```python
-_DECODERS = {
+# Per-type decoders (created once, reused)
+_DECODERS: dict[str, msgspec.json.Decoder] = {
     "orderbook_snapshot": msgspec.json.Decoder(OrderbookSnapshotMsg),
     "orderbook_delta": msgspec.json.Decoder(OrderbookDeltaMsg),
     "user_order": msgspec.json.Decoder(UserOrderMsg),
     "fill": msgspec.json.Decoder(FillMsg),
 }
 
+_ENVELOPE_DECODER = msgspec.json.Decoder(WsEnvelope)
+
 
 def decode_ws_msg(raw: bytes) -> tuple[str, int, int, object]:
-    """Decode a raw WS message. Returns (type, sid, seq, typed_msg)."""
-    envelope = msgspec.json.decode(raw)  # dict
-    msg_type = envelope.get("type", "")
-    sid = envelope.get("sid", 0)
-    seq = envelope.get("seq", 0)
-    inner = envelope.get("msg", {})
-    decoder = _DECODERS.get(msg_type)
-    if decoder is not None:
-        typed_msg = decoder.decode(msgspec.json.encode(inner))
-    else:
-        typed_msg = inner
-    return msg_type, sid, seq, typed_msg
-```
+    """Decode a raw WS message using two-pass decode.
 
-Update the tests to use whichever approach works. The key requirement is: every test fixture must parse successfully and fields must be accessible by name.
+    Returns (type, sid, seq, typed_msg).
+    typed_msg is the decoded inner message (OrderbookSnapshotMsg, etc.)
+    or the raw dict if the type is unknown.
+    """
+    envelope = _ENVELOPE_DECODER.decode(raw)
+    decoder = _DECODERS.get(envelope.type)
+    if decoder is not None:
+        typed_msg = decoder.decode(envelope.msg)
+    else:
+        typed_msg = msgspec.json.decode(envelope.msg)
+    return envelope.type, envelope.sid, envelope.seq, typed_msg
+```
 
 **Step 4: Run tests**
 
 ```bash
-pytest tests/test_ws_types.py -v
+pytest tests/test_ws_types.py --noconftest -v
 ```
 
-Expected: All PASS. If union type decoding fails, switch to the `decode_ws_msg()` approach and update tests.
+Expected: All PASS.
 
 **Step 5: Commit**
 
@@ -729,7 +814,7 @@ git commit -m "feat(kalshi): add msgspec schemas for WebSocket messages"
 
 ---
 
-## Task 6: Implement WebSocket client wrapper
+### Task 4: Implement WebSocket client wrapper
 
 **Files:**
 - Create: `kalshi/websocket/client.py`
@@ -812,7 +897,7 @@ def test_sequence_gap_detected(mock_clock):
 **Step 2: Run tests to verify they fail**
 
 ```bash
-pytest tests/test_ws_client.py -v
+pytest tests/test_ws_client.py --noconftest -v
 ```
 
 **Step 3: Implement WebSocket client**
@@ -823,13 +908,13 @@ Write `kalshi/websocket/client.py`:
 
 Handles:
 - Auth header generation via KalshiAuth
-- Channel subscription management
-- Sequence number gap detection
-- Reconnection with resubscription
+- Channel subscription management with asyncio.Lock (Correction #25)
+- Sequence number gap detection (Correction #7)
+- Reconnection with fresh auth headers (Correction #2) and resubscription
+- Tracked tasks for reconnect handler (Correction #11)
 """
 import asyncio
 import logging
-import time
 
 import msgspec
 
@@ -858,12 +943,15 @@ class KalshiWebSocketClient:
         self._channels = channels
         self._handler = handler
         self._loop = loop
+        self._api_key_id = api_key_id
+        self._private_key_path = private_key_path
         self._auth = KalshiAuth(api_key_id, private_key_path)
 
         self._ws_client: WebSocketClient | None = None
         self._subscribed_tickers: set[str] = set()
         self._seq_tracker: dict[int, int] = {}  # sid -> last_seq
         self._next_cmd_id = 1
+        self._sub_lock = asyncio.Lock()  # Correction #25
 
     def add_ticker(self, ticker: str) -> None:
         """Register a ticker for subscription (or resubscription on reconnect)."""
@@ -873,7 +961,10 @@ class KalshiWebSocketClient:
         self._subscribed_tickers.discard(ticker)
 
     def _check_sequence(self, sid: int, seq: int) -> bool:
-        """Track sequence numbers per subscription. Returns False on gap."""
+        """Track sequence numbers per subscription. Returns False on gap.
+
+        Correction #7: caller must clear local book and resubscribe on False.
+        """
         last = self._seq_tracker.get(sid)
         self._seq_tracker[sid] = seq
         if last is None:
@@ -884,15 +975,22 @@ class KalshiWebSocketClient:
         return True
 
     async def connect(self) -> None:
-        """Connect to Kalshi WebSocket with auth headers."""
+        """Connect to Kalshi WebSocket with fresh auth headers."""
+        await self._build_and_connect()
+        await self._subscribe_all()
+
+    async def _build_and_connect(self) -> None:
+        """Build a new WebSocketClient with fresh RSA-PSS auth headers.
+
+        Correction #2: Must generate fresh headers each time (timestamps expire).
+        """
         headers = self._auth.create_auth_headers("GET", "/trade-api/ws/v2")
-        # KalshiAuth returns a dict; WebSocketConfig expects list of tuples
         header_list = [(k, v) for k, v in headers.items()]
 
         config = WebSocketConfig(
             url=self._base_url,
             headers=header_list,
-            heartbeat=None,  # Kalshi has no heartbeat requirement
+            heartbeat=None,
             reconnect_timeout_ms=10_000,
             reconnect_delay_initial_ms=2_000,
             reconnect_delay_max_ms=30_000,
@@ -906,47 +1004,64 @@ class KalshiWebSocketClient:
             post_reconnection=self._on_reconnect,
         )
 
-        # Subscribe to channels for all registered tickers
-        await self._subscribe_all()
-
     async def _subscribe_all(self) -> None:
         """Send subscribe commands for all registered tickers and channels."""
-        if not self._ws_client or not self._subscribed_tickers:
-            return
+        async with self._sub_lock:
+            if not self._ws_client or not self._subscribed_tickers:
+                return
 
-        tickers = list(self._subscribed_tickers)
-        cmd = {
-            "id": self._next_cmd_id,
-            "cmd": "subscribe",
-            "params": {
-                "channels": self._channels,
-                "market_tickers": tickers,
-            },
-        }
-        self._next_cmd_id += 1
-        await self._ws_client.send_text(msgspec.json.encode(cmd))
-        log.info(f"Subscribed to {self._channels} for {len(tickers)} tickers")
-
-    async def subscribe_ticker(self, ticker: str) -> None:
-        """Subscribe to a single ticker (for dynamic subscription after connect)."""
-        self.add_ticker(ticker)
-        if self._ws_client:
+            tickers = list(self._subscribed_tickers)
             cmd = {
                 "id": self._next_cmd_id,
                 "cmd": "subscribe",
                 "params": {
                     "channels": self._channels,
-                    "market_tickers": [ticker],
+                    "market_tickers": tickers,
                 },
             }
             self._next_cmd_id += 1
             await self._ws_client.send_text(msgspec.json.encode(cmd))
+            log.info(f"Subscribed to {self._channels} for {len(tickers)} tickers")
+
+    async def subscribe_ticker(self, ticker: str) -> None:
+        """Subscribe to a single ticker (for dynamic subscription after connect)."""
+        self.add_ticker(ticker)
+        async with self._sub_lock:
+            if self._ws_client:
+                cmd = {
+                    "id": self._next_cmd_id,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": self._channels,
+                        "market_tickers": [ticker],
+                    },
+                }
+                self._next_cmd_id += 1
+                await self._ws_client.send_text(msgspec.json.encode(cmd))
 
     def _on_reconnect(self) -> None:
-        """Called after WebSocketClient auto-reconnects. Resubscribe all."""
-        self._seq_tracker.clear()  # Reset sequence tracking
-        log.info("WebSocket reconnected, resubscribing...")
-        asyncio.ensure_future(self._subscribe_all())
+        """Called after WebSocketClient auto-reconnects.
+
+        Correction #2: Tear down and rebuild with fresh auth headers.
+        Correction #11: Use tracked task with done_callback, not fire-and-forget.
+        """
+        self._seq_tracker.clear()
+        log.info("WebSocket reconnected, rebuilding with fresh auth...")
+        task = asyncio.ensure_future(self._rebuild_and_resubscribe())
+        task.add_done_callback(self._reconnect_done)
+
+    async def _rebuild_and_resubscribe(self) -> None:
+        """Tear down current connection and rebuild with fresh auth headers."""
+        if self._ws_client:
+            await self._ws_client.disconnect()
+        await self._build_and_connect()
+        await self._subscribe_all()
+
+    @staticmethod
+    def _reconnect_done(task: asyncio.Task) -> None:
+        """Log any errors from the reconnect task."""
+        if task.exception():
+            log.error(f"Reconnect failed: {task.exception()}")
 
     async def disconnect(self) -> None:
         if self._ws_client:
@@ -961,7 +1076,7 @@ class KalshiWebSocketClient:
 **Step 4: Run tests**
 
 ```bash
-pytest tests/test_ws_client.py -v
+pytest tests/test_ws_client.py --noconftest -v
 ```
 
 **Step 5: Commit**
@@ -973,36 +1088,47 @@ git commit -m "feat(kalshi): add WebSocket client wrapper with sequence tracking
 
 ---
 
-## Task 7: Review Tasks 5-6
+### Phase 2 Review Gate
 
-**Spec Review — verify these specific items:**
+**Spec Reviewer — verify these specific items:**
 - [ ] Every Kalshi WS message type has a test fixture: `orderbook_snapshot`, `orderbook_delta`, `user_order`, `fill`, settlement fill (no ticker)
+- [ ] **Correction #1**: Uses `msgspec.Raw` two-pass decode via `WsEnvelope` + `_DECODERS` dict, NOT union type
+- [ ] **Correction #23**: `FillMsg` has NO duplicate `no_price_dollars` field — exactly one occurrence
 - [ ] `FillMsg.market_ticker` is `Optional[str]` — not required — so settlement fills parse without error
 - [ ] `FillMsg.fee_cost` is `Optional[str]` — Kalshi may omit it on settlement fills
 - [ ] `OrderbookSnapshotMsg.yes_dollars_fp` is `list[list[str]]` not `list[tuple[str, str]]` (JSON arrays decode as lists)
-- [ ] Sequence gap detection in `KalshiWebSocketClient._check_sequence()` returns `False` on gap, `True` on sequential
-- [ ] Reconnection handler (`_on_reconnect`) clears sequence tracker and resubscribes all tickers
+- [ ] **Correction #7**: Sequence gap detection in `_check_sequence()` returns `False` on gap, `True` on sequential
+- [ ] **Correction #2**: `_on_reconnect` tears down and rebuilds client with fresh auth headers (not just resubscribes)
+- [ ] **Correction #25**: `asyncio.Lock` on subscription management (`_sub_lock`)
+- [ ] **Correction #11**: Reconnect handler uses tracked task with `done_callback`, not bare `asyncio.ensure_future`
 - [ ] Auth headers are generated via `KalshiAuth.create_auth_headers("GET", "/trade-api/ws/v2")` with correct method and path
 
-**Code Quality Review — verify these specific items:**
+**Quality Reviewer — verify these specific items:**
 - [ ] `WebSocketConfig.headers` receives `list[tuple[str, str]]` (not dict) — check that conversion from `KalshiAuth` dict output is correct
 - [ ] `send_text` receives `bytes` (from `msgspec.json.encode`) not `str`
-- [ ] No duplicate `no_price_dollars` field in `FillMsg` (there's a typo risk in the schema — check for duplicate field names)
+- [ ] **Correction #12**: All `pytest` commands use `--noconftest`
 
 ---
 
-## Task 8: Milestone — WebSocket foundation
+### Milestone 2: WebSocket foundation
 
 **Present to user:**
 - msgspec schemas for all WS message types with test fixtures
+- Two-pass `msgspec.Raw` decode pattern (not union types)
 - WebSocket client wrapper with sequence tracking and reconnection
+- Fresh auth header rebuild on reconnect
 - Test results
+- Review outcomes and any findings resolved
 
-**Wait for user response before proceeding to Task 9.**
+**DOES NOT dispatch Phase 3 tasks until user responds.**
 
 ---
 
-## Task 9: Implement instrument provider
+## Phase 3: Instrument & Config
+
+> **Before starting:** Invoke `forge:nautilus-testing` skill — covers NT config/factory/provider patterns.
+
+### Task 5: Implement instrument provider
 
 **Files:**
 - Create: `kalshi/providers.py`
@@ -1068,7 +1194,6 @@ def _mock_market(ticker="KXHIGHCHI-26MAR14-T55", status="active"):
 
 def test_build_instrument_creates_binary_option():
     provider = KalshiInstrumentProvider.__new__(KalshiInstrumentProvider)
-    # Bypass __init__ — we just want to test _build_instrument
     instrument = provider._build_instrument(_mock_market(), "YES")
     assert isinstance(instrument, BinaryOption)
     assert instrument.id == InstrumentId(Symbol("KXHIGHCHI-26MAR14-T55-YES"), KALSHI_VENUE)
@@ -1084,6 +1209,22 @@ def test_build_instrument_no_side():
     instrument = provider._build_instrument(_mock_market(), "NO")
     assert instrument.id == InstrumentId(Symbol("KXHIGHCHI-26MAR14-T55-NO"), KALSHI_VENUE)
     assert instrument.outcome == "No"
+
+
+def test_build_instrument_description_is_none_not_empty():
+    """Correction #15: BinaryOption.description must be None, not empty string."""
+    provider = KalshiInstrumentProvider.__new__(KalshiInstrumentProvider)
+    market = _mock_market()
+    market.title = None  # simulate missing title
+    instrument = provider._build_instrument(market, "YES")
+    assert instrument.description is None
+
+
+def test_build_instrument_observation_date_from_ticker():
+    """Correction #17: Observation date comes from ticker, not close_time."""
+    provider = KalshiInstrumentProvider.__new__(KalshiInstrumentProvider)
+    instrument = provider._build_instrument(_mock_market(), "YES")
+    assert instrument.info.get("observation_date") is not None
 ```
 
 **Step 2: Implement**
@@ -1094,6 +1235,7 @@ Write `kalshi/providers.py`:
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -1138,6 +1280,7 @@ class KalshiInstrumentProvider(InstrumentProvider):
         super().__init__()
         self._api_config = kalshi_python.Configuration()
         self._api_config.host = rest_host
+        self._api_config.request_timeout = 10  # Correction #19
         self._client = kalshi_python.KalshiClient(self._api_config)
         self._client.set_kalshi_auth(
             key_id=api_key_id, private_key_path=private_key_path,
@@ -1148,7 +1291,10 @@ class KalshiInstrumentProvider(InstrumentProvider):
         self,
         filters: dict | None = None,
     ) -> None:
-        """Load instruments from Kalshi API. Filters: series_ticker, status, event_ticker."""
+        """Load instruments from Kalshi API. Filters: series_ticker, status, event_ticker.
+
+        Correction #21: Loading failures are fatal — do not catch. Let propagate.
+        """
         await asyncio.to_thread(self._load_all_sync, filters)
 
     def _load_all_sync(self, filters: dict | None = None) -> None:
@@ -1185,6 +1331,9 @@ class KalshiInstrumentProvider(InstrumentProvider):
             Symbol(f"{ticker}-{side}"), KALSHI_VENUE,
         )
 
+        # Correction #17: Parse observation date from ticker, not close_time
+        observation_date = self._parse_observation_date(ticker)
+
         # Parse expiration from market close_time
         expiration_ns = 0
         close_time = getattr(market, "close_time", None) or getattr(market, "expiration_time", None)
@@ -1196,6 +1345,10 @@ class KalshiInstrumentProvider(InstrumentProvider):
                 pass
 
         ts_now = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
+
+        # Correction #15: description must be None, not empty string
+        title = getattr(market, "title", None)
+        description = title if title else None
 
         return BinaryOption(
             instrument_id=instrument_id,
@@ -1213,19 +1366,37 @@ class KalshiInstrumentProvider(InstrumentProvider):
             maker_fee=Decimal("0.0175"),
             taker_fee=Decimal("0.07"),
             outcome="Yes" if side == "YES" else "No",
-            description=getattr(market, "title", ""),
+            description=description,
             info={
                 "kalshi_ticker": ticker,
                 "side": side.lower(),
                 "status": getattr(market, "status", ""),
+                "observation_date": observation_date,
             },
         )
+
+    @staticmethod
+    def _parse_observation_date(ticker: str) -> str | None:
+        """Extract observation date from ticker like KXHIGHCHI-26MAR14-T55."""
+        match = re.search(r"-(\d{2})([A-Z]{3})(\d{2})-", ticker)
+        if not match:
+            return None
+        day, month_str, year = match.groups()
+        months = {
+            "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+            "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+            "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+        }
+        month = months.get(month_str)
+        if not month:
+            return None
+        return f"20{year}-{month}-{day}"
 ```
 
 **Step 3: Run tests**
 
 ```bash
-pytest tests/test_providers.py -v
+pytest tests/test_providers.py --noconftest -v
 ```
 
 **Step 4: Commit**
@@ -1237,39 +1408,7 @@ git commit -m "feat(kalshi): add instrument provider with BinaryOption support"
 
 ---
 
-## Task 10: Review Task 9
-
-**Spec Review — verify these specific items:**
-- [ ] `parse_instrument_id()` correctly strips `-YES`/`-NO` suffix and returns lowercase side
-- [ ] `_build_instrument()` creates `BinaryOption` not `CurrencyPair` — check the actual return type
-- [ ] `maker_fee=Decimal("0.0175")` and `taker_fee=Decimal("0.07")` match Kalshi's fee schedule
-- [ ] `price_precision=2` and `size_precision=0` — prices are 2 decimal places (dollars), sizes are integers
-- [ ] `outcome` is `"Yes"` or `"No"` (capitalized) — matches Polymarket convention
-- [ ] `info` dict includes `kalshi_ticker` (the raw ticker without side suffix) for use in API calls
-- [ ] No singleton pattern (the old adapter used a global `_SHARED_PROVIDER` — this must NOT exist)
-- [ ] `load_all_async` uses `asyncio.to_thread` for the SDK call (not ThreadPoolExecutor)
-
-**Code Quality Review — verify these specific items:**
-- [ ] Cursor pagination loop terminates when `cursor` is None/empty
-- [ ] Market status filter matches design doc: `("active", "open", "unopened")`
-
----
-
-## Task 11: Milestone — Instrument provider
-
-**Present to user:**
-- Instrument provider with BinaryOption instruments
-- `parse_instrument_id()` utility
-- Cursor-paginated market loading
-- Test results
-
-**Wait for user response before proceeding to Task 12.**
-
----
-
-## Task 12: Implement config and factories
-
-> **Before starting:** Invoke `forge:nautilus-testing` skill — covers NT config/factory patterns.
+### Task 6: Implement config and factories
 
 **Files:**
 - Create: `kalshi/config.py`
@@ -1291,7 +1430,8 @@ def test_data_config_defaults():
     )
     assert config.venue == KALSHI_VENUE
     assert config.environment == "demo"
-    assert "demo-api" in config.base_url_ws
+    # Correction #24: use config.ws_url (property), not config.base_url_ws
+    assert "demo-api" in config.ws_url
 
 
 def test_exec_config_defaults():
@@ -1307,7 +1447,8 @@ def test_prod_config_uses_prod_urls():
         api_key_id="test", private_key_path="/tmp/key.pem",
         environment="production",
     )
-    assert "api.elections.kalshi.com" in config.base_url_ws
+    # Correction #24: use config.ws_url (property)
+    assert "api.elections.kalshi.com" in config.ws_url
 ```
 
 **Step 2: Implement config**
@@ -1379,27 +1520,35 @@ Note: NT config classes use `frozen=True` (msgspec Struct). Properties may not w
 
 Write `kalshi/factories.py`:
 ```python
-"""Kalshi adapter factories."""
-import functools
+"""Kalshi adapter factories.
 
+Correction #18: Do NOT use lru_cache with credential dict keys.
+Use module-level singleton variable instead.
+Correction #26: Factories pass `name` — constructors must accept it.
+"""
 from nautilus_trader.live.factories import LiveDataClientFactory, LiveExecClientFactory
 
 from kalshi.config import KalshiDataClientConfig, KalshiExecClientConfig
 from kalshi.providers import KalshiInstrumentProvider
 
+# Correction #18: Module-level singleton, not lru_cache
+_SHARED_PROVIDER: KalshiInstrumentProvider | None = None
 
-@functools.lru_cache(1)
+
 def get_kalshi_instrument_provider(
     api_key_id: str,
     private_key_path: str,
     rest_host: str,
 ) -> KalshiInstrumentProvider:
     """Singleton instrument provider shared between data and exec clients."""
-    return KalshiInstrumentProvider(
-        api_key_id=api_key_id,
-        private_key_path=private_key_path,
-        rest_host=rest_host,
-    )
+    global _SHARED_PROVIDER
+    if _SHARED_PROVIDER is None:
+        _SHARED_PROVIDER = KalshiInstrumentProvider(
+            api_key_id=api_key_id,
+            private_key_path=private_key_path,
+            rest_host=rest_host,
+        )
+    return _SHARED_PROVIDER
 
 
 class KalshiLiveDataClientFactory(LiveDataClientFactory):
@@ -1412,6 +1561,7 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
         )
         return KalshiDataClient(
             loop=loop,
+            name=name,  # Correction #26
             config=config,
             instrument_provider=provider,
             msgbus=msgbus,
@@ -1430,6 +1580,7 @@ class KalshiLiveExecClientFactory(LiveExecClientFactory):
         )
         return KalshiExecutionClient(
             loop=loop,
+            name=name,  # Correction #26
             config=config,
             instrument_provider=provider,
             msgbus=msgbus,
@@ -1441,47 +1592,71 @@ class KalshiLiveExecClientFactory(LiveExecClientFactory):
 **Step 4: Run tests and commit**
 
 ```bash
-pytest tests/test_config.py -v
+pytest tests/test_config.py --noconftest -v
 git add kalshi/config.py kalshi/factories.py tests/test_config.py
 git commit -m "feat(kalshi): add config classes and factory pattern"
 ```
 
 ---
 
-## Task 13: Review Task 12
+### Phase 3 Review Gate
 
-**Spec Review — verify these specific items:**
+**Spec Reviewer — verify these specific items:**
+- [ ] `parse_instrument_id()` correctly strips `-YES`/`-NO` suffix and returns lowercase side
+- [ ] `_build_instrument()` creates `BinaryOption` not `CurrencyPair` — check the actual return type
+- [ ] `maker_fee=Decimal("0.0175")` and `taker_fee=Decimal("0.07")` match Kalshi's fee schedule
+- [ ] `price_precision=2` and `size_precision=0` — prices are 2 decimal places (dollars), sizes are integers
+- [ ] `outcome` is `"Yes"` or `"No"` (capitalized) — matches Polymarket convention
+- [ ] `info` dict includes `kalshi_ticker` (the raw ticker without side suffix) for use in API calls
+- [ ] **Correction #14**: Use `initialize()` not `load_all_async()` directly (check if provider's `_connect` calls `initialize`)
+- [ ] **Correction #15**: `BinaryOption.description` is `None` when title is missing/empty, not `""`
+- [ ] **Correction #17**: `observation_date` is parsed from ticker, not from `close_time`
+- [ ] **Correction #18**: Singleton uses module-level variable, NOT `@lru_cache` with credential dict keys
+- [ ] **Correction #19**: `api_config.request_timeout = 10` is set on the SDK configuration
+- [ ] **Correction #21**: Instrument loading failures propagate — no try/except around load
+- [ ] **Correction #24**: Config tests use `config.ws_url` (property), not `config.base_url_ws` (field)
+- [ ] **Correction #26**: Factories pass `name` parameter to client constructors
 - [ ] Config `environment` field defaults to `"demo"` — never defaults to production
 - [ ] URL resolution: `environment="demo"` → demo URLs, `environment="production"` → prod URLs
-- [ ] Factory uses `@lru_cache(1)` for singleton instrument provider (shared between data + exec)
 - [ ] Factory `create()` methods match NT signature: `(loop, name, config, msgbus, cache, clock)`
 - [ ] `frozen=True` on config classes — if properties don't work on frozen structs, verify URL resolution still works
+- [ ] `load_all_async` uses `asyncio.to_thread` for the SDK call (not ThreadPoolExecutor)
+- [ ] Cursor pagination loop terminates when `cursor` is None/empty
 
-**Code Quality Review:**
+**Quality Reviewer — verify these specific items:**
+- [ ] No singleton pattern using `@lru_cache` (Correction #18 enforcement)
 - [ ] No credential values hardcoded — all come from config
 - [ ] Factory defers import of data/execution client to avoid circular imports
+- [ ] Market status filter matches design doc: `("active", "open", "unopened")`
+- [ ] **Correction #12**: All `pytest` commands use `--noconftest`
 
 ---
 
-## Task 14: Milestone — Config, factories, and instrument provider
+### Milestone 3: Instrument provider and config
 
 **Present to user:**
+- Instrument provider with BinaryOption instruments
+- `parse_instrument_id()` utility
+- Cursor-paginated market loading
 - Config classes with environment-based URL resolution
-- Factory pattern with singleton instrument provider
+- Factory pattern with module-level singleton provider (not lru_cache)
 - Full package structure so far: `kalshi/common/`, `kalshi/websocket/`, `kalshi/config.py`, `kalshi/factories.py`, `kalshi/providers.py`
 - All test results
+- Review outcomes and any findings resolved
 
-**Wait for user response before proceeding to Task 15.**
+**DOES NOT dispatch Phase 4 tasks until user responds.**
 
 ---
 
-## Task 15: Implement data client
+## Phase 4: Clients
+
+> **Before starting:** Invoke `forge:nautilus-testing` skill — covers NT Cython mocking, `--noconftest`, test stubs.
+
+### Task 7: Implement data client
 
 **Files:**
 - Create: `kalshi/data.py`
 - Create: `tests/test_data_client.py`
-
-The data client subscribes to orderbook data via WebSocket and emits QuoteTicks.
 
 **Step 1: Write tests for quote derivation logic**
 
@@ -1581,19 +1756,19 @@ Key methods:
 
 Port the quote derivation logic from `archive/adapter_v1.py:216-270`.
 
+Client constructors must accept `name` parameter (Correction #26): `ClientId(name or "KALSHI")`.
+
 **Step 3: Run tests and commit**
 
 ```bash
-pytest tests/test_data_client.py -v
+pytest tests/test_data_client.py --noconftest -v
 git add kalshi/data.py tests/test_data_client.py
 git commit -m "feat(kalshi): add data client with quote derivation from bids-only book"
 ```
 
 ---
 
-## Task 16: Implement execution client
-
-> **Before starting:** Invoke `forge:nautilus-testing` skill — covers mocking NT execution internals.
+### Task 8: Implement execution client
 
 **Files:**
 - Create: `kalshi/execution.py`
@@ -1612,8 +1787,8 @@ Key test cases for order translation:
 - SELL NO at 0.90 → `action="sell", side="no", no_price=90`
 
 Key test cases for fill processing:
-- Fill with fee_cost → commission correctly parsed as Money
-- Settlement fill (no ticker) → skipped without error
+- Fill with fee_cost → commission correctly parsed as Money (not hardcoded 0)
+- Settlement fill (no ticker) → triggers `generate_position_status_reports()` (Correction #4)
 - Fill before accepted event → generate_order_accepted called first
 
 Key test cases for reconciliation:
@@ -1621,16 +1796,18 @@ Key test cases for reconciliation:
 - `generate_position_status_reports` → maps position_fp to PositionStatusReport
 - `generate_fill_reports` → maps SDK fill objects to FillReport
 
+**Correction #13**: Use NT test stubs — `TestComponentStubs.cache()`, `TestIdStubs.trader_id()`, register exec engine + strategy + instruments.
+
 **Step 2: Implement execution client**
 
 Write `kalshi/execution.py`. Key patterns from Polymarket adapter:
 
 ```python
 class KalshiExecutionClient(LiveExecutionClient):
-    def __init__(self, loop, config, instrument_provider, msgbus, cache, clock):
+    def __init__(self, loop, name, config, instrument_provider, msgbus, cache, clock):
         super().__init__(
             loop=loop,
-            client_id=ClientId("KALSHI"),
+            client_id=ClientId(name or "KALSHI"),  # Correction #26
             venue=KALSHI_VENUE,
             oms_type=OmsType.HEDGING,
             instrument_provider=instrument_provider,
@@ -1642,6 +1819,7 @@ class KalshiExecutionClient(LiveExecutionClient):
         self._config = config
         api_config = kalshi_python.Configuration()
         api_config.host = config.rest_url
+        api_config.request_timeout = 10  # Correction #19
         self._k_client = kalshi_python.KalshiClient(api_config)
         self._k_client.set_kalshi_auth(
             key_id=config.api_key_id,
@@ -1661,52 +1839,79 @@ class KalshiExecutionClient(LiveExecutionClient):
             retry_check=should_retry,
         )
 
+        # Token-bucket rate limiter (Correction #9)
+        # Replace batch-and-sleep with TokenBucket(rate=10.0, capacity=10)
+
         # WebSocket for user_orders + fill channels
         self._ws_client = KalshiWebSocketClient(...)
 
-        # ACK synchronization
+        # ACK synchronization (Correction #20)
         self._ack_events: dict[str, asyncio.Event] = {}
         self._accepted_orders: dict[ClientOrderId, VenueOrderId] = {}
+
+        # Bounded deduplication cache (Correction #22)
+        self._seen_trade_ids: OrderedDict = OrderedDict()
 ```
 
 Implement these methods using `asyncio.to_thread` + `_with_http_info` + `json.loads(raw_data)` pattern:
-- `_submit_order`, `_cancel_order`, `_cancel_all_orders`, `_modify_order`
+- `_submit_order`: Correction #8 — use full `"fill_or_kill"` not `"fok"`
+- `_cancel_order`, `_cancel_all_orders`, `_modify_order`
 - `generate_order_status_reports`, `generate_fill_reports`, `generate_position_status_reports`
 - `_handle_ws_message` — route user_order and fill messages
+- `_stop()`: Correction #10 — call `self._retry_pool.shutdown()`
+- `_update_account_state()`: Correction #16 — use `balance` field for capital locking
+
+Critical implementation details:
+- **Correction #3**: After `retry_pool.run()`, check for `None` → call `generate_order_rejected()`
+- **Correction #4**: Settlement fills → trigger `generate_position_status_reports()`, not skip
+- **Correction #6**: Before batch retry, check order status by `client_order_id`
+- **Correction #20**: On ACK timeout, query REST for order status as fallback
+- **Correction #22**: Cap `_seen_trade_ids` at 10K entries using `OrderedDict`
 
 **Step 3: Run tests and commit**
 
 ```bash
-pytest tests/test_execution.py -v
+pytest tests/test_execution.py --noconftest -v
 git add kalshi/execution.py tests/test_execution.py
 git commit -m "feat(kalshi): add execution client with order management and reconciliation"
 ```
 
 ---
 
-## Task 17: Review Tasks 15-16
+### Phase 4 Review Gate
 
-**Spec Review — verify these specific items:**
+**Spec Reviewer — verify these specific items:**
 - [ ] Quote derivation: `YES ask = 1.0 - max(no_bids)`, `NO ask = 1.0 - max(yes_bids)` — verify in `_derive_quotes()`
 - [ ] Empty book handling: returns None (no quotes emitted), not zero prices
 - [ ] One-sided book: the missing side gets `bid=0.0` and the present side gets `ask=1.0`
 - [ ] Order translation: `BUY` on `TICKER-YES` → SDK `action="buy", side="yes", yes_price_dollars=...`
+- [ ] **Correction #8**: `time_in_force` uses full strings: `"fill_or_kill"` not `"fok"`, `"good_till_canceled"` not `"gtc"`
+- [ ] **Correction #3**: `RetryManagerPool.run()` result checked for `None` → `generate_order_rejected()`
+- [ ] **Correction #4**: Settlement fills trigger `generate_position_status_reports()`, not just skip
+- [ ] **Correction #6**: Batch retry checks order status by `client_order_id` before resubmitting
+- [ ] **Correction #9**: Token-bucket rate limiter, not batch-and-sleep
+- [ ] **Correction #10**: `_stop()` method calls `self._retry_manager_pool.shutdown()`
+- [ ] **Correction #16**: Capital locking uses `balance` field with `_update_account_state()`
+- [ ] **Correction #19**: REST call timeout set to 10 seconds on SDK config
+- [ ] **Correction #20**: ACK timeout with REST fallback — on `asyncio.wait_for` timeout, query REST
+- [ ] **Correction #22**: Bounded deduplication — `OrderedDict`-based, 10K cap for `seen_trade_ids`
 - [ ] Fee parsing: `fee_cost` from fill message → `commission=Money(float(fee_cost), USD)` — NOT hardcoded 0
-- [ ] Settlement fill: `market_ticker is None` → logged and skipped, no crash
 - [ ] `OmsType.HEDGING` — not NETTING (because YES/NO are separate instruments in NT)
 - [ ] All REST calls use `asyncio.to_thread` — no ThreadPoolExecutor
 - [ ] All SDK calls use `_with_http_info()` + `json.loads(raw_data)` — no direct SDK model access
 - [ ] `generate_fill_reports` returns `FillReport` objects (not empty list)
 - [ ] ACK events use `asyncio.Event` with timeout (`ack_timeout_secs` from config)
 
-**Code Quality Review:**
-- [ ] `_retry_pool.shutdown()` called in `_stop()` method
+**Quality Reviewer — verify these specific items:**
+- [ ] `_retry_pool.shutdown()` called in `_stop()` method (Correction #10)
 - [ ] WebSocket disconnect called in `_disconnect()` method
 - [ ] No `strategy_id=None` hack — NT should resolve strategy_id from client_order_id cache
+- [ ] **Correction #12**: All `pytest` commands use `--noconftest`
+- [ ] **Correction #13**: NT test stubs used in execution client tests (`TestComponentStubs`, `TestIdStubs`)
 
 ---
 
-## Task 18: Milestone — Complete adapter
+### Milestone 4: Complete adapter
 
 **Present to user:**
 - Full adapter package: data client, execution client, config, factories, providers, WS client
@@ -1714,14 +1919,18 @@ git commit -m "feat(kalshi): add execution client with order management and reco
 - Order lifecycle: submit → accept → fill with fee tracking
 - Reconciliation: order reports, fill reports, position reports
 - All unit test results
+- Review outcomes and any findings resolved
 
-**Wait for user response before proceeding to Task 19.**
+**DOES NOT dispatch Phase 5 tasks until user responds.**
 
 ---
 
-## Task 19: Implement integration tests against Kalshi demo API
+## Phase 5: Integration & Verification
 
 > **Before starting:** Verify `.env` has valid demo credentials. Run `python -c "from kalshi.providers import KalshiInstrumentProvider"` to confirm imports work.
+> Also invoke `forge:writing-tests` skill — covers edge case selection and assertion quality.
+
+### Task 9: Integration tests against demo API
 
 **Files:**
 - Create: `tests/test_integration.py`
@@ -1734,8 +1943,8 @@ git commit -m "feat(kalshi): add execution client with order management and reco
 Requires valid demo credentials in .env:
   KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH
 
-Run with: pytest tests/test_integration.py -v -s --timeout=30
-Skip with: pytest tests/test_integration.py -v -k "not integration"
+Run with: pytest tests/test_integration.py --noconftest -v -s --timeout=30
+Skip with: pytest tests/test_integration.py --noconftest -v -k "not integration"
 """
 import os
 import pytest
@@ -1820,19 +2029,17 @@ receive at least one snapshot, and disconnect cleanly.
 **Step 4: Run and commit**
 
 ```bash
-pytest tests/test_integration.py -v -s --timeout=60
+pytest tests/test_integration.py --noconftest -v -s --timeout=60
 git add tests/test_integration.py
 git commit -m "test(kalshi): add integration tests against demo API"
 ```
 
 ---
 
-## Task 20: Implement order combinatorics tests
-
-> **Before starting:** Invoke `forge:writing-tests` skill — covers edge case selection and assertion quality.
+### Task 10: Order combinatorics tests
 
 **Files:**
-- Extend: `tests/test_execution.py` or create `tests/test_order_combinatorics.py`
+- Create: `tests/test_order_combinatorics.py`
 
 Test every combination that could occur in practice:
 
@@ -1858,47 +2065,21 @@ Edge cases:
 - Fill with `is_taker=True` vs `is_taker=False` (different fee coefficients)
 
 ```bash
-pytest tests/test_order_combinatorics.py -v
+pytest tests/test_order_combinatorics.py --noconftest -v
 git add tests/test_order_combinatorics.py
 git commit -m "test(kalshi): add order combinatorics tests"
 ```
 
 ---
 
-## Task 21: Review Tasks 19-20
-
-**Spec Review — verify these specific items:**
-- [ ] Integration test connects to demo API and successfully fetches balance (auth works)
-- [ ] Instrument loading returns >0 instruments, all are BinaryOption type
-- [ ] Order lifecycle: create → verify resting → cancel → verify cancelled — complete cycle tested
-- [ ] All 4 side/action combinations tested with correct SDK parameter mapping
-- [ ] Edge case: price 0.01 and 0.99 both produce valid orders
-- [ ] Edge case: settlement fill (no ticker) doesn't crash
-- [ ] Fee parsing: `is_taker=True` → `taker_fee` coefficient used, `is_taker=False` → `maker_fee`
-
-**Validation Data:**
-- Check that the demo API balance response has the expected structure: `{"balance": int, "portfolio_value": int}`
-- Verify loaded instruments have `price_precision=2` and `size_precision=0`
-
----
-
-## Task 22: Milestone — Integration testing complete
-
-**Present to user:**
-- Integration tests passing against Kalshi demo API
-- Auth, instrument loading, order lifecycle all verified
-- Order combinatorics coverage (side x action x outcome matrix)
-- Edge cases: settlement fills, min/max prices, fee calculation
-- All test results
-
-**Wait for user response before proceeding to Task 23.**
-
----
-
-## Task 23: Implement reconciliation tests
+### Task 11: Reconciliation tests and final cleanup
 
 **Files:**
 - Create: `tests/test_reconciliation.py`
+- Update: `kalshi/__init__.py` — export public API
+- Update: `pyproject.toml` — ensure no unused deps
+
+**Step 1: Write reconciliation tests**
 
 Test the three report generators against demo API state:
 
@@ -1915,44 +2096,7 @@ Also test restart recovery:
 4. Call all three report generators
 5. Verify state matches what Kalshi has
 
-```bash
-pytest tests/test_reconciliation.py -v -s --timeout=120
-git add tests/test_reconciliation.py
-git commit -m "test(kalshi): add reconciliation tests for state recovery"
-```
-
----
-
-## Task 24: Review Task 23
-
-**Spec Review — verify these specific items:**
-- [ ] `generate_order_status_reports()` returns `OrderStatusReport` objects with correct `venue_order_id`, `order_side`, `quantity`, `price`
-- [ ] `generate_position_status_reports()` returns `PositionStatusReport` with correct `quantity` matching Kalshi's `position_fp`
-- [ ] `generate_fill_reports()` returns `FillReport` objects (not empty list) with `last_qty`, `last_px`, `commission`
-- [ ] Restart recovery: fresh client can reconstruct state from Kalshi REST API alone
-
----
-
-## Task 25: Milestone — Reconciliation verified
-
-**Present to user:**
-- All three report generators tested against real demo API state
-- Restart recovery works — fresh client reconstructs state correctly
-- All test results
-- Summary of remaining work (soak test is manual/future)
-
-**Wait for user response before proceeding to Task 26.**
-
----
-
-## Task 26: Final cleanup and entry point
-
-**Files:**
-- Update: `kalshi/__init__.py` — export public API
-- Update: `pyproject.toml` — ensure no unused deps, add any missing ones
-- Create: `main.py` — minimal entry point for testing the adapter with a TradingNode
-
-**Step 1: Update `kalshi/__init__.py`**
+**Step 2: Update `kalshi/__init__.py`**
 
 ```python
 """Kalshi NautilusTrader adapter."""
@@ -1972,43 +2116,51 @@ __all__ = [
 ]
 ```
 
-**Step 2: Create minimal main.py**
-
-A simple script that creates a TradingNode with the Kalshi adapter, loads instruments,
-subscribes to quotes, and prints them. No strategy — just adapter verification.
-
-**Step 3: Run full test suite**
+**Step 3: Run full test suite and commit**
 
 ```bash
-pytest tests/ -v --timeout=120
-```
-
-**Step 4: Commit**
-
-```bash
-git add kalshi/__init__.py main.py pyproject.toml
-git commit -m "feat(kalshi): finalize adapter package with entry point"
+pytest tests/ --noconftest -v --timeout=120
+git add tests/test_reconciliation.py kalshi/__init__.py pyproject.toml
+git commit -m "test(kalshi): add reconciliation tests, finalize adapter package"
 ```
 
 ---
 
-## Task 27: Review Task 26
+### Phase 5 Review Gate
 
-**Spec Review — verify these specific items:**
+**Spec Reviewer — verify these specific items:**
+- [ ] Integration test connects to demo API and successfully fetches balance (auth works)
+- [ ] Instrument loading returns >0 instruments, all are BinaryOption type
+- [ ] Order lifecycle: create → verify resting → cancel → verify cancelled — complete cycle tested
+- [ ] All 4 side/action combinations tested with correct SDK parameter mapping
+- [ ] Edge case: price 0.01 and 0.99 both produce valid orders
+- [ ] Edge case: settlement fill (no ticker) doesn't crash — triggers position reconciliation (Correction #4)
+- [ ] Fee parsing: `is_taker=True` → `taker_fee` coefficient used, `is_taker=False` → `maker_fee`
+- [ ] `generate_order_status_reports()` returns `OrderStatusReport` objects with correct `venue_order_id`, `order_side`, `quantity`, `price`
+- [ ] `generate_position_status_reports()` returns `PositionStatusReport` with correct `quantity` matching Kalshi's `position_fp`
+- [ ] `generate_fill_reports()` returns `FillReport` objects (not empty list) with `last_qty`, `last_px`, `commission`
+- [ ] Restart recovery: fresh client can reconstruct state from Kalshi REST API alone
 - [ ] `kalshi/__init__.py` exports all public classes listed in the design doc
-- [ ] `main.py` creates a `TradingNode` with `KalshiLiveDataClientFactory` and `KalshiLiveExecClientFactory`
 - [ ] `pyproject.toml` has no new dependencies added (msgspec is an NT dependency, kalshi-python already present)
-- [ ] All tests pass: `pytest tests/ -v`
+- [ ] All tests pass: `pytest tests/ --noconftest -v`
 - [ ] No files at top level that should be in `kalshi/` or `archive/`
+- [ ] **Correction #5**: `MAX_BATCH_CREATE` is 9 (verified in integration test batch submissions)
+- [ ] **Correction #12**: `--noconftest` on ALL pytest commands
+
+**Quality Reviewer — verify these specific items:**
+- [ ] Loaded instruments have `price_precision=2` and `size_precision=0`
+- [ ] Demo API balance response has expected structure: `{"balance": int, "portfolio_value": int}`
+- [ ] No hardcoded demo/prod URLs outside constants module
+- [ ] All test assertions are specific values, not just truthiness checks
 
 ---
 
-## Task 28: Milestone — Adapter complete
+### Milestone 5: Adapter complete — final milestone
 
 **Present to user:**
 - Complete adapter package with all components
 - Full test suite: unit tests, integration tests, order combinatorics, reconciliation
-- Entry point for manual verification
+- All 26 corrections from the deepening review verified in appropriate review gates
 - Summary of what was built vs what was designed
 - Open items: soak test (24h run, manual), production deployment
 

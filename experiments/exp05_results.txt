@@ -1,0 +1,38 @@
+================================================================================
+PHASE A: VALIDATION RUN
+  min_p_win=0.95  max_cost=92c  sell_target=97c
+  catalog : /home/mike/code/kalshi-trader/kalshi_data_catalog
+  events  : /home/mike/code/altmarkets/kalshi-weather/data/climate_events.parquet
+  signals : /home/mike/code/kalshi-trader/data/model_signals.parquet
+================================================================================
+
+--- Actor ---
+  Models loaded         : True
+  ClimateEvents received: 100
+  Cities with features  : 20
+
+--- Strategy ---
+  ModelSignals received : 31
+  DangerAlerts received : 0
+  Positions open        : 0
+  Danger-exited tickers : 0
+
+--- Orders ---
+  Total orders          : 0
+  Filled orders         : 0
+
+--- Account ---
+  Final balance         : $100.00
+
+--- Diagnosis ---
+  FAIL: No orders placed — signals emitted but no quote ticks matched; check catalog contains NO-side instruments
+
+  Pipeline stages that passed:
+    [PASS] Models loaded
+    [PASS] ClimateEvents received
+    [PASS] City features built
+    [PASS] ModelSignals emitted
+    [FAIL] Orders placed
+    [FAIL] Fills recorded
+
+Skipping Phase B — Phase A had zero fills. Fix pipeline first.
