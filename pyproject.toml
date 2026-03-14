@@ -15,3 +15,8 @@ dependencies = [
 [tool.ty.rules]
 "unresolved-import" = "ignore"
 "unknown-argument" = "ignore"
+
+[dependency-groups]
+dev = [
+    "allpairspy>=2.5.1",
+]
