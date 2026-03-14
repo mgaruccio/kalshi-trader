@@ -158,3 +158,44 @@ class TestQuantityPassthrough:
     def test_count_matches_quantity(self, qty):
         params = _order_to_kalshi_params(_order(OrderSide.BUY, "0.50", qty=qty), _instr("YES"))
         assert params["count"] == qty
+
+
+# ---------------------------------------------------------------------------
+# Market orders: no price fields in params
+# ---------------------------------------------------------------------------
+
+class TestMarketOrders:
+    """Market orders (no price) must produce params without price fields."""
+
+    def test_market_order_buy_yes(self):
+        order = MagicMock()
+        order.side = OrderSide.BUY
+        order.order_type = OrderType.MARKET
+        order.time_in_force = TimeInForce.FOK
+        order.price = None
+        order.quantity = Quantity.from_int(5)
+        order.client_order_id = ClientOrderId("C-MKT")
+
+        params = _order_to_kalshi_params(order, _instr("YES"))
+        assert params["type"] == "market"
+        assert params["action"] == "buy"
+        assert params["side"] == "yes"
+        assert "yes_price" not in params
+        assert "no_price" not in params
+        assert params["count"] == 5
+
+    def test_market_order_sell_no(self):
+        order = MagicMock()
+        order.side = OrderSide.SELL
+        order.order_type = OrderType.MARKET
+        order.time_in_force = TimeInForce.FOK
+        order.price = None
+        order.quantity = Quantity.from_int(10)
+        order.client_order_id = ClientOrderId("C-MKT2")
+
+        params = _order_to_kalshi_params(order, _instr("NO"))
+        assert params["type"] == "market"
+        assert params["action"] == "sell"
+        assert params["side"] == "no"
+        assert "yes_price" not in params
+        assert "no_price" not in params
