@@ -1,4 +1,5 @@
 """Kalshi execution client — order management, fills, and reconciliation."""
+
 import asyncio
 import json
 import logging
@@ -8,20 +9,43 @@ from decimal import Decimal
 import kalshi_python
 from kalshi_python.api.portfolio_api import PortfolioApi
 from kalshi_python.exceptions import ApiException
+from kalshi_python.models.create_order_request import CreateOrderRequest
 
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.reports import FillReport, OrderStatusReport, PositionStatusReport
+from nautilus_trader.execution.reports import (
+    FillReport,
+    OrderStatusReport,
+    PositionStatusReport,
+)
 from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.retry import RetryManagerPool
 from nautilus_trader.model.currencies import USD, USDC
 from nautilus_trader.model.enums import (
-    AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-    PositionSide, TimeInForce,
+    AccountType,
+    LiquiditySide,
+    OmsType,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    PositionSide,
+    TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
-    AccountId, ClientId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId,
+    AccountId,
+    ClientId,
+    ClientOrderId,
+    InstrumentId,
+    Symbol,
+    TradeId,
+    VenueOrderId,
 )
-from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from nautilus_trader.model.objects import (
+    AccountBalance,
+    Currency,
+    Money,
+    Price,
+    Quantity,
+)
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.common.errors import should_retry
@@ -141,6 +165,10 @@ class KalshiExecutionClient(LiveExecutionClient):
         )
         self._config = config
 
+        # Correction #27: set account_id in __init__ so generate_account_state works
+        # NT reconciliation requires account_id to be non-None before first account state.
+        self._set_account_id(AccountId(f"KALSHI-001"))
+
         # SDK REST client (Correction #19: timeout=10)
         api_config = kalshi_python.Configuration()
         api_config.host = config.rest_url
@@ -210,13 +238,31 @@ class KalshiExecutionClient(LiveExecutionClient):
         # Correction #9: rate-limit write operations
         await self._rate_limiter.acquire()
 
+        # Correction #32: kalshi_python SDK v3 requires a CreateOrderRequest
+        # model; individual kwargs (including time_in_force, which no longer
+        # exists in the schema) are not accepted.
+        req = CreateOrderRequest(
+            ticker=params["ticker"],
+            side=params["side"],
+            action=params["action"],
+            count=params["count"],
+            type=params["type"],
+            client_order_id=params.get("client_order_id"),
+            yes_price=params.get("yes_price"),
+            no_price=params.get("no_price"),
+        )
+
         retry_manager = await self._retry_manager_pool.acquire()
         try:
+            # Correction #31: NT 1.224 RetryManager.run() API is
+            # run(name, details, func, *args, **kwargs); pass asyncio.to_thread
+            # as the callable so each retry creates a fresh coroutine.
             response = await retry_manager.run(
                 "create_order",
-                asyncio.to_thread(
-                    self._portfolio.create_order_with_http_info, **params
-                ),
+                None,
+                asyncio.to_thread,
+                self._portfolio.create_order_with_http_info,
+                req,
             )
             # Correction #3: None response → rejected
             if response is None:
@@ -234,7 +280,9 @@ class KalshiExecutionClient(LiveExecutionClient):
             event = asyncio.Event()
             self._ack_events[order.client_order_id.value] = event
             try:
-                await asyncio.wait_for(event.wait(), timeout=self._config.ack_timeout_secs)
+                await asyncio.wait_for(
+                    event.wait(), timeout=self._config.ack_timeout_secs
+                )
             except asyncio.TimeoutError:
                 # REST fallback: check order status
                 await self._ack_fallback(command, response)
@@ -253,7 +301,8 @@ class KalshiExecutionClient(LiveExecutionClient):
             )
             data = json.loads(resp.raw_data)
             order_data = data.get("order", {})
-            if order_data.get("status") in ("resting", "filled"):
+            # Correction #33: Kalshi v3 API uses "executed" for filled orders
+            if order_data.get("status") in ("resting", "filled", "executed"):
                 c_oid = command.order.client_order_id
                 if c_oid not in self._accepted_orders:
                     self.generate_order_accepted(
@@ -302,7 +351,9 @@ class KalshiExecutionClient(LiveExecutionClient):
 
             # Sequence gap → missed fills are catastrophic; trigger reconciliation
             if not self._ws_client._check_sequence(sid=sid, seq=seq):
-                log.warning(f"Execution WS sequence gap sid={sid}, triggering reconciliation")
+                log.warning(
+                    f"Execution WS sequence gap sid={sid}, triggering reconciliation"
+                )
                 asyncio.create_task(self.generate_order_status_reports(None))
                 asyncio.create_task(self.generate_fill_reports(None))
                 return
@@ -313,6 +364,16 @@ class KalshiExecutionClient(LiveExecutionClient):
                 self._handle_fill(msg, ts)
         except Exception as e:
             log.error(f"Error handling exec WS message: {e}")
+
+    def _strategy_id_for(self, c_oid: ClientOrderId | None):
+        """Correction #35: look up StrategyId from cache for WS-driven events.
+
+        NT generate_* methods require a concrete StrategyId, not None.
+        """
+        if c_oid is None:
+            return None
+        order = self._cache.order(c_oid)
+        return order.strategy_id if order is not None else None
 
     def _handle_user_order(self, msg: UserOrderMsg, ts: int) -> None:
         c_oid = ClientOrderId(msg.client_order_id) if msg.client_order_id else None
@@ -325,10 +386,11 @@ class KalshiExecutionClient(LiveExecutionClient):
         if c_oid and c_oid.value in self._ack_events:
             self._ack_events.pop(c_oid.value).set()
 
+        sid = self._strategy_id_for(c_oid)
         if msg.status == "resting":
-            if c_oid and c_oid not in self._accepted_orders:
+            if c_oid and c_oid not in self._accepted_orders and sid is not None:
                 self.generate_order_accepted(
-                    strategy_id=None,
+                    strategy_id=sid,
                     instrument_id=instrument_id,
                     client_order_id=c_oid,
                     venue_order_id=v_oid,
@@ -336,9 +398,9 @@ class KalshiExecutionClient(LiveExecutionClient):
                 )
                 self._accepted_orders[c_oid] = v_oid
         elif msg.status == "canceled":
-            if c_oid:
+            if c_oid and sid is not None:
                 self.generate_order_canceled(
-                    strategy_id=None,
+                    strategy_id=sid,
                     instrument_id=instrument_id,
                     client_order_id=c_oid,
                     venue_order_id=v_oid,
@@ -348,9 +410,9 @@ class KalshiExecutionClient(LiveExecutionClient):
             # Immediately-filled orders (market orders, limit crossing spread) arrive
             # with status="filled" — no "resting" status is sent. Accept if needed;
             # the fill details come separately via the fill channel.
-            if c_oid and c_oid not in self._accepted_orders:
+            if c_oid and c_oid not in self._accepted_orders and sid is not None:
                 self.generate_order_accepted(
-                    strategy_id=None,
+                    strategy_id=sid,
                     instrument_id=instrument_id,
                     client_order_id=c_oid,
                     venue_order_id=v_oid,
@@ -358,9 +420,9 @@ class KalshiExecutionClient(LiveExecutionClient):
                 )
                 self._accepted_orders[c_oid] = v_oid
         elif msg.status == "rejected":
-            if c_oid:
+            if c_oid and sid is not None:
                 self.generate_order_rejected(
-                    strategy_id=None,
+                    strategy_id=sid,
                     instrument_id=instrument_id,
                     client_order_id=c_oid,
                     reason="Exchange rejected",
@@ -387,14 +449,21 @@ class KalshiExecutionClient(LiveExecutionClient):
         )
         instrument = self._instrument_provider.find(instrument_id)
         if not instrument:
-            log.error(f"Fill for unknown instrument {instrument_id} — triggering reconciliation")
+            log.error(
+                f"Fill for unknown instrument {instrument_id} — triggering reconciliation"
+            )
             asyncio.create_task(self.generate_position_status_reports(None))
+            return
+
+        fill_sid = self._strategy_id_for(c_oid)
+        if fill_sid is None:
+            log.warning(f"Fill for unknown order {c_oid} — cannot route to strategy")
             return
 
         # Generate accepted first if not yet done
         if c_oid and c_oid not in self._accepted_orders:
             self.generate_order_accepted(
-                strategy_id=None,
+                strategy_id=fill_sid,
                 instrument_id=instrument_id,
                 client_order_id=c_oid,
                 venue_order_id=v_oid,
@@ -409,7 +478,7 @@ class KalshiExecutionClient(LiveExecutionClient):
         order_side = OrderSide.BUY if msg.action == "buy" else OrderSide.SELL
 
         self.generate_order_filled(
-            strategy_id=None,
+            strategy_id=fill_sid,
             instrument_id=instrument_id,
             client_order_id=c_oid,
             venue_order_id=v_oid,
@@ -437,8 +506,15 @@ class KalshiExecutionClient(LiveExecutionClient):
             if balance is None:
                 return
             balance_dollars = float(balance) / 100.0  # Kalshi balance is in cents
+            # Correction #28: generate_account_state requires AccountBalance, not Money
+            balance_money = Money(balance_dollars, USD)
+            account_balance = AccountBalance(
+                total=balance_money,
+                locked=Money(0.0, USD),
+                free=balance_money,
+            )
             self.generate_account_state(
-                balances=[Money(balance_dollars, USD)],
+                balances=[account_balance],
                 margins=[],
                 reported=True,
                 ts_event=self._clock.timestamp_ns(),
@@ -484,14 +560,18 @@ class KalshiExecutionClient(LiveExecutionClient):
                         account_id=self.account_id,
                         instrument_id=instrument_id,
                         venue_order_id=VenueOrderId(order["order_id"]),
-                        order_side=OrderSide.BUY if order.get("action") == "buy" else OrderSide.SELL,
+                        order_side=OrderSide.BUY
+                        if order.get("action") == "buy"
+                        else OrderSide.SELL,
                         order_type=OrderType.LIMIT,
                         time_in_force=TimeInForce.GTC,
                         order_status=OrderStatus.ACCEPTED,
                         quantity=instrument.make_qty(order.get("count", 0)),
                         filled_qty=instrument.make_qty(0),
                         price=price,
-                        client_order_id=ClientOrderId(client_order_id_val) if client_order_id_val else None,
+                        client_order_id=ClientOrderId(client_order_id_val)
+                        if client_order_id_val
+                        else None,
                         report_id=UUID4(),
                         ts_accepted=ts,
                         ts_last=ts,
@@ -532,12 +612,20 @@ class KalshiExecutionClient(LiveExecutionClient):
                         instrument_id=instrument_id,
                         venue_order_id=VenueOrderId(fill["order_id"]),
                         trade_id=TradeId(fill["trade_id"]),
-                        order_side=OrderSide.BUY if fill.get("action") == "buy" else OrderSide.SELL,
+                        order_side=OrderSide.BUY
+                        if fill.get("action") == "buy"
+                        else OrderSide.SELL,
                         last_qty=instrument.make_qty(float(fill.get("count_fp", 0))),
                         last_px=instrument.make_price(price_dollars),
-                        commission=_parse_fill_commission(str(fee) if fee is not None else None),
-                        liquidity_side=LiquiditySide.TAKER if fill.get("is_taker", False) else LiquiditySide.MAKER,
-                        client_order_id=ClientOrderId(client_order_id_val) if client_order_id_val else None,
+                        commission=_parse_fill_commission(
+                            str(fee) if fee is not None else None
+                        ),
+                        liquidity_side=LiquiditySide.TAKER
+                        if fill.get("is_taker", False)
+                        else LiquiditySide.MAKER,
+                        client_order_id=ClientOrderId(client_order_id_val)
+                        if client_order_id_val
+                        else None,
                         report_id=UUID4(),
                         ts_event=ts,
                         ts_init=ts,
@@ -547,7 +635,9 @@ class KalshiExecutionClient(LiveExecutionClient):
             log.error(f"generate_fill_reports failed: {e}")
         return reports
 
-    async def generate_position_status_reports(self, command) -> list[PositionStatusReport]:
+    async def generate_position_status_reports(
+        self, command
+    ) -> list[PositionStatusReport]:
         reports = []
         try:
             resp = await asyncio.to_thread(self._portfolio.get_positions_with_http_info)
