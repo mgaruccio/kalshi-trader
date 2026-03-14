@@ -175,6 +175,13 @@ class WeatherMakerStrategy(Strategy):
         self._first_quoted_ns: dict[str, int] = {}
         # tickers with an IOC exit order in-flight (prevents duplicate exits)
         self._exiting_tickers: set[str] = set()
+        # Diagnostic counters
+        self._signals_received: int = 0
+        self._filter_passes: int = 0
+        self._filter_fails: int = 0
+        self._ladders_placed: int = 0
+        self._exits_attempted: int = 0
+        self._orders_submitted: int = 0
 
     def on_start(self) -> None:
         self.subscribe_data(DataType(SignalScore))
@@ -235,6 +242,7 @@ class WeatherMakerStrategy(Strategy):
         Per Enhancement #18: drift is NOT cleared by a new score. Drift
         persists until session end or explicit 'drift_cleared' signal.
         """
+        self._signals_received += 1
         self._scores[score.ticker] = score
         self._evaluate_contract(score.ticker)
 
@@ -264,6 +272,7 @@ class WeatherMakerStrategy(Strategy):
         side, passes = should_quote(self._config, score, self._drift_cities)
 
         if passes and ticker not in self._quoted_tickers:
+            self._filter_passes += 1
             self._quoted_tickers.add(ticker)
             # Record first-seen time for tomorrow contract gating
             if ticker not in self._first_quoted_ns:
@@ -286,9 +295,13 @@ class WeatherMakerStrategy(Strategy):
                     self.subscribe_quote_ticks(instrument_id)
 
         elif not passes and ticker in self._quoted_tickers:
+            self._filter_fails += 1
             self._quoted_tickers.discard(ticker)
             self._cancel_all_for_ticker(ticker)
             self.log.info(f"Filter EXIT: {ticker}")
+
+        elif not passes and ticker not in self._quoted_tickers:
+            self._filter_fails += 1
 
     # ------------------------------------------------------------------
     # Quote management
@@ -398,6 +411,7 @@ class WeatherMakerStrategy(Strategy):
                 time_in_force=TimeInForce.GTC,
             )
             self.submit_order(order)
+            self._orders_submitted += 1
             new_order_ids.append(order.client_order_id)
             # Update local tally for subsequent ladder levels
             market_exposure += allowed_qty * price_cents
@@ -405,6 +419,8 @@ class WeatherMakerStrategy(Strategy):
 
         self._resting_orders[ticker] = new_order_ids
         self._last_anchor[ticker] = bid_cents
+        if new_order_ids:
+            self._ladders_placed += 1
 
     def _exit_position(self, ticker: str, instrument_id: InstrumentId, bid_cents: int) -> None:
         """Exit position when price hits exit threshold (IOC — partial better than none).
@@ -430,6 +446,7 @@ class WeatherMakerStrategy(Strategy):
                         time_in_force=TimeInForce.IOC,
                     )
                     self._exiting_tickers.add(ticker)
+                    self._exits_attempted += 1
                     self.submit_order(order)
                     self.log.info(f"EXIT: {ticker} at {bid_cents}c, selling {qty} contracts")
                 break

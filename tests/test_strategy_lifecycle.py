@@ -72,6 +72,7 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_evaluate_contract",
         "_cancel_all_for_ticker",
         "_exit_position",
+        "_reprice_ladder",
         "_market_exposure_cents",
         "_city_exposure_cents",
         "_check_circuit_breaker",
@@ -385,3 +386,105 @@ class TestTomorrowContractGating:
         strategy._handle_signal_score(score)
         # Should still have original timestamp
         assert strategy._first_quoted_ns.get("KXHIGHNY-26MAR15-T54") == 42_000_000_000
+
+
+class TestDiagnosticCounters:
+    def test_signals_received_increments(self):
+        """_signals_received increments once per _handle_signal_score call."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        assert strategy._signals_received == 0
+        score = _make_score()
+        strategy._handle_signal_score(score)
+        assert strategy._signals_received == 1
+        strategy._handle_signal_score(score)
+        assert strategy._signals_received == 2
+
+    def test_filter_passes_increments_on_new_pass(self):
+        """_filter_passes increments when a contract newly passes the filter."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        assert strategy._filter_passes == 0
+        score = _make_score(no_p_win=0.98, n_models=3)
+        strategy._handle_signal_score(score)
+        assert strategy._filter_passes == 1
+
+    def test_filter_fails_increments_on_fail(self):
+        """_filter_fails increments when a contract fails the filter."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        assert strategy._filter_fails == 0
+        # Low confidence — should fail
+        score = _make_score(no_p_win=0.50, yes_p_win=0.50, n_models=3)
+        strategy._handle_signal_score(score)
+        assert strategy._filter_fails == 1
+
+    def test_filter_fails_increments_on_exit(self):
+        """_filter_fails increments when a previously-passing contract exits the filter."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        score = _make_score(no_p_win=0.98, n_models=3)
+        strategy._handle_signal_score(score)
+        assert strategy._filter_passes == 1
+        assert strategy._filter_fails == 0
+
+        # Drift pauses the city — contract fails and exits
+        drift = ForecastDrift(city="new_york", date="2026-03-15", message="drift", ts_event=0, ts_init=0)
+        strategy._handle_forecast_drift(drift)
+        assert strategy._filter_fails == 1
+
+    def test_ladders_placed_and_orders_submitted(self):
+        """_ladders_placed and _orders_submitted increment when _reprice_ladder places orders."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        strategy = _make_strategy()
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+        score = _make_score()
+
+        # Set up account balance and instrument mocks
+        instrument = MagicMock()
+        instrument.make_qty.side_effect = lambda q: q
+        instrument.make_price.side_effect = lambda p: p
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+
+        usd_balance = MagicMock()
+        usd_balance.total.as_double.return_value = 1000.0  # $1000
+        mock_account = MagicMock()
+        mock_account.balances.return_value.get.return_value = usd_balance
+        strategy.portfolio.account.return_value = mock_account
+
+        assert strategy._ladders_placed == 0
+        assert strategy._orders_submitted == 0
+
+        strategy._reprice_ladder(ticker, instrument_id, "no", 85, score)
+
+        assert strategy._ladders_placed == 1
+        # Default config: ladder_depth=3, so up to 3 orders placed
+        assert strategy._orders_submitted == strategy.submit_order.call_count
+        assert strategy._orders_submitted > 0
+
+    def test_exits_attempted_increments(self):
+        """_exits_attempted increments when _exit_position submits an IOC order."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        strategy = _make_strategy()
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        # Set up a non-zero position
+        pos = MagicMock()
+        pos.instrument_id = instrument_id
+        pos.is_closed = False
+        pos.quantity.as_double.return_value = 5.0
+        strategy.cache.positions.return_value = [pos]
+        instrument = MagicMock()
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+
+        assert strategy._exits_attempted == 0
+        strategy._exit_position(ticker, instrument_id, 97)
+        assert strategy._exits_attempted == 1
