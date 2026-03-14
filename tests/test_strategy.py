@@ -223,8 +223,8 @@ class TestCheckRiskCaps:
         assert allowed == 10
 
     def test_market_cap_reduces_quantity(self):
-        # Market cap = 20,000 cents. Already exposed 14,940 (166 * 90).
-        # Remaining = 5,060. At 90c = 56 contracts.
+        # Market cap = 20,000. Exposed = 166*90 = 14,940. Remaining = 5,060.
+        # floor(5060 / 90) = 56 contracts.
         allowed = check_risk_caps(
             market_exposure_cents=166 * 90,
             city_exposure_cents=166 * 90,
@@ -234,11 +234,12 @@ class TestCheckRiskCaps:
             market_cap_pct=0.20,
             city_cap_pct=0.33,
         )
-        assert 0 <= allowed < 100
+        assert allowed == 56
 
     def test_city_cap_reduces_quantity(self):
-        # City exposure = 18,000 (two markets, 100*90 each).
-        # City cap = 33,000. Remaining = 15,000. At 90c = 166 contracts.
+        # City cap = 33,000. Exposed = 18,000 (200*90). Remaining = 15,000.
+        # floor(15000 / 90) = 166. Market cap = 20,000, market exposed = 0 → 222.
+        # City cap is binding: allowed = 166.
         allowed = check_risk_caps(
             market_exposure_cents=0,
             city_exposure_cents=100 * 90 + 100 * 90,
@@ -248,7 +249,7 @@ class TestCheckRiskCaps:
             market_cap_pct=0.20,
             city_cap_pct=0.33,
         )
-        assert 0 < allowed < 200
+        assert allowed == 166
 
     def test_zero_balance_allows_nothing(self):
         allowed = check_risk_caps(

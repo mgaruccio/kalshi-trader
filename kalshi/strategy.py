@@ -173,6 +173,8 @@ class WeatherMakerStrategy(Strategy):
         self._initial_balance_cents: int = 0
         # ticker -> ns timestamp when it first passed filter (for tomorrow gating)
         self._first_quoted_ns: dict[str, int] = {}
+        # tickers with an IOC exit order in-flight (prevents duplicate exits)
+        self._exiting_tickers: set[str] = set()
 
     def on_start(self) -> None:
         self.subscribe_data(DataType(SignalScore))
@@ -204,12 +206,24 @@ class WeatherMakerStrategy(Strategy):
             f"FILL: {event.instrument_id} {event.order_side} "
             f"{event.last_qty}@{event.last_px}"
         )
+        # Clear exit guard so next tick can re-attempt if position remains open
+        try:
+            base_ticker, _ = parse_instrument_id(event.instrument_id)
+            self._exiting_tickers.discard(base_ticker)
+        except ValueError:
+            pass
 
     def on_order_canceled(self, event) -> None:
         pass  # _resting_orders replaced entirely on reprice
 
     def on_order_rejected(self, event) -> None:
         self.log.error(f"ORDER REJECTED: {event.instrument_id} — {event.reason}")
+        # Clear exit guard so next tick can retry
+        try:
+            base_ticker, _ = parse_instrument_id(event.instrument_id)
+            self._exiting_tickers.discard(base_ticker)
+        except ValueError:
+            pass
 
     # ------------------------------------------------------------------
     # Signal handlers
@@ -258,7 +272,9 @@ class WeatherMakerStrategy(Strategy):
                 f"Filter PASS: {ticker} ({side} side, "
                 f"p_win={score.no_p_win if side == 'no' else score.yes_p_win:.3f})"
             )
-            # Subscribe to quote ticks for both sides of the contract
+            # Subscribe to quote ticks for both sides of the contract.
+            # cache.add_instrument() MUST precede subscribe_quote_ticks() —
+            # StreamingFeatherWriter silently drops ticks for unknown instruments.
             for side_suffix in ("YES", "NO"):
                 instrument_id = InstrumentId(
                     Symbol(f"{ticker}-{side_suffix}"),
@@ -266,6 +282,7 @@ class WeatherMakerStrategy(Strategy):
                 )
                 instrument = self.cache.instrument(instrument_id)
                 if instrument is not None:
+                    self.cache.add_instrument(instrument)
                     self.subscribe_quote_ticks(instrument_id)
 
         elif not passes and ticker in self._quoted_tickers:
@@ -390,7 +407,14 @@ class WeatherMakerStrategy(Strategy):
         self._last_anchor[ticker] = bid_cents
 
     def _exit_position(self, ticker: str, instrument_id: InstrumentId, bid_cents: int) -> None:
-        """Exit position when price hits exit threshold (IOC — partial better than none)."""
+        """Exit position when price hits exit threshold (IOC — partial better than none).
+
+        Guard against duplicate exits: if an IOC exit is already in-flight for
+        this ticker, skip. Cleared in on_order_filled / on_order_rejected.
+        """
+        if ticker in self._exiting_tickers:
+            return
+
         self._cancel_all_for_ticker(ticker)
 
         positions = self.cache.positions(venue=instrument_id.venue)
@@ -405,6 +429,7 @@ class WeatherMakerStrategy(Strategy):
                         quantity=instrument.make_qty(qty),
                         time_in_force=TimeInForce.IOC,
                     )
+                    self._exiting_tickers.add(ticker)
                     self.submit_order(order)
                     self.log.info(f"EXIT: {ticker} at {bid_cents}c, selling {qty} contracts")
                 break

@@ -71,6 +71,7 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_handle_forecast_drift",
         "_evaluate_contract",
         "_cancel_all_for_ticker",
+        "_exit_position",
         "_market_exposure_cents",
         "_city_exposure_cents",
         "_check_circuit_breaker",
@@ -78,6 +79,8 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_in_entry_phase",
         "_is_tomorrow_contract",
         "_tomorrow_delay_elapsed",
+        "on_order_filled",
+        "on_order_rejected",
         "on_stop",
         "on_start",
     ):
@@ -156,6 +159,19 @@ class TestFilterEvaluation:
         strategy._handle_signal_score(score)
         assert strategy.subscribe_quote_ticks.call_count == 2
 
+    def test_cache_add_instrument_called_before_subscribe(self):
+        """cache.add_instrument() is called before subscribe_quote_ticks() for each side."""
+        strategy = _make_strategy()
+        instrument = MagicMock()
+        strategy.cache.instrument.return_value = instrument
+        call_order = []
+        strategy.cache.add_instrument = MagicMock(side_effect=lambda i: call_order.append("add"))
+        strategy.subscribe_quote_ticks = MagicMock(side_effect=lambda i: call_order.append("sub"))
+        score = _make_score(no_p_win=0.98, n_models=3)
+        strategy._handle_signal_score(score)
+        # For each of YES and NO: add must precede subscribe
+        assert call_order == ["add", "sub", "add", "sub"]
+
 
 class TestOnStop:
     def test_on_stop_cancels_open_orders(self):
@@ -222,6 +238,60 @@ class TestCircuitBreaker:
         strategy.portfolio.account.return_value = mock_account
         strategy._check_circuit_breaker()
         assert strategy._halted is False
+
+
+class TestExitGuard:
+    def test_exit_in_progress_blocks_second_exit(self):
+        """Duplicate IOC exits are blocked when _exiting_tickers contains the ticker."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        strategy = _make_strategy()
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        # Set up: no open positions (so no real order placed, but guard still tested)
+        strategy.cache.positions.return_value = []
+        # Mark as already exiting
+        strategy._exiting_tickers.add(ticker)
+
+        strategy._exit_position(ticker, instrument_id, 97)
+        # submit_order should NOT be called — guarded
+        strategy.submit_order.assert_not_called()
+
+    def test_exit_guard_cleared_on_fill(self):
+        """_exiting_tickers cleared when order fill event arrives."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        strategy = _make_strategy()
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+        strategy._exiting_tickers.add(ticker)
+
+        event = MagicMock()
+        event.instrument_id = instrument_id
+        event.order_side = MagicMock()
+        event.last_qty = MagicMock()
+        event.last_px = MagicMock()
+        strategy.on_order_filled(event)
+        assert ticker not in strategy._exiting_tickers
+
+    def test_exit_guard_cleared_on_reject(self):
+        """_exiting_tickers cleared when order rejection event arrives."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        strategy = _make_strategy()
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+        strategy._exiting_tickers.add(ticker)
+
+        event = MagicMock()
+        event.instrument_id = instrument_id
+        event.reason = "test rejection"
+        strategy.on_order_rejected(event)
+        assert ticker not in strategy._exiting_tickers
 
 
 class TestTimeOfDayGating:
