@@ -295,52 +295,50 @@ class TestExitGuard:
 
 
 class TestTimeOfDayGating:
+    # Timestamps for 2026-03-16 (Mon) at various ET times:
+    # 12:00 ET -> 1773676800000000000 ns
+    # 09:00 ET -> 1773666000000000000 ns
+    # 16:00 ET -> 1773691200000000000 ns
+
     def test_in_entry_phase_during_window(self):
-        """Returns True when current ET time is within [10:30, 15:00)."""
+        """Returns True when clock time is 12:00 ET, within [10:30, 15:00)."""
         cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
         strategy = _make_strategy(cfg)
-        from unittest.mock import patch
-        from datetime import datetime, time
-        from zoneinfo import ZoneInfo
-        # Mock datetime.now to return 12:00 ET
-        with patch("kalshi.strategy.datetime") as mock_dt:
-            mock_dt.now.return_value = MagicMock(time=lambda: time(12, 0))
-            assert strategy._in_entry_phase() is True
+        strategy.clock.timestamp_ns.return_value = 1_773_676_800_000_000_000  # 2026-03-16 12:00 ET
+        assert strategy._in_entry_phase() is True
 
     def test_before_entry_phase(self):
+        """Returns False when clock time is 09:00 ET, before [10:30, 15:00)."""
         cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
         strategy = _make_strategy(cfg)
-        from unittest.mock import patch
-        from datetime import time
-        with patch("kalshi.strategy.datetime") as mock_dt:
-            mock_dt.now.return_value = MagicMock(time=lambda: time(9, 0))
-            assert strategy._in_entry_phase() is False
+        strategy.clock.timestamp_ns.return_value = 1_773_666_000_000_000_000  # 2026-03-16 09:00 ET
+        assert strategy._in_entry_phase() is False
 
     def test_after_entry_phase(self):
+        """Returns False when clock time is 16:00 ET, after [10:30, 15:00)."""
         cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
         strategy = _make_strategy(cfg)
-        from unittest.mock import patch
-        from datetime import time
-        with patch("kalshi.strategy.datetime") as mock_dt:
-            mock_dt.now.return_value = MagicMock(time=lambda: time(16, 0))
-            assert strategy._in_entry_phase() is False
+        strategy.clock.timestamp_ns.return_value = 1_773_691_200_000_000_000  # 2026-03-16 16:00 ET
+        assert strategy._in_entry_phase() is False
 
 
 class TestTomorrowContractGating:
+    # Use 2026-03-14 noon ET as the clock reference (1773504000000000000 ns).
+    # "Today" from clock = 2026-03-14, so ticker date 26MAR14 is today, 26MAR15 is tomorrow.
+    _NOW_NS = 1_773_504_000_000_000_000  # 2026-03-14 12:00 ET
+
     def test_today_contract_not_tomorrow(self):
-        """Ticker with today's date is not a tomorrow contract."""
-        from datetime import date
-        today = date.today()
-        ticker = f"KXHIGHNY-{today.strftime('%y%b%d').upper()}-T54"
+        """Ticker with clock's current date is not a tomorrow contract."""
         strategy = _make_strategy()
+        strategy.clock.timestamp_ns.return_value = self._NOW_NS
+        ticker = "KXHIGHNY-26MAR14-T54"  # 2026-03-14 == clock's today
         assert strategy._is_tomorrow_contract(ticker) is False
 
     def test_future_contract_is_tomorrow(self):
-        """Ticker with tomorrow's date is a tomorrow contract."""
-        from datetime import date, timedelta
-        tomorrow = date.today() + timedelta(days=1)
-        ticker = f"KXHIGHNY-{tomorrow.strftime('%y%b%d').upper()}-T54"
+        """Ticker with a future date is a tomorrow contract."""
         strategy = _make_strategy()
+        strategy.clock.timestamp_ns.return_value = self._NOW_NS
+        ticker = "KXHIGHNY-26MAR15-T54"  # 2026-03-15 > clock's today (2026-03-14)
         assert strategy._is_tomorrow_contract(ticker) is True
 
     def test_delay_not_elapsed(self):

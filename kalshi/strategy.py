@@ -474,7 +474,8 @@ class WeatherMakerStrategy(Strategy):
 
     def _in_entry_phase(self) -> bool:
         """Return True if current ET time is within the entry phase window."""
-        now_et = datetime.now(_ET).time()
+        now_ns = self.clock.timestamp_ns()
+        now_et = datetime.fromtimestamp(now_ns / 1e9, tz=_ET).time()
         h_start, m_start = (int(x) for x in self._config.entry_phase_start_et.split(":"))
         h_end, m_end = (int(x) for x in self._config.entry_phase_end_et.split(":"))
         start = time(h_start, m_start)
@@ -491,7 +492,9 @@ class WeatherMakerStrategy(Strategy):
         try:
             # Parse YYMONDD: e.g. "26MAR15" -> 2026-03-15
             settlement = datetime.strptime(date_str, "%y%b%d").date()
-            return settlement > date.today()
+            now_ns = self.clock.timestamp_ns()
+            today = datetime.fromtimestamp(now_ns / 1e9, tz=_ET).date()
+            return settlement > today
         except ValueError:
             return False
 
