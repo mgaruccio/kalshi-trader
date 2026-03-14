@@ -387,7 +387,8 @@ class KalshiExecutionClient(LiveExecutionClient):
         )
         instrument = self._instrument_provider.find(instrument_id)
         if not instrument:
-            log.warning(f"Fill for unknown instrument {instrument_id}")
+            log.error(f"Fill for unknown instrument {instrument_id} — triggering reconciliation")
+            asyncio.create_task(self.generate_position_status_reports(None))
             return
 
         # Generate accepted first if not yet done

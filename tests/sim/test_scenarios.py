@@ -298,7 +298,7 @@ class TestImmediateFill:
 # ---------------------------------------------------------------------------
 
 class TestUnknownInstrumentFill:
-    def test_fill_for_unknown_instrument_does_not_crash(self):
+    def test_fill_for_unknown_instrument_triggers_reconciliation(self):
         stub = _make_adapter_stub()
         stub._instrument_provider.find.return_value = None  # unknown instrument
         factory = WsMessageFactory()
@@ -307,9 +307,11 @@ class TestUnknownInstrumentFill:
             trade_id="T-UNK", order_id="O-UNK", ticker="UNKNOWN-TICKER",
             side="yes", action="buy", count=1, price_cents=50,
         )
-        with patch("kalshi.execution.asyncio.create_task"):
+        with patch("kalshi.execution.asyncio.create_task") as mock_task:
             stub._handle_ws_message(msg)
 
+        # Unknown instrument fill must trigger position reconciliation, not silent drop
+        assert mock_task.call_count == 1
         stub.generate_order_filled.assert_not_called()
 
 
