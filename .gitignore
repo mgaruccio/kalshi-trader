@@ -14,3 +14,6 @@ wheels/
 .env.prod
 *.pem
 kalshi_data_catalog/
+
+# Worktrees
+.worktrees/
