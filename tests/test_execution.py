@@ -1,6 +1,8 @@
 """Tests for KalshiExecutionClient — order translation and fill processing."""
+import asyncio
 import pytest
-from unittest.mock import MagicMock
+from collections import OrderedDict
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
 from nautilus_trader.model.identifiers import (
@@ -10,7 +12,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.model.currencies import USD
 
 from kalshi.common.constants import KALSHI_VENUE
-from kalshi.execution import _order_to_kalshi_params, _parse_fill_commission
+from kalshi.execution import _order_to_kalshi_params, _parse_fill_commission, _DEDUP_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +73,7 @@ class TestOrderToKalshiParams:
         params = _order_to_kalshi_params(order, instrument_id)
         assert params["time_in_force"] == "good_till_canceled"
 
-    def test_ioc_uses_full_string(self):
+    def test_fok_uses_full_string(self):
         """Correction #8: time_in_force must be 'fill_or_kill' not 'fok'."""
         order, instrument_id = _make_order(OrderSide.BUY, "KXHIGHCHI-26MAR14-T55", "YES", 0.32, tif=TimeInForce.FOK)
         params = _order_to_kalshi_params(order, instrument_id)
@@ -106,3 +108,112 @@ class TestParseFillCommission:
     def test_zero_fee_cost(self):
         commission = _parse_fill_commission("0.0000")
         assert float(commission) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by settlement + dedup tests
+# ---------------------------------------------------------------------------
+
+def _make_fill_stub():
+    """Bind KalshiExecutionClient._handle_fill onto a plain Python SimpleNamespace.
+
+    KalshiExecutionClient inherits from a Cython Component that makes attributes
+    like _clock read-only descriptors. We cannot __new__ the class and assign to
+    them in tests. Instead, we bind the pure-Python _handle_fill method onto a
+    SimpleNamespace that has only the attributes the method actually needs.
+    """
+    import types as _types
+    from kalshi.execution import KalshiExecutionClient
+
+    stub = _types.SimpleNamespace(
+        _seen_trade_ids=OrderedDict(),
+        _accepted_orders={},
+        _instrument_provider=MagicMock(),
+        generate_order_accepted=MagicMock(),
+        generate_order_filled=MagicMock(),
+        generate_position_status_reports=AsyncMock(return_value=[]),
+    )
+    stub._handle_fill = _types.MethodType(KalshiExecutionClient._handle_fill, stub)
+    return stub
+
+
+def _mock_fill(trade_id: str, market_ticker: str | None = "KXHIGHCHI-26MAR14-T55") -> MagicMock:
+    fill = MagicMock()
+    fill.trade_id = trade_id
+    fill.market_ticker = market_ticker
+    fill.client_order_id = "C-001"
+    fill.order_id = "O-001"
+    fill.side = "yes"
+    fill.yes_price_dollars = "0.50"
+    fill.no_price_dollars = None
+    fill.count_fp = "5"
+    fill.fee_cost = "0.01"
+    fill.is_taker = True
+    fill.action = "buy"
+    return fill
+
+
+# ---------------------------------------------------------------------------
+# Settlement fill → position reconciliation (Correction #4)
+# ---------------------------------------------------------------------------
+
+class TestSettlementFill:
+    def test_settlement_fill_triggers_position_reconciliation(self):
+        """Correction #4: Fill with no market_ticker → ensure_future(generate_position_status_reports)."""
+        stub = _make_fill_stub()
+        fill = _mock_fill("T-SETTLE", market_ticker=None)
+
+        with patch("kalshi.execution.asyncio.create_task") as mock_future:
+            stub._handle_fill(fill, 1_000_000)
+            assert mock_future.call_count == 1
+
+    def test_settlement_fill_does_not_emit_order_filled(self):
+        """Settlement fills must not produce a fill event."""
+        stub = _make_fill_stub()
+        fill = _mock_fill("T-SETTLE", market_ticker=None)
+
+        with patch("kalshi.execution.asyncio.create_task"):
+            stub._handle_fill(fill, 1_000_000)
+
+        stub.generate_order_filled.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Dedup cache (Correction #22)
+# ---------------------------------------------------------------------------
+
+class TestDedupCache:
+    def _stub_with_instrument(self):
+        stub = _make_fill_stub()
+        instrument = MagicMock()
+        instrument.make_qty = lambda x: x
+        instrument.make_price = lambda x: x
+        stub._instrument_provider.find.return_value = instrument
+        return stub
+
+    def test_duplicate_trade_id_skipped(self):
+        """Correction #22: Same trade_id must not generate two fill events."""
+        stub = self._stub_with_instrument()
+        fill = _mock_fill("T-001")
+
+        stub._handle_fill(fill, 1_000_000)
+        stub._handle_fill(fill, 1_000_001)  # duplicate
+
+        assert stub.generate_order_filled.call_count == 1
+
+    def test_cache_evicts_oldest_at_10k(self):
+        """Correction #22: After 10K entries, the oldest is evicted on the next insert."""
+        stub = self._stub_with_instrument()
+
+        # Pre-fill the cache to the max
+        for i in range(_DEDUP_MAX):
+            stub._seen_trade_ids[f"T-{i:06d}"] = None
+
+        oldest = "T-000000"
+        assert oldest in stub._seen_trade_ids
+
+        fill = _mock_fill("T-NEW")
+        stub._handle_fill(fill, 1_000_000)
+
+        assert oldest not in stub._seen_trade_ids, "Oldest entry should have been evicted"
+        assert "T-NEW" in stub._seen_trade_ids

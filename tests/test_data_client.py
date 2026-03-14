@@ -27,6 +27,17 @@ class TestDeriveQuotes:
         quotes = _derive_quotes("TICKER", {}, {})
         assert quotes is None
 
+    def test_empty_no_book(self):
+        """YES data only — NO book empty. NO ask derived from YES bid; YES ask = 1.0."""
+        quotes = _derive_quotes("TICKER", {0.32: 5.0}, {})
+        assert quotes["YES"]["bid"] == 0.32
+        assert quotes["YES"]["ask"] == 1.0  # no NO bids → 1.0 - 0.0
+        assert quotes["YES"]["bid_size"] == 5.0
+        assert quotes["YES"]["ask_size"] == 0.0
+        assert quotes["NO"]["bid"] == 0.0
+        assert quotes["NO"]["ask"] == pytest.approx(1.0 - 0.32)
+        assert quotes["NO"]["ask_size"] == 5.0
+
     def test_single_level_each_side(self):
         quotes = _derive_quotes("TICKER", {0.50: 10.0}, {0.50: 10.0})
         assert quotes["YES"]["bid"] == 0.50

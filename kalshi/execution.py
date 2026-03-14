@@ -1,5 +1,6 @@
 """Kalshi execution client — order management, fills, and reconciliation."""
 import asyncio
+import json
 import logging
 from collections import OrderedDict
 from decimal import Decimal
@@ -82,6 +83,32 @@ def _parse_fill_commission(fee_cost: str | None) -> Money:
     return Money(float(fee_cost), USDC)
 
 
+class TokenBucket:
+    """Async token-bucket rate limiter (Correction #9: 10 writes/sec Kalshi Basic tier)."""
+
+    def __init__(self, rate: float = 10.0, capacity: float = 10.0) -> None:
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens: float = capacity
+        self._updated_at: float | None = None
+
+    async def acquire(self, cost: float = 1.0) -> None:
+        while True:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            if self._updated_at is None:
+                self._updated_at = now
+            elapsed = now - self._updated_at
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+            self._updated_at = now
+            if self._tokens >= cost:
+                self._tokens -= cost
+                return
+            sleep_time = (cost - self._tokens) / self._rate
+            await asyncio.sleep(sleep_time)
+            now = asyncio.get_running_loop().time()
+
+
 class KalshiExecutionClient(LiveExecutionClient):
     """Kalshi live execution client.
 
@@ -137,6 +164,9 @@ class KalshiExecutionClient(LiveExecutionClient):
             retry_check=should_retry,
         )
 
+        # Token-bucket rate limiter (Correction #9: 10 writes/sec Basic tier)
+        self._rate_limiter = TokenBucket(rate=10.0, capacity=10.0)
+
         # WebSocket for user_orders + fill channels
         self._ws_client = KalshiWebSocketClient(
             clock=clock,
@@ -177,11 +207,16 @@ class KalshiExecutionClient(LiveExecutionClient):
         order = command.order
         params = _order_to_kalshi_params(order, command.instrument_id)
 
+        # Correction #9: rate-limit write operations
+        await self._rate_limiter.acquire()
+
         retry_manager = await self._retry_manager_pool.acquire()
         try:
             response = await retry_manager.run(
                 "create_order",
-                asyncio.to_thread(self._portfolio.create_order, **params),
+                asyncio.to_thread(
+                    self._portfolio.create_order_with_http_info, **params
+                ),
             )
             # Correction #3: None response → rejected
             if response is None:
@@ -208,13 +243,17 @@ class KalshiExecutionClient(LiveExecutionClient):
 
     async def _ack_fallback(self, command, create_response) -> None:
         """Correction #20: On ACK timeout, query REST for order status."""
+        # Remove stale ACK event to prevent memory leak
+        self._ack_events.pop(command.order.client_order_id.value, None)
         try:
-            order_id = create_response.order.order_id
+            create_data = json.loads(create_response.raw_data)
+            order_id = create_data["order"]["order_id"]
             resp = await asyncio.to_thread(
-                self._portfolio.get_order, order_id=order_id
+                self._portfolio.get_order_with_http_info, order_id=order_id
             )
-            order_data = getattr(resp, "order", None)
-            if order_data and order_data.status in ("resting", "filled"):
+            data = json.loads(resp.raw_data)
+            order_data = data.get("order", {})
+            if order_data.get("status") in ("resting", "filled"):
                 c_oid = command.order.client_order_id
                 if c_oid not in self._accepted_orders:
                     self.generate_order_accepted(
@@ -229,9 +268,11 @@ class KalshiExecutionClient(LiveExecutionClient):
             log.error(f"ACK fallback failed: {e}")
 
     async def _cancel_order(self, command) -> None:
+        # Correction #9: rate-limit write operations
+        await self._rate_limiter.acquire()
         try:
             await asyncio.to_thread(
-                self._portfolio.cancel_order,
+                self._portfolio.cancel_order_with_http_info,
                 order_id=command.venue_order_id.value,
             )
         except ApiException as e:
@@ -246,7 +287,7 @@ class KalshiExecutionClient(LiveExecutionClient):
 
     async def _cancel_all_orders(self, command) -> None:
         try:
-            await asyncio.to_thread(self._portfolio.cancel_all_orders)
+            await asyncio.to_thread(self._portfolio.batch_cancel_orders_with_http_info)
         except ApiException as e:
             log.error(f"cancel_all_orders failed: {e}")
 
@@ -258,6 +299,13 @@ class KalshiExecutionClient(LiveExecutionClient):
         try:
             msg_type, sid, seq, msg = decode_ws_msg(raw)
             ts = self._clock.timestamp_ns()
+
+            # Sequence gap → missed fills are catastrophic; trigger reconciliation
+            if not self._ws_client._check_sequence(sid=sid, seq=seq):
+                log.warning(f"Execution WS sequence gap sid={sid}, triggering reconciliation")
+                asyncio.create_task(self.generate_order_status_reports(None))
+                asyncio.create_task(self.generate_fill_reports(None))
+                return
 
             if msg_type == "user_order" and isinstance(msg, UserOrderMsg):
                 self._handle_user_order(msg, ts)
@@ -296,6 +344,19 @@ class KalshiExecutionClient(LiveExecutionClient):
                     venue_order_id=v_oid,
                     ts_event=ts,
                 )
+        elif msg.status == "filled":
+            # Immediately-filled orders (market orders, limit crossing spread) arrive
+            # with status="filled" — no "resting" status is sent. Accept if needed;
+            # the fill details come separately via the fill channel.
+            if c_oid and c_oid not in self._accepted_orders:
+                self.generate_order_accepted(
+                    strategy_id=None,
+                    instrument_id=instrument_id,
+                    client_order_id=c_oid,
+                    venue_order_id=v_oid,
+                    ts_event=ts,
+                )
+                self._accepted_orders[c_oid] = v_oid
         elif msg.status == "rejected":
             if c_oid:
                 self.generate_order_rejected(
@@ -309,14 +370,14 @@ class KalshiExecutionClient(LiveExecutionClient):
     def _handle_fill(self, msg: FillMsg, ts: int) -> None:
         # Correction #4: Settlement fills (no ticker) → reconcile positions
         if not msg.market_ticker:
-            asyncio.ensure_future(self.generate_position_status_reports(None))
+            asyncio.create_task(self.generate_position_status_reports(None))
             return
 
         # Correction #22: Bounded dedup cache
         if msg.trade_id in self._seen_trade_ids:
             return
         self._seen_trade_ids[msg.trade_id] = None
-        if len(self._seen_trade_ids) > _DEDUP_MAX:
+        if len(self._seen_trade_ids) >= _DEDUP_MAX:
             self._seen_trade_ids.popitem(last=False)
 
         c_oid = ClientOrderId(msg.client_order_id) if msg.client_order_id else None
@@ -369,8 +430,9 @@ class KalshiExecutionClient(LiveExecutionClient):
 
     async def _update_account_state(self) -> None:
         try:
-            resp = await asyncio.to_thread(self._portfolio.get_balance)
-            balance = getattr(resp, "balance", None)
+            resp = await asyncio.to_thread(self._portfolio.get_balance_with_http_info)
+            data = json.loads(resp.raw_data)
+            balance = data.get("balance")
             if balance is None:
                 return
             balance_dollars = float(balance) / 100.0  # Kalshi balance is in cents
@@ -391,12 +453,13 @@ class KalshiExecutionClient(LiveExecutionClient):
         reports = []
         try:
             resp = await asyncio.to_thread(
-                self._portfolio.get_orders, status="resting"
+                self._portfolio.get_orders_with_http_info, status="resting"
             )
+            data = json.loads(resp.raw_data)
             ts = self._clock.timestamp_ns()
-            for order in getattr(resp, "orders", []) or []:
-                ticker = getattr(order, "ticker", None)
-                side = getattr(order, "side", "yes")
+            for order in data.get("orders", []) or []:
+                ticker = order.get("ticker")
+                side = order.get("side", "yes")
                 if not ticker:
                     continue
                 instrument_id = InstrumentId(
@@ -406,27 +469,28 @@ class KalshiExecutionClient(LiveExecutionClient):
                 if not instrument:
                     continue
 
-                yes_price = getattr(order, "yes_price", None)
-                no_price = getattr(order, "no_price", None)
+                yes_price = order.get("yes_price")
+                no_price = order.get("no_price")
                 price = None
                 if side == "yes" and yes_price:
                     price = instrument.make_price(yes_price / 100.0)
                 elif side == "no" and no_price:
                     price = instrument.make_price(no_price / 100.0)
 
+                client_order_id_val = order.get("client_order_id")
                 reports.append(
                     OrderStatusReport(
                         account_id=self.account_id,
                         instrument_id=instrument_id,
-                        venue_order_id=VenueOrderId(order.order_id),
-                        order_side=OrderSide.BUY if order.action == "buy" else OrderSide.SELL,
+                        venue_order_id=VenueOrderId(order["order_id"]),
+                        order_side=OrderSide.BUY if order.get("action") == "buy" else OrderSide.SELL,
                         order_type=OrderType.LIMIT,
                         time_in_force=TimeInForce.GTC,
                         order_status=OrderStatus.ACCEPTED,
-                        quantity=instrument.make_qty(getattr(order, "count", 0)),
+                        quantity=instrument.make_qty(order.get("count", 0)),
                         filled_qty=instrument.make_qty(0),
                         price=price,
-                        client_order_id=ClientOrderId(order.client_order_id) if getattr(order, "client_order_id", None) else None,
+                        client_order_id=ClientOrderId(client_order_id_val) if client_order_id_val else None,
                         report_id=UUID4(),
                         ts_accepted=ts,
                         ts_last=ts,
@@ -440,11 +504,12 @@ class KalshiExecutionClient(LiveExecutionClient):
     async def generate_fill_reports(self, command) -> list[FillReport]:
         reports = []
         try:
-            resp = await asyncio.to_thread(self._portfolio.get_fills)
+            resp = await asyncio.to_thread(self._portfolio.get_fills_with_http_info)
+            data = json.loads(resp.raw_data)
             ts = self._clock.timestamp_ns()
-            for fill in getattr(resp, "fills", []) or []:
-                ticker = getattr(fill, "market_ticker", None)
-                side = getattr(fill, "side", "yes")
+            for fill in data.get("fills", []) or []:
+                ticker = fill.get("market_ticker")
+                side = fill.get("side", "yes")
                 if not ticker:
                     continue
                 instrument_id = InstrumentId(
@@ -454,23 +519,24 @@ class KalshiExecutionClient(LiveExecutionClient):
                 if not instrument:
                     continue
 
-                yes_price = getattr(fill, "yes_price", None)
-                no_price = getattr(fill, "no_price", None)
+                yes_price = fill.get("yes_price")
+                no_price = fill.get("no_price")
                 price_dollars = (yes_price or no_price or 0) / 100.0
-                fee = getattr(fill, "fee_cost", None)
+                fee = fill.get("fee_cost")
+                client_order_id_val = fill.get("client_order_id")
 
                 reports.append(
                     FillReport(
                         account_id=self.account_id,
                         instrument_id=instrument_id,
-                        venue_order_id=VenueOrderId(fill.order_id),
-                        trade_id=TradeId(fill.trade_id),
-                        order_side=OrderSide.BUY if fill.action == "buy" else OrderSide.SELL,
-                        last_qty=instrument.make_qty(float(getattr(fill, "count_fp", 0))),
+                        venue_order_id=VenueOrderId(fill["order_id"]),
+                        trade_id=TradeId(fill["trade_id"]),
+                        order_side=OrderSide.BUY if fill.get("action") == "buy" else OrderSide.SELL,
+                        last_qty=instrument.make_qty(float(fill.get("count_fp", 0))),
                         last_px=instrument.make_price(price_dollars),
                         commission=_parse_fill_commission(str(fee) if fee is not None else None),
-                        liquidity_side=LiquiditySide.TAKER if getattr(fill, "is_taker", False) else LiquiditySide.MAKER,
-                        client_order_id=ClientOrderId(fill.client_order_id) if getattr(fill, "client_order_id", None) else None,
+                        liquidity_side=LiquiditySide.TAKER if fill.get("is_taker", False) else LiquiditySide.MAKER,
+                        client_order_id=ClientOrderId(client_order_id_val) if client_order_id_val else None,
                         report_id=UUID4(),
                         ts_event=ts,
                         ts_init=ts,
@@ -483,11 +549,12 @@ class KalshiExecutionClient(LiveExecutionClient):
     async def generate_position_status_reports(self, command) -> list[PositionStatusReport]:
         reports = []
         try:
-            resp = await asyncio.to_thread(self._portfolio.get_positions)
+            resp = await asyncio.to_thread(self._portfolio.get_positions_with_http_info)
+            data = json.loads(resp.raw_data)
             ts = self._clock.timestamp_ns()
-            for pos in getattr(resp, "market_exposures", []) or []:
-                ticker = getattr(pos, "market_id", None) or getattr(pos, "ticker", None)
-                position_fp = float(getattr(pos, "position_fp", 0) or 0)
+            for pos in data.get("market_exposures", []) or []:
+                ticker = pos.get("market_id") or pos.get("ticker")
+                position_fp = float(pos.get("position_fp", 0) or 0)
                 if not ticker or position_fp == 0:
                     continue
                 side = "YES" if position_fp > 0 else "NO"

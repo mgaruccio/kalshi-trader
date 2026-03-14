@@ -133,7 +133,7 @@ class KalshiDataClient(LiveMarketDataClient):
                 # Sequence gap — clear books and resubscribe
                 log.warning(f"Sequence gap detected for sid={sid}, clearing books")
                 self._books.clear()
-                asyncio.ensure_future(self._resubscribe_all())
+                asyncio.create_task(self._resubscribe_all())
                 return
 
             if msg_type == "orderbook_snapshot":
