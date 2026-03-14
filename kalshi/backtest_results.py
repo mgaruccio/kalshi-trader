@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+
 
 @dataclass
 class BacktestResults:
@@ -121,7 +124,6 @@ def _compute_max_drawdown_cents(fills) -> int:
     max_dd = 0
 
     for f in fills:
-        from nautilus_trader.model.enums import OrderSide
         price_cents = round(float(f.last_px) * 100)
         qty = int(f.last_qty)
         if f.order_side == OrderSide.SELL:
@@ -144,8 +146,6 @@ def _compute_contracts_per_city(fills, cache) -> dict[str, int]:
     City is extracted from the instrument's raw_symbol metadata if available,
     falling back to the ticker prefix heuristic (e.g. KXHIGHNY -> ny).
     """
-    from nautilus_trader.model.enums import OrderSide
-
     city_counts: dict[str, int] = {}
     for f in fills:
         if f.order_side != OrderSide.BUY:
@@ -165,7 +165,6 @@ def _city_from_instrument_id(instrument_id_str: str, cache) -> str:
     e.g. KXHIGHNY-26MAR15-T54-YES -> city code "NY"
     """
     try:
-        from nautilus_trader.model.identifiers import InstrumentId
         inst_id = InstrumentId.from_str(instrument_id_str)
         instrument = cache.instrument(inst_id)
         if instrument is not None:
