@@ -201,7 +201,7 @@ def format_report(results: BacktestResults) -> str:
         f"  Adjusted PnL:     {results.adjusted_pnl_cents:+.1f}c  (fill_rate / assumed)",
         "",
         "--- Fill Statistics ---",
-        f"  Orders submitted: {results.order_count}",
+        f"  Orders placed (NT): {results.order_count}",
         f"  Fills:            {results.fill_count}",
         f"  Fill rate:        {results.fill_rate:.1%}",
         f"  Avg fill price:   {results.avg_fill_price_cents:.1f}c",
