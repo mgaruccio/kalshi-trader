@@ -1,4 +1,5 @@
 """Mock Kalshi REST/WebSocket server for confidence tests."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,10 +16,10 @@ from websockets.asyncio.server import serve as ws_serve
 class MockOrder:
     order_id: str
     ticker: str
-    side: str          # "yes" or "no"
-    action: str        # "buy" or "sell"
-    type: str          # "limit" or "market"
-    status: str        # "resting", "filled", "canceled"
+    side: str  # "yes" or "no"
+    action: str  # "buy" or "sell"
+    type: str  # "limit" or "market"
+    status: str  # "resting", "filled", "canceled"
     count: int
     client_order_id: str
     yes_price: int = 0
@@ -26,7 +27,12 @@ class MockOrder:
     time_in_force: str = "good_till_canceled"
 
 
-_STATUS_PHRASES = {200: "OK", 201: "Created", 404: "Not Found", 500: "Internal Server Error"}
+_STATUS_PHRASES = {
+    200: "OK",
+    201: "Created",
+    404: "Not Found",
+    500: "Internal Server Error",
+}
 
 _SID_USER_ORDER = 1
 _SID_FILL = 2
@@ -71,20 +77,36 @@ class MockKalshiServer:
         ws_port=None skips starting the WS server.
         """
         self._http_server = await asyncio.start_server(
-            self._handle_http, "127.0.0.1", port,
+            self._handle_http,
+            "127.0.0.1",
+            port,
         )
         self.port = self._http_server.sockets[0].getsockname()[1]
 
         if ws_port is not None:
             self._ws_server = await ws_serve(
-                self._ws_handler, "127.0.0.1", ws_port,
+                self._ws_handler,
+                "127.0.0.1",
+                ws_port,
             )
             self.ws_port = self._ws_server.sockets[0].getsockname()[1]
 
     async def stop(self) -> None:
+        # Force-close all active WS connections before stopping so that
+        # wait_closed() doesn't block waiting for clients to disconnect
+        # on their own (the TradingNode may take >3 s to fully stop).
+        for ws in list(self._subscriptions.keys()):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        self._subscriptions.clear()
+
         if self._ws_server:
             self._ws_server.close()
-            await self._ws_server.wait_closed()
+            # Skip wait_closed() — reconnecting clients can create new connections
+            # after close(); the server thread is stopped by the test runner's
+            # loop.stop() call immediately after.
         if self._http_server:
             self._http_server.close()
             await self._http_server.wait_closed()
@@ -174,7 +196,10 @@ class MockKalshiServer:
             "side": side,
         }
         await self._broadcast_ws(
-            "orderbook_delta", _SID_ORDERBOOK, msg, channel="orderbook_delta",
+            "orderbook_delta",
+            _SID_ORDERBOOK,
+            msg,
+            channel="orderbook_delta",
         )
 
     # ------------------------------------------------------------------
@@ -239,7 +264,9 @@ class MockKalshiServer:
 
         return False, 0.0
 
-    async def _send_fill_notifications(self, order: MockOrder, fill_price: float) -> None:
+    async def _send_fill_notifications(
+        self, order: MockOrder, fill_price: float
+    ) -> None:
         """Broadcast user_order(filled) + fill WS messages; store fill for REST."""
         # user_order message
         user_msg: dict[str, Any] = {
@@ -272,8 +299,12 @@ class MockKalshiServer:
             "ts": int(time.time() * 1_000_000_000),
             "client_order_id": order.client_order_id,
             "fee_cost": "0.00",
-            "yes_price_dollars": f"{fill_price:.2f}" if order.side == "yes" else f"{complement:.2f}",
-            "no_price_dollars": f"{fill_price:.2f}" if order.side == "no" else f"{complement:.2f}",
+            "yes_price_dollars": f"{fill_price:.2f}"
+            if order.side == "yes"
+            else f"{complement:.2f}",
+            "no_price_dollars": f"{fill_price:.2f}"
+            if order.side == "no"
+            else f"{complement:.2f}",
         }
 
         # REST fills use int-cent format (execution.py:523-525 reads yes_price/no_price in cents)
@@ -287,12 +318,18 @@ class MockKalshiServer:
             "is_taker": True,
             "client_order_id": order.client_order_id,
             "fee_cost": "0.00",
-            "yes_price": int(round((fill_price if order.side == "yes" else complement) * 100)),
-            "no_price": int(round((fill_price if order.side == "no" else complement) * 100)),
+            "yes_price": int(
+                round((fill_price if order.side == "yes" else complement) * 100)
+            ),
+            "no_price": int(
+                round((fill_price if order.side == "no" else complement) * 100)
+            ),
         }
         self._fills.append(rest_fill)
 
-        await self._broadcast_ws("user_order", _SID_USER_ORDER, user_msg, channel="user_orders")
+        await self._broadcast_ws(
+            "user_order", _SID_USER_ORDER, user_msg, channel="user_orders"
+        )
         await self._broadcast_ws("fill", _SID_FILL, fill_msg, channel="fill")
 
     async def check_resting_orders(self) -> None:
@@ -401,7 +438,7 @@ class MockKalshiServer:
 
         prefix = "/trade-api/v2"
         if path.startswith(prefix):
-            path = path[len(prefix):]
+            path = path[len(prefix) :]
 
         if method == "GET" and path == "/markets":
             return 200, self._handle_get_markets()
@@ -420,14 +457,14 @@ class MockKalshiServer:
             return 200, await self._handle_cancel_all_orders()
 
         if method == "GET" and path.startswith("/portfolio/orders/"):
-            order_id = path[len("/portfolio/orders/"):]
+            order_id = path[len("/portfolio/orders/") :]
             o = self._orders.get(order_id)
             if not o:
                 return 404, {"error": "not found"}
             return 200, {"order": self._order_to_dict(o)}
 
         if method == "DELETE" and path.startswith("/portfolio/orders/"):
-            order_id = path[len("/portfolio/orders/"):]
+            order_id = path[len("/portfolio/orders/") :]
             return 200, await self._handle_cancel_order(order_id)
 
         if method == "GET" and path == "/portfolio/fills":
@@ -444,8 +481,12 @@ class MockKalshiServer:
 
     def _handle_get_markets(self) -> dict:
         from tests.mock_exchange.fixtures import (
-            TEST_TICKER, TEST_TITLE, TEST_CLOSE_TIME, TEST_SERIES,
+            TEST_TICKER,
+            TEST_TITLE,
+            TEST_CLOSE_TIME,
+            TEST_SERIES,
         )
+
         return {
             "markets": [
                 {
@@ -510,7 +551,10 @@ class MockKalshiServer:
                 "remaining_count_fp": f"{order.count:.2f}",
             }
             await self._broadcast_ws(
-                "user_order", _SID_USER_ORDER, user_msg, channel="user_orders",
+                "user_order",
+                _SID_USER_ORDER,
+                user_msg,
+                channel="user_orders",
             )
 
         return {"order": self._order_to_dict(order)}
@@ -528,7 +572,10 @@ class MockKalshiServer:
                 "client_order_id": o.client_order_id,
             }
             await self._broadcast_ws(
-                "user_order", _SID_USER_ORDER, user_msg, channel="user_orders",
+                "user_order",
+                _SID_USER_ORDER,
+                user_msg,
+                channel="user_orders",
             )
             return {"order": self._order_to_dict(o)}
         return {"order": self._order_to_dict(o) if o else {}}
@@ -548,7 +595,10 @@ class MockKalshiServer:
                     "client_order_id": o.client_order_id,
                 }
                 await self._broadcast_ws(
-                    "user_order", _SID_USER_ORDER, user_msg, channel="user_orders",
+                    "user_order",
+                    _SID_USER_ORDER,
+                    user_msg,
+                    channel="user_orders",
                 )
         return {"orders": canceled}
 
@@ -563,13 +613,16 @@ class MockKalshiServer:
     # ------------------------------------------------------------------
 
     def _order_to_dict(self, order: MockOrder) -> dict:
+        # Kalshi v3 SDK uses "executed" for filled orders in REST responses.
+        # Internal MockOrder.status stays "filled" for matching engine clarity.
+        rest_status = "executed" if order.status == "filled" else order.status
         return {
             "order_id": order.order_id,
             "ticker": order.ticker,
             "side": order.side,
             "action": order.action,
             "type": order.type,
-            "status": order.status,
+            "status": rest_status,
             "count": order.count,
             "client_order_id": order.client_order_id,
             "yes_price": order.yes_price,

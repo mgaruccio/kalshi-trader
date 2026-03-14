@@ -12,6 +12,7 @@ Behaviour:
 "Done" means the strategy has collected enough evidence (≥ 2 fills) for the
 test runner to assert outcomes against the scenario expectations.
 """
+
 from __future__ import annotations
 
 import logging
@@ -44,9 +45,9 @@ class ConfidenceTestStrategy(Strategy):
 
         # Order state
         self._market_order_placed = False
-        self._current_limit_client_oid = None   # ClientOrderId of live limit order
+        self._current_limit_client_oid = None  # ClientOrderId of live limit order
         self._last_no_bid_cents: int | None = None
-        self._limit_order_count = 0             # total limit orders placed
+        self._limit_order_count = 0  # total limit orders placed
 
         # Event tracking (populated by order callbacks)
         self.accepted_orders: list = []
@@ -117,14 +118,18 @@ class ConfidenceTestStrategy(Strategy):
         self.submit_order(order)
         self._current_limit_client_oid = order.client_order_id
         self._limit_order_count += 1
-        log.debug(f"[strategy] limit order submitted at {price_cents}c: {order.client_order_id}")
+        log.debug(
+            f"[strategy] limit order submitted at {price_cents}c: {order.client_order_id}"
+        )
 
     def _cancel_and_replace_limit(self, new_price_cents: int) -> None:
         if self._current_limit_client_oid is not None:
             order = self.cache.order(self._current_limit_client_oid)
             if order is not None and order.is_open:
                 self.cancel_order(order)
-                log.debug(f"[strategy] canceling limit: {self._current_limit_client_oid}")
+                log.debug(
+                    f"[strategy] canceling limit: {self._current_limit_client_oid}"
+                )
         self._place_limit_order(new_price_cents)
 
     # ------------------------------------------------------------------
@@ -148,7 +153,9 @@ class ConfidenceTestStrategy(Strategy):
 
     def on_order_rejected(self, event) -> None:
         self.rejected_orders.append(event)
-        log.warning(f"[strategy] order rejected: {event.client_order_id} — {event.reason}")
+        log.warning(
+            f"[strategy] order rejected: {event.client_order_id} — {event.reason}"
+        )
 
     # ------------------------------------------------------------------
     # Terminal state
@@ -156,7 +163,9 @@ class ConfidenceTestStrategy(Strategy):
 
     def _signal_done(self) -> None:
         self.done = True
-        log.info(f"[strategy] done — {len(self.filled_orders)} fills, "
-                 f"{len(self.canceled_orders)} cancels")
+        log.info(
+            f"[strategy] done — {len(self.filled_orders)} fills, "
+            f"{len(self.canceled_orders)} cancels"
+        )
         if self._done_callback is not None:
             self._done_callback()

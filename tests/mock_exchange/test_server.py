@@ -221,7 +221,7 @@ class TestMockWebSocketServer:
                     },
                 )
                 assert status == 201
-                assert data["order"]["status"] == "filled"
+                assert data["order"]["status"] == "executed"
 
                 # Collect next two WS messages (user_order + fill, order may vary)
                 m1 = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
