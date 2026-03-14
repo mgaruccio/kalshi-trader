@@ -123,7 +123,7 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
 | `websockets.WebSocketClientProtocol` | `websockets.asyncio.client.ClientConnection` | Deprecated in websockets v16 |
 | `json.loads(raw)` in SignalActor | msgspec typed decoder | 5-10x faster, consistent with adapter |
 | `TimeInForce.FOK` for exit | `TimeInForce.IOC` | Partial exit > no exit on thin books |
-| `self.cancel_all_orders(self.id)` | Verify NT API — may need `self.cancel_all_orders()` | API may not take strategy_id |
+| `self.cancel_all_orders(self.id)` | `open_orders = self.cache.orders_open(strategy_id=self.id); self.cancel_orders(open_orders)` | `cancel_all_orders` takes `InstrumentId`, not `StrategyId` — confirmed bug |
 | `list(balances.values())[0].total` | `account.balance(USD).total` | Explicit currency lookup |
 | `OmsType.NETTING` in backtest | `OmsType.HEDGING` | Match live adapter |
 | Test file `tests/test_integration.py` | `tests/test_maker_integration.py` | File already exists |
