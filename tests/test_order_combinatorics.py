@@ -8,6 +8,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.execution import _order_to_kalshi_params, _parse_fill_commission
+from tests.helpers import make_mock_order
 
 
 # ---------------------------------------------------------------------------
@@ -158,3 +159,45 @@ class TestQuantityPassthrough:
     def test_count_matches_quantity(self, qty):
         params = _order_to_kalshi_params(_order(OrderSide.BUY, "0.50", qty=qty), _instr("YES"))
         assert params["count"] == qty
+
+
+# ---------------------------------------------------------------------------
+# Market orders: no price fields in params
+# ---------------------------------------------------------------------------
+
+class TestMarketOrders:
+    """Market orders (no price) must produce params without price fields."""
+
+    def test_market_order_buy_yes(self):
+        order = make_mock_order(
+            side=OrderSide.BUY,
+            price_cents=None,
+            qty=5,
+            tif=TimeInForce.FOK,
+            order_type=OrderType.MARKET,
+            client_order_id="C-MKT",
+        )
+        params = _order_to_kalshi_params(order, _instr("YES"))
+        assert params["type"] == "market"
+        assert params["action"] == "buy"
+        assert params["side"] == "yes"
+        assert "yes_price" not in params
+        assert "no_price" not in params
+        assert params["count"] == 5
+
+    def test_market_order_sell_no(self):
+        order = make_mock_order(
+            side=OrderSide.SELL,
+            price_cents=None,
+            qty=10,
+            tif=TimeInForce.FOK,
+            order_type=OrderType.MARKET,
+            client_order_id="C-MKT2",
+        )
+        params = _order_to_kalshi_params(order, _instr("NO"))
+        assert params["type"] == "market"
+        assert params["action"] == "sell"
+        assert params["side"] == "no"
+        assert "yes_price" not in params
+        assert "no_price" not in params
+        assert params["count"] == 10
