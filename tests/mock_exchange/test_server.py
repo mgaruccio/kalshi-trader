@@ -31,8 +31,9 @@ def server_url():
         time.sleep(0.05)
     assert server.port is not None, "Server failed to start"
 
-    yield f"http://localhost:{server.port}"
+    yield f"http://127.0.0.1:{server.port}"
 
+    asyncio.run_coroutine_threadsafe(server.stop(), loop).result(timeout=2)
     loop.call_soon_threadsafe(loop.stop)
     t.join(timeout=2)
 
@@ -64,8 +65,7 @@ class TestMockRESTServer:
     def test_get_balance_returns_cents(self, server_url):
         data = _get(f"{server_url}/trade-api/v2/portfolio/balance")
         assert "balance" in data
-        assert isinstance(data["balance"], int)
-        assert data["balance"] > 0
+        assert data["balance"] == 100_000
 
     def test_get_orders_empty(self, server_url):
         data = _get(f"{server_url}/trade-api/v2/portfolio/orders?status=resting")
@@ -80,7 +80,7 @@ class TestMockRESTServer:
         assert status == 201
         assert "order" in data
         assert data["order"]["order_id"]
-        assert data["order"]["status"] in ("resting", "filled")
+        assert data["order"]["status"] == "resting"
 
     def test_cancel_order(self, server_url):
         _, create_data = _post(f"{server_url}/trade-api/v2/portfolio/orders", {
@@ -95,6 +95,9 @@ class TestMockRESTServer:
         )
         with urllib.request.urlopen(req) as resp:
             assert resp.status == 200
+        # Re-fetch and verify status is canceled
+        refetch = _get(f"{server_url}/trade-api/v2/portfolio/orders/{order_id}")
+        assert refetch["order"]["status"] == "canceled"
 
     def test_get_fills_empty(self, server_url):
         data = _get(f"{server_url}/trade-api/v2/portfolio/fills")

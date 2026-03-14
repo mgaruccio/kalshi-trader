@@ -163,7 +163,10 @@ class MockKalshiServer:
 
         if method == "GET" and path.startswith("/portfolio/orders/"):
             order_id = path[len("/portfolio/orders/"):]
-            return 200, self._handle_get_single_order(order_id)
+            o = self._orders.get(order_id)
+            if not o:
+                return 404, {"error": "not found"}
+            return 200, {"order": self._order_to_dict(o)}
 
         if method == "DELETE" and path.startswith("/portfolio/orders/"):
             order_id = path[len("/portfolio/orders/"):]
@@ -214,12 +217,6 @@ class MockKalshiServer:
         elif "status=filled" in full_path:
             orders = [o for o in orders if o.status == "filled"]
         return {"orders": [self._order_to_dict(o) for o in orders]}
-
-    def _handle_get_single_order(self, order_id: str) -> dict:
-        o = self._orders.get(order_id)
-        if not o:
-            return {"error": "not found"}
-        return {"order": self._order_to_dict(o)}
 
     def _handle_create_order(self, data: dict) -> dict:
         order = MockOrder(
