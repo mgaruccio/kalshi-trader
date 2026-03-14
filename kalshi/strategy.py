@@ -9,7 +9,7 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol
+from nautilus_trader.model.identifiers import ClientId, ClientOrderId, InstrumentId, Symbol
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.trading.strategy import Strategy
 
@@ -183,9 +183,15 @@ class WeatherMakerStrategy(Strategy):
         self._exits_attempted: int = 0
         self._orders_submitted: int = 0
 
+    # Client ID used for backtest CustomData routing via DataEngine.
+    # In live mode, the SignalActor also publishes on the MessageBus topic,
+    # which this subscription covers (subscribe_data always subscribes on
+    # the MessageBus regardless of client_id).
+    SIGNAL_CLIENT_ID = ClientId("SIGNAL")
+
     def on_start(self) -> None:
-        self.subscribe_data(DataType(SignalScore))
-        self.subscribe_data(DataType(ForecastDrift))
+        self.subscribe_data(DataType(SignalScore), client_id=self.SIGNAL_CLIENT_ID)
+        self.subscribe_data(DataType(ForecastDrift), client_id=self.SIGNAL_CLIENT_ID)
         # Record initial balance for drawdown circuit breaker
         account = self.portfolio.account(KALSHI_VENUE)
         if account is not None:

@@ -2,19 +2,49 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import DataType
-from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import ClientId, TraderId
-from nautilus_trader.model.objects import Money
+from nautilus_trader.model.enums import AccountType, AssetClass, OmsType
+from nautilus_trader.model.identifiers import ClientId, Symbol, TraderId
+from nautilus_trader.model.instruments import BinaryOption
+from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.signals import SignalScore
 from kalshi.strategy import WeatherMakerConfig, WeatherMakerStrategy
+
+
+def _to_binary_option(cat_inst) -> BinaryOption:
+    """Convert a catalog instrument (CurrencyPair) to BinaryOption for backtesting.
+
+    The collector stores instruments as CurrencyPair (NT default for unknown types).
+    The backtest engine with a CASH account requires BinaryOption.
+    """
+    symbol_str = cat_inst.id.symbol.value  # e.g. "KXHIGHNY-26MAR15-T54-YES"
+    side = "Yes" if symbol_str.endswith("-YES") else "No"
+
+    return BinaryOption(
+        instrument_id=cat_inst.id,
+        raw_symbol=Symbol(symbol_str),
+        asset_class=AssetClass.ALTERNATIVE,
+        currency=Currency.from_str("USD"),
+        price_precision=2,
+        size_precision=0,
+        price_increment=Price.from_str("0.01"),
+        size_increment=Quantity.from_int(1),
+        activation_ns=0,
+        expiration_ns=0,
+        ts_event=cat_inst.ts_event,
+        ts_init=cat_inst.ts_init,
+        maker_fee=Decimal("0"),
+        taker_fee=Decimal("0"),
+        outcome=side,
+    )
 
 
 def build_backtest_engine(
@@ -63,18 +93,26 @@ def load_catalog_data(
     """
     catalog = ParquetDataCatalog(str(catalog_path))
 
-    instruments = catalog.instruments()
+    catalog_instruments = catalog.instruments()
     if instrument_ids:
-        instruments = [i for i in instruments if str(i.id) in instrument_ids]
+        catalog_instruments = [i for i in catalog_instruments if str(i.id) in instrument_ids]
 
-    for inst in instruments:
+    # The collector saves instruments as CurrencyPair, but the backtest engine
+    # with a CASH account requires BinaryOption. Re-create as BinaryOption.
+    instruments = []
+    for cat_inst in catalog_instruments:
+        inst = _to_binary_option(cat_inst)
         engine.add_instrument(inst)
+        instruments.append(inst)
 
     if not instruments:
         return
 
+    # Always filter ticks to instruments we have definitions for.
+    # Without this, ticks for unregistered instruments cause
+    # "No matching engine found" RuntimeError in SimulatedExchange.
     quotes = catalog.quote_ticks(
-        instrument_ids=[i.id for i in instruments] if instrument_ids else None,
+        instrument_ids=[i.id for i in instruments],
         start=start,
         end=end,
     )
@@ -88,11 +126,15 @@ def load_signal_data(
 ) -> None:
     """Load historical SignalScore data into the engine.
 
-    Requires client_id="SIGNAL" for custom data types without instrument_id.
+    Wraps each SignalScore in CustomData so the DataEngine recognizes it
+    during replay (raw Data subclasses fall through the type dispatch).
     Call engine.sort_data() after loading both catalog and signal data.
     """
     if scores:
-        engine.add_data(scores, client_id=ClientId("SIGNAL"), sort=False)
+        from nautilus_trader.model.data import CustomData
+        data_type = DataType(SignalScore)
+        wrapped = [CustomData(data_type=data_type, data=s) for s in scores]
+        engine.add_data(wrapped, client_id=ClientId("SIGNAL"), sort=False)
 
 
 def run_full_backtest(
@@ -102,6 +144,7 @@ def run_full_backtest(
     starting_balance_usd: int = 10_000,
     start: datetime | None = None,
     end: datetime | None = None,
+    instrument_ids: list[str] | None = None,
 ) -> tuple[BacktestEngine, WeatherMakerStrategy]:
     """Orchestrate a complete backtest run.
 
@@ -115,13 +158,14 @@ def run_full_backtest(
         starting_balance_usd: Starting account balance in USD.
         start: Optional earliest timestamp for catalog predicate pushdown.
         end: Optional latest timestamp for catalog predicate pushdown.
+        instrument_ids: Optional list of instrument ID strings to filter catalog.
 
     Returns:
         (engine, strategy) — engine after run(), strategy with diagnostic counters.
     """
     engine = build_backtest_engine(starting_balance_usd=starting_balance_usd)
 
-    load_catalog_data(engine, catalog_path, start=start, end=end)
+    load_catalog_data(engine, catalog_path, instrument_ids=instrument_ids, start=start, end=end)
     load_signal_data(engine, scores)
     engine.sort_data()
 

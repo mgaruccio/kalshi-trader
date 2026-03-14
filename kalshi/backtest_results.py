@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, OrderStatus
 from nautilus_trader.model.identifiers import InstrumentId
 
 
@@ -31,7 +31,7 @@ class BacktestResults:
     adjusted_pnl_cents: float
 
 
-def extract_results(engine, strategy, assumed_fill_rate: float = 0.5) -> BacktestResults:
+def extract_results(engine, strategy, assumed_fill_rate: float = 0.5, starting_balance_usd: int = 10_000) -> BacktestResults:
     """Extract metrics from a completed BacktestEngine run and strategy state.
 
     Args:
@@ -46,37 +46,47 @@ def extract_results(engine, strategy, assumed_fill_rate: float = 0.5) -> Backtes
     """
     cache = engine.cache
 
-    # --- fills and orders ---
-    fills = cache.fills()
-    orders = cache.orders()
+    # --- orders ---
+    all_orders = cache.orders()
+    order_count = len(all_orders)
 
-    fill_count = len(fills)
-    order_count = len(orders)
+    # --- fill data from orders ---
+    # NT LimitOrder uses status enum, not is_filled property.
+    filled_orders = [
+        o for o in all_orders
+        if o.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+    ]
+    fill_count = len(filled_orders)
     fill_rate = fill_count / order_count if order_count > 0 else 0.0
 
-    # --- PnL from positions ---
-    # Sum realized PnL from all positions
+    # --- PnL from account balance change ---
+    accounts = cache.accounts()
     total_pnl_usd = 0.0
-    for position in cache.positions():
-        rpnl = position.realized_pnl
-        if rpnl is not None:
-            total_pnl_usd += rpnl.as_double()
+    if accounts:
+        account = accounts[0]
+        balances = account.balances()
+        if balances:
+            from nautilus_trader.model.currencies import USD
+            bal = account.balance_total(USD)
+            if bal is not None:
+                ending_balance = bal.as_double()
+                starting_balance = starting_balance_usd if starting_balance_usd else 10_000
+                total_pnl_usd = ending_balance - starting_balance
     pnl_cents = round(total_pnl_usd * 100)
 
     # --- avg fill price ---
     avg_fill_price_cents = 0.0
     if fill_count > 0:
         total_price = sum(
-            round(float(f.last_px) * 100) for f in fills
+            round(float(o.avg_px) * 100) for o in filled_orders if o.avg_px is not None
         )
         avg_fill_price_cents = total_price / fill_count
 
     # --- max drawdown ---
-    # NautilusTrader exposes account statistics; use realized PnL series
-    max_drawdown_cents = _compute_max_drawdown_cents(fills)
+    max_drawdown_cents = _compute_max_drawdown_cents(filled_orders)
 
     # --- contracts per city ---
-    contracts_per_city = _compute_contracts_per_city(fills, cache)
+    contracts_per_city = _compute_contracts_per_city(filled_orders, cache)
 
     # --- strategy diagnostic counters ---
     signals_received = getattr(strategy, "_signals_received", 0)
@@ -109,27 +119,31 @@ def extract_results(engine, strategy, assumed_fill_rate: float = 0.5) -> Backtes
     )
 
 
-def _compute_max_drawdown_cents(fills) -> int:
-    """Compute max drawdown in cents from the fill sequence.
+def _compute_max_drawdown_cents(filled_orders) -> int:
+    """Compute max drawdown in cents from filled orders.
 
     Drawdown is defined as the largest peak-to-trough decline in cumulative
-    realized PnL over the fill sequence. A fill's contribution to PnL is
-    positive for sells (exits) and negative for buys (entries at cost).
+    realized PnL. Buys are costs, sells are proceeds.
     """
-    if not fills:
+    if not filled_orders:
         return 0
+
+    # Sort by filled timestamp
+    sorted_orders = sorted(filled_orders, key=lambda o: o.ts_last)
 
     peak = 0
     running = 0
     max_dd = 0
 
-    for f in fills:
-        price_cents = round(float(f.last_px) * 100)
-        qty = int(f.last_qty)
-        if f.order_side == OrderSide.SELL:
-            running += price_cents * qty   # proceeds
+    for o in sorted_orders:
+        if o.avg_px is None:
+            continue
+        price_cents = round(float(o.avg_px) * 100)
+        qty = int(float(o.filled_qty))
+        if o.side == OrderSide.SELL:
+            running += price_cents * qty
         else:
-            running -= price_cents * qty   # cost
+            running -= price_cents * qty
 
         if running > peak:
             peak = running
@@ -140,18 +154,17 @@ def _compute_max_drawdown_cents(fills) -> int:
     return max_dd
 
 
-def _compute_contracts_per_city(fills, cache) -> dict[str, int]:
-    """Count filled buy contracts per city using instrument metadata.
+def _compute_contracts_per_city(filled_orders, cache) -> dict[str, int]:
+    """Count filled buy contracts per city.
 
-    City is extracted from the instrument's raw_symbol metadata if available,
-    falling back to the ticker prefix heuristic (e.g. KXHIGHNY -> ny).
+    City extracted from ticker prefix heuristic (e.g. KXHIGHNY -> ny).
     """
     city_counts: dict[str, int] = {}
-    for f in fills:
-        if f.order_side != OrderSide.BUY:
+    for o in filled_orders:
+        if o.side != OrderSide.BUY:
             continue
-        qty = int(f.last_qty)
-        city = _city_from_instrument_id(str(f.instrument_id), cache)
+        qty = int(float(o.filled_qty))
+        city = _city_from_instrument_id(str(o.instrument_id), cache)
         city_counts[city] = city_counts.get(city, 0) + qty
 
     return city_counts
