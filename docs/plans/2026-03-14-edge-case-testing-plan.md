@@ -12,6 +12,92 @@
 - `forge:writing-tests`: Invoke before each implementation task — covers TDD cycle, assertion quality
 - `forge:nautilus-testing`: Invoke before Tasks 4, 7 — covers NT Cython test patterns, mock wiring
 
+## Enhancement Summary
+
+**Deepened on:** 2026-03-14
+**Research agents used:** 12 (writing-tests, nautilus-testing, geek-finance, kalshi-tails, architecture-strategist, performance-oracle, error-propagation-reviewer, pattern-recognition-specialist, python-reviewer, escalate-not-accommodate, CT-best-practices, simulation-testing-research)
+
+### Critical Corrections (must fix before implementation)
+
+**C1: `_execute_op` is incomplete — Layer 3 is operationally inert.**
+The simulation test only handles `submit_order` and `settle_market`, silently dropping cancel, trigger_fill, disconnect, and reconnect operations. The 6-type weighted generator reduces to 2-type execution. All 4 review agents flagged this as the #1 issue. **Fix:** Implement all operation types in `_execute_op` with proper ID mapping (client_order_id → venue_order_id).
+
+**C2: Bare `except Exception: pass` swallows infrastructure bugs.**
+The FakeExchange signals rejections via response status, not exceptions. The only legitimate exception is `ApiException(status=429)` from rate limiting. **Fix:** Catch `ApiException` specifically, let everything else propagate.
+
+**C3: FakeExchange financial mechanics are wrong.**
+- Balance calc credits on sell instead of locking `(100-price)` collateral (fully collateralized model)
+- FOK consumes book liquidity before checking if full fill is possible → corrupts book on rejection
+- No capital locking on resting orders → can over-commit balance
+- No insufficient-funds rejection → a listed CT parameter with no code path
+- GTC partial fill sets status="filled" instead of "resting"
+- Fill price uses aggressor's limit price instead of resting order's price (price improvement)
+- No short-sell prevention (Kalshi doesn't allow selling without a position)
+- Single-level matching only → no multi-level book walking for IOC/partial fills
+
+**C4: `asyncio.create_task` crashes in synchronous context.**
+Settlement fills (line 373) and sequence gaps (lines 306-307) call `asyncio.create_task`, which requires a running event loop. The harness runs synchronously. **Fix:** Patch `asyncio.create_task` in the harness (like existing `test_execution.py` does), or use `async-solipsism`/`looptime` for deterministic async tests.
+
+**C5: SimHarness should use real NT infrastructure (Polymarket pattern).**
+SimpleNamespace stubs swallow events silently — `generate_order_filled` calls `_send_order_event` → `_msgbus.send("ExecEngine.process", ...)` which needs a real MessageBus. **Fix:** Instantiate real `KalshiExecutionClient` with real MessageBus/Cache/ExecutionEngine, mock only `kalshi_python` SDK and WebSocket layer. Keep existing SimpleNamespace tests in `test_execution.py` for fast unit-level coverage.
+
+**C6: WS messages should flow through `decode_ws_msg` production path.**
+The harness manually constructs `FillMsg(**dict_filter)` which is a separate deserialization path from production (`bytes → decode_ws_msg → typed struct`). **Fix:** Serialize fake exchange dicts to JSON bytes via `msgspec.json.encode`, then call `decode_ws_msg`. Also bind `_handle_ws_message` instead of individual handlers to test the full dispatch + sequence gap detection path.
+
+**C7: Crossed book in test fixtures creates impossible market state.**
+`yes_levels={32: 10, 30: 20}` + `no_levels={68: 10, 70: 20}` → YES bid=32 but YES implied ask = 100-70 = 30. Bid > Ask is an arbitrage condition that never exists on a real exchange. **Fix:** Validate initial book states; use non-complementary prices (e.g., `yes_levels={25: 10}`, `no_levels={60: 10}` → YES bid=25, ask=40, no cross).
+
+### High-Priority Improvements
+
+**H1: Case count estimates are inflated ~3-5x.** Empirically measured: order translation = 33 (3-way), not "~100-160". Quote derivation = 33. Date parsing = 51. Total ~117, not ~500. Full CT suite runs in ~0.9s. Adjust plan text and CI time budget to <5s.
+
+**H2: Descriptive test IDs.** Build from parameter values (e.g., `BUY-YES-p50-GTC-q5`), not sequential indexes (`ct3-17`). The plan's own review checklist requires this but the implementation contradicts it. Use `OrderedDict` input to `AllPairs` for named tuple output.
+
+**H3: Static timestamp in harness clock.** All events get `ts=1_000_000_000`. Use an incrementing counter via `itertools.count` side_effect.
+
+**H4: Derive PRNG seeds per component.** Exchange and injector using same seed causes correlated random sequences. Use `seed`, `seed * 3 + 1`, `seed * 7 + 3` or `numpy.random.SeedSequence.spawn()`.
+
+**H5: Cancel should raise `ApiException(status=400)`, not `ValueError`.** Matches what `should_retry()` expects in `kalshi/common/errors.py:17` and tests the adapter's cancel_rejected error path.
+
+**H6: Use separate SIDs per WS channel.** `sid=1` for user_order, `sid=2` for fill. Tests per-SID sequence tracking in `_check_sequence()`.
+
+**H7: Add `KalshiExchangeProtocol`.** ~20-line `typing.Protocol` covering the 8 shared methods. Catches interface drift between FakeExchange and FaultInjector.
+
+**H8: client_order_id → venue_order_id mapping.** SequenceGenerator cancel operations reference client_order_id but FakeExchange.cancel_order expects venue_order_id. SimHarness must maintain the mapping from submit_order responses.
+
+**H9: TokenBucket.acquire(cost > capacity) is an infinite loop.** A batch of 11 orders would hang forever. Add a dedicated test for this edge case.
+
+**H10: Dedup cache off-by-one.** `>= _DEDUP_MAX` at line 380 means capacity is 9,999, not 10,000. Document or fix.
+
+### Medium-Priority Enhancements
+
+**M1: Add dedup eviction replay test.** Pre-fill cache to `_DEDUP_MAX-1`, submit one more fill, then replay the evicted trade_id. Documents the known limitation.
+
+**M2: Domain invariants as reusable assertion helpers.** `YES bid + NO ask ≈ 1.0` checked across ALL CT combinations.
+
+**M3: Consolidate `_make_order` helpers** into `tests/helpers.py` (cents-based API). Three files have three different price conventions.
+
+**M4: Increase simulation to 50 seeds × 100 ops.** Only adds ~2s, much better coverage. 10×30 barely scratches the state space.
+
+**M5: Reorder window is tumbling, not sliding.** Docstring says "sliding" but implementation uses fixed non-overlapping windows.
+
+**M6: FakeExchange should raise `KeyError` for unknown markets,** not silently return 0 fills. Hides test wiring bugs.
+
+**M7: SequenceGenerator should not silently mutate operation types.** Skip and redraw, or yield labeled `Operation("cancel_order_skipped", ...)`.
+
+**M8: Missing `ws_reorder_window` test in harness.** Fill-before-ack delivery (a priority scenario) is never exercised.
+
+**M9: Use `looptime` or `async-solipsism` for asyncio time control.** `time-machine` does NOT properly control asyncio event loop time — can cause monotonic clock to go backwards.
+
+### References Discovered
+
+- [FoundationDB BUGGIFY pattern](https://transactional.blog/simulation/buggify) — per-run fault site enablement
+- [async-solipsism](https://github.com/bmerry/async-solipsism) — deterministic asyncio event loop for Python
+- [looptime](https://github.com/nolar/looptime) — asyncio time dilation for testing
+- [order-matching PyPI](https://pypi.org/project/order-matching/) — reference matching engine
+- [Brownie DeFi stateful testing](https://eth-brownie.readthedocs.io/en/stable/tests-hypothesis-stateful.html) — Hypothesis RuleBasedStateMachine for exchange testing
+- [NumPy SeedSequence](https://numpy.org/doc/stable/reference/random/parallel.html) — independent reproducible PRNG streams
+
 ## Context for Executor
 
 ### Key Files — Source Under Test
