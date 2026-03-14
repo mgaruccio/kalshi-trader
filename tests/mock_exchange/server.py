@@ -216,13 +216,13 @@ class MockKalshiServer:
 
         if order.action == "buy":
             if order.side == "no":
-                no_ask = round(1.0 - yes_bid, 10) if yes_bid > 0 else 0.5
+                no_ask = round(1.0 - yes_bid, 10) if yes_bid > 0 else 1.0
                 if order.type == "market":
                     return True, no_ask
                 limit = order.no_price / 100.0
                 return limit >= no_ask, no_ask
             else:  # yes
-                yes_ask = round(1.0 - no_bid, 10) if no_bid > 0 else 0.5
+                yes_ask = round(1.0 - no_bid, 10) if no_bid > 0 else 1.0
                 if order.type == "market":
                     return True, yes_ask
                 limit = order.yes_price / 100.0
@@ -231,9 +231,11 @@ class MockKalshiServer:
             if order.side == "no":
                 if order.type == "market":
                     return True, no_bid
+                raise NotImplementedError("limit sell not implemented")
             else:
                 if order.type == "market":
                     return True, yes_bid
+                raise NotImplementedError("limit sell not implemented")
 
         return False, 0.0
 
@@ -247,37 +249,48 @@ class MockKalshiServer:
             "side": order.side,
             "action": order.action,
             "client_order_id": order.client_order_id,
-            "fill_count_fp": str(order.count),
-            "initial_count_fp": str(order.count),
-            "remaining_count_fp": "0",
+            "fill_count_fp": f"{order.count:.2f}",
+            "initial_count_fp": f"{order.count:.2f}",
+            "remaining_count_fp": "0.00",
         }
         if order.side == "yes":
             user_msg["yes_price_dollars"] = f"{fill_price:.2f}"
         else:
             user_msg["no_price_dollars"] = f"{fill_price:.2f}"
 
-        # fill message
+        # fill message — WS format uses _dollars strings; both fields always present
         trade_id = str(uuid.uuid4())
+        complement = round(1.0 - fill_price, 10)
         fill_msg: dict[str, Any] = {
             "trade_id": trade_id,
             "order_id": order.order_id,
             "market_ticker": order.ticker,
             "side": order.side,
             "action": order.action,
-            "count_fp": str(order.count),
+            "count_fp": f"{order.count:.2f}",
             "is_taker": True,
             "ts": int(time.time() * 1_000_000_000),
             "client_order_id": order.client_order_id,
             "fee_cost": "0.00",
+            "yes_price_dollars": f"{fill_price:.2f}" if order.side == "yes" else f"{complement:.2f}",
+            "no_price_dollars": f"{fill_price:.2f}" if order.side == "no" else f"{complement:.2f}",
         }
-        if order.side == "yes":
-            fill_msg["yes_price_dollars"] = f"{fill_price:.2f}"
-            fill_msg["no_price_dollars"] = None
-        else:
-            fill_msg["no_price_dollars"] = f"{fill_price:.2f}"
-            fill_msg["yes_price_dollars"] = None
 
-        self._fills.append(fill_msg)
+        # REST fills use int-cent format (execution.py:523-525 reads yes_price/no_price in cents)
+        rest_fill = {
+            "trade_id": trade_id,
+            "order_id": order.order_id,
+            "market_ticker": order.ticker,
+            "side": order.side,
+            "action": order.action,
+            "count_fp": f"{order.count:.2f}",
+            "is_taker": True,
+            "client_order_id": order.client_order_id,
+            "fee_cost": "0.00",
+            "yes_price": int(round((fill_price if order.side == "yes" else complement) * 100)),
+            "no_price": int(round((fill_price if order.side == "no" else complement) * 100)),
+        }
+        self._fills.append(rest_fill)
 
         await self._broadcast_ws("user_order", _SID_USER_ORDER, user_msg, channel="user_orders")
         await self._broadcast_ws("fill", _SID_FILL, fill_msg, channel="fill")
@@ -492,9 +505,9 @@ class MockKalshiServer:
                 "side": order.side,
                 "action": order.action,
                 "client_order_id": order.client_order_id,
-                "fill_count_fp": "0",
-                "initial_count_fp": str(order.count),
-                "remaining_count_fp": str(order.count),
+                "fill_count_fp": "0.00",
+                "initial_count_fp": f"{order.count:.2f}",
+                "remaining_count_fp": f"{order.count:.2f}",
             }
             await self._broadcast_ws(
                 "user_order", _SID_USER_ORDER, user_msg, channel="user_orders",
@@ -526,6 +539,17 @@ class MockKalshiServer:
             if o.status == "resting":
                 o.status = "canceled"
                 canceled.append(self._order_to_dict(o))
+                user_msg = {
+                    "order_id": o.order_id,
+                    "ticker": o.ticker,
+                    "status": "canceled",
+                    "side": o.side,
+                    "action": o.action,
+                    "client_order_id": o.client_order_id,
+                }
+                await self._broadcast_ws(
+                    "user_order", _SID_USER_ORDER, user_msg, channel="user_orders",
+                )
         return {"orders": canceled}
 
     def _handle_get_fills(self) -> dict:

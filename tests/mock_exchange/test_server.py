@@ -235,10 +235,11 @@ class TestMockWebSocketServer:
 
             assert user_msg["msg"]["status"] == "filled"
             assert user_msg["msg"]["client_order_id"] == "C-MKT-001"
-            assert fill_msg["msg"]["count_fp"] == "1"
+            assert fill_msg["msg"]["count_fp"] == "1.00"
             assert fill_msg["msg"]["client_order_id"] == "C-MKT-001"
             assert fill_msg["msg"]["market_ticker"] == TEST_TICKER
-            # Fill price should be NO ask = 0.45
+            # Fill price: NO ask = 0.45; YES price = complement = 0.55
             assert abs(float(fill_msg["msg"]["no_price_dollars"]) - 0.45) < 0.001
+            assert abs(float(fill_msg["msg"]["yes_price_dollars"]) - 0.55) < 0.001
 
         asyncio.run(_run())
