@@ -8,14 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 uv sync
 
-# Run tests (most test files need --noconftest to avoid fixture conflicts)
-pytest test_weather_strategy.py --noconftest -v
-pytest test_db.py -v
-pytest test_adapter.py --noconftest -v
-pytest test_evaluator.py --noconftest -v
+# Run tests (use uv run python -m pytest, NOT uv run pytest — system Python lacks project deps)
+uv run python -m pytest tests/mock_exchange/ -v          # mock exchange unit tests
+uv run python -m pytest tests/test_live_confidence.py -v  # adapter confidence tests (run in isolation)
+uv run python -m pytest tests/test_execution.py tests/sim/ -v  # adapter unit tests
 
-# Run all tests
-pytest --noconftest -v
+# Run all tests (excluding confidence tests which need isolation due to event loop)
+uv run python -m pytest --ignore=tests/test_live_confidence.py -v
 
 # Run live trading (requires .env with Kalshi credentials + Redis running)
 uv run main.py                          # live trading
@@ -56,7 +55,7 @@ Evaluator → Redis stream → Trading Node → Kalshi adapter → REST API
 ```
 
 ### Critical modules
-- **`adapter.py`**: Kalshi ↔ NautilusTrader translation layer. `KalshiDataClient` (WebSocket market data), `KalshiExecutionClient` (order routing with batch submission), `KalshiInstrumentProvider` (market discovery). All REST calls are offloaded to `ThreadPoolExecutor` to avoid blocking the NT event loop.
+- **`kalshi/`**: Kalshi ↔ NautilusTrader adapter package. `KalshiDataClient` (WebSocket market data), `KalshiExecutionClient` (order routing), `KalshiInstrumentProvider` (market discovery). REST calls offloaded to `asyncio.to_thread()`. Config overrides via `base_url_http`/`base_url_ws`. Factory singleton `_SHARED_PROVIDER` must be reset to `None` between test runs.
 - **`weather_strategy.py`**: 2-phase strategy — Phase 1 places spread orders in an opening window for next-day contracts; Phase 2 places laddered GTC buy orders below bid with immediate sell-on-fill at target price.
 - **`data_types.py`**: Custom NT `Data` subclasses (`ModelSignal`, `DangerAlert`, `ClimateEvent`) that flow through the message bus. NT 1.224+ pattern: private `_ts_event`/`_ts_init` with `@property` accessors, no `super().__init__()`.
 - **`db.py`**: SQLite with WAL mode. Shared by evaluator and trading node. All writes via named functions (`write_evaluations`, `upsert_position`, `write_fill`, etc.).
@@ -75,3 +74,9 @@ The ML models, market parsing (`parse_ticker`, `SERIES_CONFIG`), and forecast fe
 - **Environment**: Demo (`demo-api.kalshi.co`) vs Production (`api.elections.kalshi.com`) controlled by `.env` / `KalshiConfig`.
 - **SQLite WAL mode** enables concurrent reads from CLI/dashboard while evaluator and trading node write.
 - **Currency**: Kalshi contracts use a synthetic `CONTRACT` currency registered at adapter import time.
+
+## Testing
+
+- **Confidence tests** (`tests/test_live_confidence.py`): Boot a real TradingNode against a local mock Kalshi exchange. Must run in isolation (`uv run python -m pytest tests/test_live_confidence.py -v`) — event loop contamination with other async tests.
+- **Mock exchange** (`tests/mock_exchange/`): REST server (asyncio.start_server) + WS server (websockets.serve) on separate ports. 4 deterministic scenarios: steady_fill, chase_up, market_order_immediate, no_fill_timeout.
+- **Factory singleton**: `kalshi.factories._SHARED_PROVIDER = None` between tests that create new mock server instances.
