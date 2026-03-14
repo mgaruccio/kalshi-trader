@@ -75,6 +75,9 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_city_exposure_cents",
         "_check_circuit_breaker",
         "_trigger_halt",
+        "_in_entry_phase",
+        "_is_tomorrow_contract",
+        "_tomorrow_delay_elapsed",
         "on_stop",
         "on_start",
     ):
@@ -145,14 +148,13 @@ class TestFilterEvaluation:
         assert "KXHIGHNY-26MAR15-T54" not in strategy._quoted_tickers
 
     def test_subscribe_quote_ticks_called_on_new_pass(self):
-        """subscribe_quote_ticks called when contract first passes filter."""
+        """subscribe_quote_ticks called exactly twice (YES + NO) when contract passes filter."""
         strategy = _make_strategy()
         instrument = MagicMock()
         strategy.cache.instrument.return_value = instrument
         score = _make_score(no_p_win=0.98, n_models=3)
         strategy._handle_signal_score(score)
-        # subscribe_quote_ticks should have been called for YES and NO instruments
-        assert strategy.subscribe_quote_ticks.call_count >= 1
+        assert strategy.subscribe_quote_ticks.call_count == 2
 
 
 class TestOnStop:
@@ -186,3 +188,132 @@ class TestCircuitBreaker:
         strategy.cache.orders_open.return_value = []
         strategy._check_circuit_breaker()
         assert strategy._halted is True
+
+    def test_drawdown_circuit_breaker_triggers(self):
+        """Drawdown beyond max_drawdown_pct halts the strategy."""
+        cfg = WeatherMakerConfig(max_drawdown_pct=0.15)
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 100_000
+        # Current balance = 84,000 → drawdown = 16% > 15%
+        usd_balance = MagicMock()
+        usd_balance.total.as_double.return_value = 840.0  # $840 = 84,000 cents
+        strategy.portfolio.account.return_value.balances.return_value = {
+            # Use a real Currency key or mock — strategy uses _USD module-level constant
+            # so we need the mock to return our balance for any key lookup
+        }
+        # Patch balances().get() directly
+        mock_account = MagicMock()
+        mock_account.balances.return_value.get.return_value = usd_balance
+        strategy.portfolio.account.return_value = mock_account
+        strategy.cache.orders_open.return_value = []
+        strategy._check_circuit_breaker()
+        assert strategy._halted is True
+
+    def test_drawdown_within_limit_does_not_halt(self):
+        """Drawdown within limit does not trigger halt."""
+        cfg = WeatherMakerConfig(max_drawdown_pct=0.15)
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 100_000
+        # Current balance = 90,000 → drawdown = 10% < 15%
+        usd_balance = MagicMock()
+        usd_balance.total.as_double.return_value = 900.0  # $900 = 90,000 cents
+        mock_account = MagicMock()
+        mock_account.balances.return_value.get.return_value = usd_balance
+        strategy.portfolio.account.return_value = mock_account
+        strategy._check_circuit_breaker()
+        assert strategy._halted is False
+
+
+class TestTimeOfDayGating:
+    def test_in_entry_phase_during_window(self):
+        """Returns True when current ET time is within [10:30, 15:00)."""
+        cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
+        strategy = _make_strategy(cfg)
+        from unittest.mock import patch
+        from datetime import datetime, time
+        from zoneinfo import ZoneInfo
+        # Mock datetime.now to return 12:00 ET
+        with patch("kalshi.strategy.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(time=lambda: time(12, 0))
+            assert strategy._in_entry_phase() is True
+
+    def test_before_entry_phase(self):
+        cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
+        strategy = _make_strategy(cfg)
+        from unittest.mock import patch
+        from datetime import time
+        with patch("kalshi.strategy.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(time=lambda: time(9, 0))
+            assert strategy._in_entry_phase() is False
+
+    def test_after_entry_phase(self):
+        cfg = WeatherMakerConfig(entry_phase_start_et="10:30", entry_phase_end_et="15:00")
+        strategy = _make_strategy(cfg)
+        from unittest.mock import patch
+        from datetime import time
+        with patch("kalshi.strategy.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(time=lambda: time(16, 0))
+            assert strategy._in_entry_phase() is False
+
+
+class TestTomorrowContractGating:
+    def test_today_contract_not_tomorrow(self):
+        """Ticker with today's date is not a tomorrow contract."""
+        from datetime import date
+        today = date.today()
+        ticker = f"KXHIGHNY-{today.strftime('%y%b%d').upper()}-T54"
+        strategy = _make_strategy()
+        assert strategy._is_tomorrow_contract(ticker) is False
+
+    def test_future_contract_is_tomorrow(self):
+        """Ticker with tomorrow's date is a tomorrow contract."""
+        from datetime import date, timedelta
+        tomorrow = date.today() + timedelta(days=1)
+        ticker = f"KXHIGHNY-{tomorrow.strftime('%y%b%d').upper()}-T54"
+        strategy = _make_strategy()
+        assert strategy._is_tomorrow_contract(ticker) is True
+
+    def test_delay_not_elapsed(self):
+        """Returns False when not enough time has passed since first quote."""
+        cfg = WeatherMakerConfig(tomorrow_min_age_minutes=30)
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        # First seen 10 minutes ago (10 * 60 * 1e9 ns)
+        ten_min_ago_ns = 1_000_000_000 - int(10 * 60 * 1e9)
+        strategy._first_quoted_ns[ticker] = ten_min_ago_ns
+        strategy.clock.timestamp_ns.return_value = 1_000_000_000
+        assert strategy._tomorrow_delay_elapsed(ticker) is False
+
+    def test_delay_elapsed(self):
+        """Returns True when enough time has passed since first quote."""
+        cfg = WeatherMakerConfig(tomorrow_min_age_minutes=30)
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        # First seen 31 minutes ago
+        thirty_one_min_ago_ns = 1_000_000_000 - int(31 * 60 * 1e9)
+        strategy._first_quoted_ns[ticker] = thirty_one_min_ago_ns
+        strategy.clock.timestamp_ns.return_value = 1_000_000_000
+        assert strategy._tomorrow_delay_elapsed(ticker) is True
+
+    def test_first_quoted_tracks_timestamp(self):
+        """_first_quoted_ns is set when contract first passes filter."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        strategy.clock.timestamp_ns.return_value = 42_000_000_000
+        score = _make_score(no_p_win=0.98, n_models=3)
+        strategy._handle_signal_score(score)
+        assert strategy._first_quoted_ns.get("KXHIGHNY-26MAR15-T54") == 42_000_000_000
+
+    def test_first_quoted_not_overwritten_on_second_pass(self):
+        """_first_quoted_ns is NOT updated on subsequent filter passes."""
+        strategy = _make_strategy()
+        strategy.cache.instrument.return_value = MagicMock()
+        strategy.clock.timestamp_ns.return_value = 42_000_000_000
+        score = _make_score(no_p_win=0.98, n_models=3)
+        strategy._handle_signal_score(score)
+        # Second score with different timestamp
+        strategy.clock.timestamp_ns.return_value = 99_000_000_000
+        strategy._quoted_tickers.discard("KXHIGHNY-26MAR15-T54")  # force re-entry
+        strategy._handle_signal_score(score)
+        # Should still have original timestamp
+        assert strategy._first_quoted_ns.get("KXHIGHNY-26MAR15-T54") == 42_000_000_000

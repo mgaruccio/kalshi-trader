@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 import os
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol
+from nautilus_trader.model.objects import Currency
 from nautilus_trader.trading.strategy import Strategy
 
 from kalshi.common.constants import KALSHI_VENUE
 from kalshi.providers import parse_instrument_id
 from kalshi.signals import ForecastDrift, SignalScore
+
+_ET = ZoneInfo("America/New_York")
+_USD = Currency.from_str("USD")
 
 
 class WeatherMakerConfig(StrategyConfig, frozen=True):
@@ -164,11 +170,23 @@ class WeatherMakerStrategy(Strategy):
         self._resting_orders: dict[str, list[ClientOrderId]] = {}
         self._last_anchor: dict[str, int] = {}
         self._halted: bool = False
+        self._initial_balance_cents: int = 0
+        # ticker -> ns timestamp when it first passed filter (for tomorrow gating)
+        self._first_quoted_ns: dict[str, int] = {}
 
     def on_start(self) -> None:
         self.subscribe_data(DataType(SignalScore))
         self.subscribe_data(DataType(ForecastDrift))
-        self.log.info("WeatherMakerStrategy started — subscribed to signals")
+        # Record initial balance for drawdown circuit breaker
+        account = self.portfolio.account(KALSHI_VENUE)
+        if account is not None:
+            bal = account.balances().get(_USD)
+            if bal is not None:
+                self._initial_balance_cents = int(bal.total.as_double() * 100)
+        self.log.info(
+            f"WeatherMakerStrategy started — subscribed to signals, "
+            f"initial balance {self._initial_balance_cents}c"
+        )
 
     def on_stop(self) -> None:
         open_orders = self.cache.orders_open(strategy_id=self.id)
@@ -233,6 +251,9 @@ class WeatherMakerStrategy(Strategy):
 
         if passes and ticker not in self._quoted_tickers:
             self._quoted_tickers.add(ticker)
+            # Record first-seen time for tomorrow contract gating
+            if ticker not in self._first_quoted_ns:
+                self._first_quoted_ns[ticker] = self.clock.timestamp_ns()
             self.log.info(
                 f"Filter PASS: {ticker} ({side} side, "
                 f"p_win={score.no_p_win if side == 'no' else score.yes_p_win:.3f})"
@@ -282,9 +303,17 @@ class WeatherMakerStrategy(Strategy):
         if bid_cents <= 0:
             return
 
-        # Check exit condition
+        # Check exit condition (always honored regardless of time gate)
         if bid_cents >= self._config.exit_price_cents:
             self._exit_position(base_ticker, tick.instrument_id, bid_cents)
+            return
+
+        # Time-of-day gate — only place new ladders during entry phase
+        if not self._in_entry_phase():
+            return
+
+        # Tomorrow contract delay — wait for price discovery to settle
+        if self._is_tomorrow_contract(base_ticker) and not self._tomorrow_delay_elapsed(base_ticker):
             return
 
         # Dead-zone check
@@ -309,10 +338,10 @@ class WeatherMakerStrategy(Strategy):
         if account is None:
             self.log.warning(f"No account for {instrument_id.venue}")
             return
-        balances = account.balances()
-        if not balances:
+        usd_balance = account.balances().get(_USD)
+        if usd_balance is None:
             return
-        balance_cents = int(list(balances.values())[0].total.as_double() * 100)
+        balance_cents = int(usd_balance.total.as_double() * 100)
 
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
@@ -415,6 +444,42 @@ class WeatherMakerStrategy(Strategy):
         return total
 
     # ------------------------------------------------------------------
+    # Time-of-day and tomorrow contract helpers
+    # ------------------------------------------------------------------
+
+    def _in_entry_phase(self) -> bool:
+        """Return True if current ET time is within the entry phase window."""
+        now_et = datetime.now(_ET).time()
+        h_start, m_start = (int(x) for x in self._config.entry_phase_start_et.split(":"))
+        h_end, m_end = (int(x) for x in self._config.entry_phase_end_et.split(":"))
+        start = time(h_start, m_start)
+        end = time(h_end, m_end)
+        return start <= now_et < end
+
+    def _is_tomorrow_contract(self, ticker: str) -> bool:
+        """Return True if this ticker settles tomorrow (not today)."""
+        # Ticker format: KXHIGHNY-26MAR15-T54 — date part is index 1
+        parts = ticker.split("-")
+        if len(parts) < 2:
+            return False
+        date_str = parts[1]  # e.g. "26MAR15"
+        try:
+            # Parse YYMONDD: e.g. "26MAR15" -> 2026-03-15
+            settlement = datetime.strptime(date_str, "%y%b%d").date()
+            return settlement > date.today()
+        except ValueError:
+            return False
+
+    def _tomorrow_delay_elapsed(self, ticker: str) -> bool:
+        """Return True if enough time has passed since first quote for a tomorrow contract."""
+        first_ns = self._first_quoted_ns.get(ticker, 0)
+        if first_ns == 0:
+            return False
+        elapsed_ns = self.clock.timestamp_ns() - first_ns
+        delay_ns = self._config.tomorrow_min_age_minutes * 60 * 1_000_000_000
+        return elapsed_ns >= delay_ns
+
+    # ------------------------------------------------------------------
     # Circuit breaker
     # ------------------------------------------------------------------
 
@@ -428,7 +493,18 @@ class WeatherMakerStrategy(Strategy):
             self._trigger_halt("halt file present")
             return
 
-        # Drawdown check would require initial balance tracking — skipped for shell
+        # Drawdown check — compare current balance to initial
+        if self._initial_balance_cents > 0:
+            account = self.portfolio.account(KALSHI_VENUE)
+            if account is not None:
+                usd_balance = account.balances().get(_USD)
+                if usd_balance is not None:
+                    current_cents = int(usd_balance.total.as_double() * 100)
+                    drawdown = (self._initial_balance_cents - current_cents) / self._initial_balance_cents
+                    if drawdown >= self._config.max_drawdown_pct:
+                        self._trigger_halt(
+                            f"drawdown {drawdown:.1%} >= limit {self._config.max_drawdown_pct:.1%}"
+                        )
 
     def _trigger_halt(self, reason: str) -> None:
         """Cancel all orders and set halted flag. Do NOT close positions."""
