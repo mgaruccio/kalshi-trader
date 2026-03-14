@@ -43,9 +43,9 @@ class KalshiInstrumentProvider(InstrumentProvider):
         api_key_id: str,
         private_key_path: str,
         rest_host: str,
+        load_all: bool = True,
     ):
-        # Correction #29: load_all=True so initialize() calls load_all_async()
-        super().__init__(InstrumentProviderConfig(load_all=True))
+        super().__init__(InstrumentProviderConfig(load_all=load_all))
         self._api_config = kalshi_python.Configuration()
         self._api_config.host = rest_host
         self._api_config.request_timeout = 10  # Correction #19
@@ -55,6 +55,11 @@ class KalshiInstrumentProvider(InstrumentProvider):
             private_key_path=private_key_path,
         )
         self._markets_api = MarketsApi(self._client)
+
+    @property
+    def client(self) -> kalshi_python.KalshiClient:
+        """Authenticated Kalshi API client for direct SDK usage."""
+        return self._client
 
     async def load_all_async(
         self,
@@ -70,7 +75,7 @@ class KalshiInstrumentProvider(InstrumentProvider):
         """Synchronous market loading — called via asyncio.to_thread."""
         filters = filters or {}
         series_ticker = filters.get("series_ticker")
-        statuses = filters.get("statuses", ["active", "open", "unopened"])
+        statuses = filters.get("statuses", ["open", "unopened"])
 
         for status in statuses:
             cursor = None
