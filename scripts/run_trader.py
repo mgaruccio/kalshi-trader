@@ -106,8 +106,11 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _require_production_flag(args: argparse.Namespace) -> None:
-    """Abort if production environment is requested without explicit risk acknowledgement."""
-    if args.environment == "production" and not args.i_accept_risk:
+    """Abort if production environment is requested without explicit risk acknowledgement.
+
+    Dry-run mode skips this check since no orders are submitted.
+    """
+    if args.environment == "production" and not args.i_accept_risk and not args.dry_run:
         print(
             "ERROR: --environment=production requires --i-accept-risk flag.\n"
             "       This flag acknowledges that you are trading with real money.\n"

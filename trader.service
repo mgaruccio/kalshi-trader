@@ -9,7 +9,7 @@ WorkingDirectory=/root/kalshi-trader
 EnvironmentFile=/root/kalshi-trader/.env
 Environment=PYTHONPATH=/root/kalshi-trader
 ExecStart=/root/kalshi-trader/.venv/bin/python scripts/run_trader.py \
-    --environment demo --dry-run --starting-balance 20
+    --environment production --dry-run --starting-balance 20
 Restart=on-failure
 RestartSec=30
 StandardOutput=append:/root/kalshi-trader/trader.log
