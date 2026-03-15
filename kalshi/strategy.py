@@ -50,7 +50,13 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
 
     # Circuit breaker
     max_drawdown_pct: float = 0.15
+    small_account_drawdown_pct: float = 0.25   # relaxed limit when balance < threshold
+    small_account_threshold_usd: int = 100     # accounts below this use relaxed limit
     halt_file_path: str = "/tmp/kalshi-halt"
+
+    # Dry-run mode — log orders instead of submitting
+    dry_run: bool = False
+    dry_run_balance_usd: int = 20              # simulated starting capital
 
 
 def should_quote(
@@ -73,8 +79,8 @@ def should_quote(
         p_win = score.yes_p_win
         anchor_cents = score.yes_bid
 
-    # Must be open market
-    if score.status and score.status != "open":
+    # Must be tradeable market — signal server returns "active", Kalshi API uses "open"
+    if score.status and score.status not in ("open", "active"):
         return side, False
 
     # Check model count
@@ -175,6 +181,8 @@ class WeatherMakerStrategy(Strategy):
         self._first_quoted_ns: dict[str, int] = {}
         # tickers with an IOC exit order in-flight (prevents duplicate exits)
         self._exiting_tickers: set[str] = set()
+        # Dry-run simulated balance tracker
+        self._dry_run_balance_cents: int = 0
         # Diagnostic counters
         self._signals_received: int = 0
         self._filter_passes: int = 0
@@ -193,15 +201,23 @@ class WeatherMakerStrategy(Strategy):
         self.subscribe_data(DataType(SignalScore), client_id=self.SIGNAL_CLIENT_ID)
         self.subscribe_data(DataType(ForecastDrift), client_id=self.SIGNAL_CLIENT_ID)
         # Record initial balance for drawdown circuit breaker
-        account = self.portfolio.account(KALSHI_VENUE)
-        if account is not None:
-            bal = account.balances().get(_USD)
-            if bal is not None:
-                self._initial_balance_cents = int(bal.total.as_double() * 100)
-        self.log.info(
-            f"WeatherMakerStrategy started — subscribed to signals, "
-            f"initial balance {self._initial_balance_cents}c"
-        )
+        if self._config.dry_run:
+            self._initial_balance_cents = self._config.dry_run_balance_usd * 100
+            self._dry_run_balance_cents = self._initial_balance_cents
+            self.log.info(
+                f"DRY-RUN MODE — no orders will be submitted, "
+                f"simulated balance {self._initial_balance_cents}c"
+            )
+        else:
+            account = self.portfolio.account(KALSHI_VENUE)
+            if account is not None:
+                bal = account.balances().get(_USD)
+                if bal is not None:
+                    self._initial_balance_cents = int(bal.total.as_double() * 100)
+            self.log.info(
+                f"WeatherMakerStrategy started — subscribed to signals, "
+                f"initial balance {self._initial_balance_cents}c"
+            )
 
     def on_stop(self) -> None:
         open_orders = self.cache.orders_open(strategy_id=self.id)
@@ -315,8 +331,10 @@ class WeatherMakerStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def on_quote_tick(self, tick) -> None:
-        """Handle incoming quote tick — circuit breaker then reprice."""
-        self._check_circuit_breaker()
+        """Handle incoming quote tick — check halt then reprice."""
+        # Cheap halt check on every tick (halt file only, no position iteration)
+        if not self._halted and os.path.exists(self._config.halt_file_path):
+            self._trigger_halt("halt file present")
         if self._halted:
             return
 
@@ -369,16 +387,23 @@ class WeatherMakerStrategy(Strategy):
         score: SignalScore,
     ) -> None:
         """Cancel existing orders and place new ladder at current bid."""
+        self._check_circuit_breaker()
+        if self._halted:
+            return
         self._cancel_all_for_ticker(ticker)
 
-        account = self.portfolio.account(instrument_id.venue)
-        if account is None:
-            self.log.warning(f"No account for {instrument_id.venue}")
-            return
-        usd_balance = account.balances().get(_USD)
-        if usd_balance is None:
-            return
-        balance_cents = int(usd_balance.total.as_double() * 100)
+        # Resolve balance — dry-run uses simulated tracker, live uses portfolio
+        if self._config.dry_run:
+            balance_cents = self._dry_run_balance_cents
+        else:
+            account = self.portfolio.account(instrument_id.venue)
+            if account is None:
+                self.log.warning(f"No account for {instrument_id.venue}")
+                return
+            usd_balance = account.balances().get(_USD)
+            if usd_balance is None:
+                return
+            balance_cents = int(usd_balance.total.as_double() * 100)
 
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
@@ -410,53 +435,89 @@ class WeatherMakerStrategy(Strategy):
             if allowed_qty <= 0:
                 break
 
-            order = self.order_factory.limit(
-                instrument_id=instrument_id,
-                order_side=OrderSide.BUY,
-                quantity=instrument.make_qty(allowed_qty),
-                price=instrument.make_price(price_cents / 100.0),
-                time_in_force=TimeInForce.GTC,
-            )
-            self.submit_order(order)
-            self._orders_submitted += 1
-            new_order_ids.append(order.client_order_id)
+            if self._config.dry_run:
+                cost_cents = allowed_qty * price_cents
+                self.log.info(
+                    f"DRY-RUN BUY: {instrument_id} {allowed_qty}@{price_cents}c "
+                    f"(cost={cost_cents}c, balance={balance_cents}c→{balance_cents - cost_cents}c)"
+                )
+                self._dry_run_balance_cents -= cost_cents
+                balance_cents = self._dry_run_balance_cents
+                self._orders_submitted += 1
+            else:
+                order = self.order_factory.limit(
+                    instrument_id=instrument_id,
+                    order_side=OrderSide.BUY,
+                    quantity=instrument.make_qty(allowed_qty),
+                    price=instrument.make_price(price_cents / 100.0),
+                    time_in_force=TimeInForce.GTC,
+                )
+                self.submit_order(order)
+                self._orders_submitted += 1
+                new_order_ids.append(order.client_order_id)
+
             # Update local tally for subsequent ladder levels
             market_exposure += allowed_qty * price_cents
             city_exposure += allowed_qty * price_cents
 
         self._resting_orders[ticker] = new_order_ids
         self._last_anchor[ticker] = bid_cents
-        if new_order_ids:
+        if self._config.dry_run:
+            self._ladders_placed += 1
+        elif new_order_ids:
             self._ladders_placed += 1
 
     def _exit_position(self, ticker: str, instrument_id: InstrumentId, bid_cents: int) -> None:
-        """Exit position when price hits exit threshold (IOC — partial better than none).
+        """Exit ALL open long positions when price hits exit threshold.
 
-        Guard against duplicate exits: if an IOC exit is already in-flight for
+        In HEDGING mode each fill creates a separate position, so we must
+        close each one individually by passing position_id to submit_order.
+        Without position_id, the sell creates a new SHORT instead of closing
+        the existing LONG.
+
+        Guard against duplicate exits: if exits are already in-flight for
         this ticker, skip. Cleared in on_order_filled / on_order_rejected.
+
+        In dry-run mode: log the exit and credit simulated proceeds.
         """
         if ticker in self._exiting_tickers:
             return
 
         self._cancel_all_for_ticker(ticker)
 
+        if self._config.dry_run:
+            # In dry-run mode, we don't have real positions. Credit proceeds
+            # based on the bid price for any simulated cost already deducted.
+            self._exits_attempted += 1
+            self.log.info(
+                f"DRY-RUN EXIT: {ticker} at {bid_cents}c "
+                f"(balance={self._dry_run_balance_cents}c)"
+            )
+            return
+
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            return
+
+        total_qty = 0
         positions = self.cache.positions(venue=instrument_id.venue)
         for pos in positions:
             if pos.instrument_id == instrument_id and not pos.is_closed:
                 qty = int(pos.quantity.as_double())
-                if qty > 0:
-                    instrument = self.cache.instrument(instrument_id)
+                if qty > 0 and pos.is_long:
                     order = self.order_factory.market(
                         instrument_id=instrument_id,
                         order_side=OrderSide.SELL,
                         quantity=instrument.make_qty(qty),
                         time_in_force=TimeInForce.IOC,
                     )
-                    self._exiting_tickers.add(ticker)
-                    self._exits_attempted += 1
-                    self.submit_order(order)
-                    self.log.info(f"EXIT: {ticker} at {bid_cents}c, selling {qty} contracts")
-                break
+                    self.submit_order(order, position_id=pos.id)
+                    total_qty += qty
+
+        if total_qty > 0:
+            self._exiting_tickers.add(ticker)
+            self._exits_attempted += 1
+            self.log.info(f"EXIT: {ticker} at {bid_cents}c, closing {total_qty} contracts")
 
     def _cancel_all_for_ticker(self, ticker: str) -> None:
         """Cancel all resting orders for a specific ticker."""
@@ -536,7 +597,12 @@ class WeatherMakerStrategy(Strategy):
     # ------------------------------------------------------------------
 
     def _check_circuit_breaker(self) -> None:
-        """Halt if halt file exists or drawdown limit breached."""
+        """Halt if halt file exists or drawdown limit breached.
+
+        Drawdown is measured from portfolio value (cash + mark-to-market
+        positions at last bid), not just cash balance. This prevents
+        capital deployment from being mistaken for losses.
+        """
         if self._halted:
             return
 
@@ -545,18 +611,51 @@ class WeatherMakerStrategy(Strategy):
             self._trigger_halt("halt file present")
             return
 
-        # Drawdown check — compare current balance to initial
+        # Drawdown check — portfolio value vs initial balance
         if self._initial_balance_cents > 0:
-            account = self.portfolio.account(KALSHI_VENUE)
-            if account is not None:
-                usd_balance = account.balances().get(_USD)
-                if usd_balance is not None:
-                    current_cents = int(usd_balance.total.as_double() * 100)
-                    drawdown = (self._initial_balance_cents - current_cents) / self._initial_balance_cents
-                    if drawdown >= self._config.max_drawdown_pct:
-                        self._trigger_halt(
-                            f"drawdown {drawdown:.1%} >= limit {self._config.max_drawdown_pct:.1%}"
-                        )
+            portfolio_cents = (
+                self._dry_run_balance_cents
+                if self._config.dry_run
+                else self._portfolio_value_cents()
+            )
+            if portfolio_cents is not None:
+                drawdown = (self._initial_balance_cents - portfolio_cents) / self._initial_balance_cents
+                # Small accounts get a relaxed drawdown limit
+                threshold = self._config.small_account_threshold_usd * 100
+                limit = (
+                    self._config.small_account_drawdown_pct
+                    if self._initial_balance_cents < threshold
+                    else self._config.max_drawdown_pct
+                )
+                if drawdown >= limit:
+                    self._trigger_halt(
+                        f"drawdown {drawdown:.1%} >= limit {limit:.1%}"
+                    )
+
+    def _portfolio_value_cents(self) -> int | None:
+        """Return cash + mark-to-market value of open positions in cents."""
+        account = self.portfolio.account(KALSHI_VENUE)
+        if account is None:
+            return None
+        usd_balance = account.balances().get(_USD)
+        if usd_balance is None:
+            return None
+        cash_cents = int(usd_balance.total.as_double() * 100)
+
+        # Mark open positions at last bid
+        mtm_cents = 0
+        for position in self.cache.positions(venue=KALSHI_VENUE):
+            if position.is_closed:
+                continue
+            qty = int(position.quantity.as_double())
+            if qty <= 0:
+                continue
+            last_tick = self.cache.quote_tick(position.instrument_id)
+            if last_tick is not None:
+                bid_cents = round(float(last_tick.bid_price) * 100)
+                mtm_cents += qty * bid_cents
+
+        return cash_cents + mtm_cents
 
     def _trigger_halt(self, reason: str) -> None:
         """Cancel all orders and set halted flag. Do NOT close positions."""

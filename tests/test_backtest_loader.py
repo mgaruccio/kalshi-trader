@@ -20,7 +20,7 @@ def _make_item(**overrides) -> dict:
         "drn_no": 0.98,
         "yes_bid": 85,
         "yes_ask": 90,
-        "status": "open",
+        "status": "active",
         "timestamp": "2026-03-14T12:00:00Z",
     }
     item.update(overrides)
@@ -83,9 +83,9 @@ class TestParseBackfillResponse:
         assert scores[0].ticker == "VALID"
 
     def test_status_passed_through(self):
-        data = [_make_item(status="open")]
+        data = [_make_item(status="active")]
         scores = parse_backfill_response(data)
-        assert scores[0].status == "open"
+        assert scores[0].status == "active"
 
     def test_multiple_scores_sorted(self):
         """Multiple scores across different timestamps are sorted correctly."""

@@ -21,6 +21,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Ensure project root is on sys.path when run as a script
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # Parameter sweep grid — (param_name, field_name, values)
 # 4 + 3 + 3 + 4 + 3 = 17 runs total
 _SWEEP_GRID: list[tuple[str, str, list]] = [
@@ -48,10 +51,16 @@ def _parse_args() -> argparse.Namespace:
         description="One-at-a-time parameter sweep for WeatherMakerStrategy.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    signal_group = parser.add_mutually_exclusive_group()
+    signal_group.add_argument(
+        "--signal-file",
+        default=None,
+        help="Path to pre-computed signals parquet (from scripts/precompute_signals.py)",
+    )
+    signal_group.add_argument(
         "--signal-url",
-        default="http://localhost:8000",
-        help="Base URL of the signal server (for backfill fetch)",
+        default=None,
+        help="Base URL of the signal server (for backfill fetch — slow)",
     )
     parser.add_argument(
         "--catalog-path",
@@ -134,14 +143,14 @@ def _run_single(
         end=end,
     )
     try:
-        results = extract_results(engine, strategy)
+        results = extract_results(engine, strategy, starting_balance_usd=starting_balance)
     finally:
         engine.dispose()
 
     return {
         "param_name":   param_name,
         "param_value":  param_value,
-        "pnl":          results.pnl_cents,
+        "pnl":          results.total_pnl_cents,
         "fills":        results.fill_count,
         "fill_rate":    round(results.fill_rate, 4),
         "max_drawdown": results.max_drawdown_cents,
@@ -192,12 +201,39 @@ def main() -> None:
     end = _parse_date(args.end_date)
     catalog_path = Path(args.catalog_path)
 
-    # --- Fetch signals once ---
-    try:
-        scores = asyncio.run(_fetch_scores(args.signal_url, start))
-    except Exception as exc:
-        print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # --- Load signals once ---
+    if args.signal_file:
+        from kalshi.backtest_loader import load_signal_file
+        print(f"Loading pre-computed signals from {args.signal_file}...")
+        try:
+            scores = load_signal_file(args.signal_file)
+        except Exception as exc:
+            print(f"ERROR: Failed to load signal file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Loaded {len(scores)} signal scores.")
+    elif args.signal_url:
+        try:
+            scores = asyncio.run(_fetch_scores(args.signal_url, start))
+        except Exception as exc:
+            print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        signal_file = Path("data/model_signals.parquet")
+        if signal_file.exists():
+            from kalshi.backtest_loader import load_signal_file
+            print(f"Loading pre-computed signals from {signal_file}...")
+            try:
+                scores = load_signal_file(signal_file)
+            except Exception as exc:
+                print(f"ERROR: Failed to load signal file: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"  Loaded {len(scores)} signal scores.")
+        else:
+            try:
+                scores = asyncio.run(_fetch_scores("http://localhost:8000", start))
+            except Exception as exc:
+                print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
+                sys.exit(1)
 
     scores = _filter_scores_to_date_range(scores, start, end)
     print(f"  Using {len(scores)} scores after date filter.\n")

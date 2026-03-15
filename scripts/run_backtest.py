@@ -2,14 +2,19 @@
 
 Usage:
     uv run python scripts/run_backtest.py --help
+
+    # From pre-computed signals file (preferred):
+    uv run python scripts/run_backtest.py \\
+        --signal-file data/model_signals.parquet \\
+        --catalog-path kalshi_data_catalog \\
+        --starting-balance 10000
+
+    # From signal server backfill endpoint (slow):
     uv run python scripts/run_backtest.py \\
         --signal-url http://localhost:8000 \\
         --catalog-path kalshi_data_catalog \\
         --start-date 2026-01-01 \\
-        --end-date 2026-03-14 \\
-        --starting-balance 10000 \\
-        --confidence-threshold 0.97 \\
-        --output results.json
+        --starting-balance 10000
 """
 from __future__ import annotations
 
@@ -21,6 +26,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Ensure project root is on sys.path when run as a script
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -28,11 +36,17 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Data sources
-    parser.add_argument(
+    # Data sources — signal-file (preferred) or signal-url (slow HTTP fallback)
+    signal_group = parser.add_mutually_exclusive_group()
+    signal_group.add_argument(
+        "--signal-file",
+        default=None,
+        help="Path to pre-computed signals parquet (from scripts/precompute_signals.py)",
+    )
+    signal_group.add_argument(
         "--signal-url",
-        default="http://localhost:8000",
-        help="Base URL of the signal server (for backfill fetch)",
+        default=None,
+        help="Base URL of the signal server (for backfill fetch — slow)",
     )
     parser.add_argument(
         "--catalog-path",
@@ -170,12 +184,40 @@ def main() -> None:
     start = _parse_date(args.start_date)
     end = _parse_date(args.end_date)
 
-    # --- Fetch signals ---
-    try:
-        scores = asyncio.run(_fetch_scores(args.signal_url, start))
-    except Exception as exc:
-        print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # --- Load signals ---
+    if args.signal_file:
+        from kalshi.backtest_loader import load_signal_file
+        print(f"Loading pre-computed signals from {args.signal_file}...")
+        try:
+            scores = load_signal_file(args.signal_file)
+        except Exception as exc:
+            print(f"ERROR: Failed to load signal file: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Loaded {len(scores)} signal scores.")
+    elif args.signal_url:
+        try:
+            scores = asyncio.run(_fetch_scores(args.signal_url, start))
+        except Exception as exc:
+            print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Default: try signal file, fall back to localhost
+        signal_file = Path("data/model_signals.parquet")
+        if signal_file.exists():
+            from kalshi.backtest_loader import load_signal_file
+            print(f"Loading pre-computed signals from {signal_file}...")
+            try:
+                scores = load_signal_file(signal_file)
+            except Exception as exc:
+                print(f"ERROR: Failed to load signal file: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(f"  Loaded {len(scores)} signal scores.")
+        else:
+            try:
+                scores = asyncio.run(_fetch_scores("http://localhost:8000", start))
+            except Exception as exc:
+                print(f"ERROR: Failed to fetch signal data: {exc}", file=sys.stderr)
+                sys.exit(1)
 
     scores = _filter_scores_to_date_range(scores, start, end)
 
@@ -205,7 +247,7 @@ def main() -> None:
     # --- Extract and print results ---
     from kalshi.backtest_results import extract_results, format_report
 
-    results = extract_results(engine, strategy)
+    results = extract_results(engine, strategy, starting_balance_usd=args.starting_balance)
     print(format_report(results))
 
     # --- Optional JSON output ---

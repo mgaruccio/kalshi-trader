@@ -57,6 +57,18 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Required when --environment=production. Acknowledges real-money risk.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Log-only mode: log orders instead of submitting. No exec client needed.",
+    )
+    parser.add_argument(
+        "--starting-balance",
+        type=int,
+        default=20,
+        help="Simulated starting capital in USD (only used with --dry-run)",
+    )
 
     # Strategy config overrides (same set as run_backtest.py)
     parser.add_argument(
@@ -131,6 +143,9 @@ def _build_strategy_config(args: argparse.Namespace):
     from kalshi.strategy import WeatherMakerConfig
 
     overrides: dict = {}
+    if args.dry_run:
+        overrides["dry_run"] = True
+        overrides["dry_run_balance_usd"] = args.starting_balance
     if args.confidence_threshold is not None:
         overrides["confidence_threshold"] = args.confidence_threshold
     if args.ladder_depth is not None:
@@ -184,11 +199,6 @@ def main() -> None:
         private_key_path=private_key_path,
         environment=args.environment,
     )
-    exec_cfg = KalshiExecClientConfig(
-        api_key_id=api_key_id,
-        private_key_path=private_key_path,
-        environment=args.environment,
-    )
 
     signal_actor_cfg = SignalActorConfig(
         signal_http_url=args.signal_url,
@@ -197,9 +207,18 @@ def main() -> None:
 
     strategy_cfg = _build_strategy_config(args)
 
+    if args.dry_run:
+        print(
+            f"{'=' * 60}\n"
+            f"  DRY-RUN MODE — no orders will be submitted\n"
+            f"  Simulated balance: ${args.starting_balance}\n"
+            f"{'=' * 60}"
+        )
+
     print(
         f"Starting WeatherMakerStrategy trader\n"
         f"  environment:          {args.environment}\n"
+        f"  dry_run:              {args.dry_run}\n"
         f"  signal_url:           {args.signal_url}\n"
         f"  confidence_threshold: {strategy_cfg.confidence_threshold}\n"
         f"  ladder_depth:         {strategy_cfg.ladder_depth}\n"
@@ -207,20 +226,37 @@ def main() -> None:
     )
 
     # --- TradingNode ---
-    node_config = TradingNodeConfig(
-        trader_id="KALSHI-TRADER-001",
-        data_clients={
-            "KALSHI": data_cfg,
-        },
-        exec_clients={
-            "KALSHI": exec_cfg,
-        },
-    )
+    # In dry-run mode, skip the exec client entirely — no connection to
+    # Kalshi order API. portfolio.account() will return None, which is
+    # fine since the strategy uses simulated balance in dry-run.
+    if args.dry_run:
+        node_config = TradingNodeConfig(
+            trader_id="KALSHI-TRADER-001",
+            data_clients={
+                "KALSHI": data_cfg,
+            },
+        )
+    else:
+        exec_cfg = KalshiExecClientConfig(
+            api_key_id=api_key_id,
+            private_key_path=private_key_path,
+            environment=args.environment,
+        )
+        node_config = TradingNodeConfig(
+            trader_id="KALSHI-TRADER-001",
+            data_clients={
+                "KALSHI": data_cfg,
+            },
+            exec_clients={
+                "KALSHI": exec_cfg,
+            },
+        )
 
     node = TradingNode(config=node_config)
 
     node.add_data_client_factory("KALSHI", KalshiLiveDataClientFactory)
-    node.add_exec_client_factory("KALSHI", KalshiLiveExecClientFactory)
+    if not args.dry_run:
+        node.add_exec_client_factory("KALSHI", KalshiLiveExecClientFactory)
     node.build()
 
     # --- Add components ---

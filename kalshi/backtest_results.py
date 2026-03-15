@@ -11,13 +11,16 @@ from nautilus_trader.model.identifiers import InstrumentId
 class BacktestResults:
     """Aggregated metrics from a completed backtest run."""
 
-    pnl_cents: int
+    pnl_cents: int                # realized (cash balance change)
+    unrealized_pnl_cents: int     # mark-to-market value of open positions
+    total_pnl_cents: int          # realized + unrealized
     fill_count: int
     order_count: int
     fill_rate: float
     max_drawdown_cents: int
     contracts_per_city: dict[str, int]
     avg_fill_price_cents: float
+    open_position_count: int      # contracts still held at backtest end
 
     # Strategy diagnostic counters (set by A2)
     signals_received: int
@@ -27,7 +30,7 @@ class BacktestResults:
     exits_attempted: int
     orders_submitted: int
 
-    # Adjusted PnL: scale by fill_rate / assumed_fill_rate
+    # Adjusted PnL: scale total_pnl by fill_rate / assumed_fill_rate
     adjusted_pnl_cents: float
 
 
@@ -82,6 +85,12 @@ def extract_results(engine, strategy, assumed_fill_rate: float = 0.5, starting_b
         )
         avg_fill_price_cents = total_price / fill_count
 
+    # --- unrealized PnL: mark open positions at last observed bid ---
+    unrealized_pnl_cents, open_position_count = _compute_unrealized_pnl(cache)
+
+    # --- total PnL ---
+    total_pnl_cents = pnl_cents + unrealized_pnl_cents
+
     # --- max drawdown ---
     max_drawdown_cents = _compute_max_drawdown_cents(filled_orders)
 
@@ -96,19 +105,22 @@ def extract_results(engine, strategy, assumed_fill_rate: float = 0.5, starting_b
     exits_attempted = getattr(strategy, "_exits_attempted", 0)
     orders_submitted = getattr(strategy, "_orders_submitted", 0)
 
-    # --- adjusted PnL ---
+    # --- adjusted PnL: scale total PnL by fill_rate / assumed_fill_rate ---
     adjusted_pnl_cents = (
-        pnl_cents * (fill_rate / assumed_fill_rate) if assumed_fill_rate > 0 else 0.0
+        total_pnl_cents * (fill_rate / assumed_fill_rate) if assumed_fill_rate > 0 else 0.0
     )
 
     return BacktestResults(
         pnl_cents=pnl_cents,
+        unrealized_pnl_cents=unrealized_pnl_cents,
+        total_pnl_cents=total_pnl_cents,
         fill_count=fill_count,
         order_count=order_count,
         fill_rate=fill_rate,
         max_drawdown_cents=max_drawdown_cents,
         contracts_per_city=contracts_per_city,
         avg_fill_price_cents=avg_fill_price_cents,
+        open_position_count=open_position_count,
         signals_received=signals_received,
         filter_passes=filter_passes,
         filter_fails=filter_fails,
@@ -117,6 +129,36 @@ def extract_results(engine, strategy, assumed_fill_rate: float = 0.5, starting_b
         orders_submitted=orders_submitted,
         adjusted_pnl_cents=adjusted_pnl_cents,
     )
+
+
+def _compute_unrealized_pnl(cache) -> tuple[int, int]:
+    """Compute mark-to-market value of open positions using last observed bid.
+
+    For each open position, values the held contracts at the last bid price
+    seen in the cache. This represents what you could sell them for right now.
+
+    Returns (unrealized_value_cents, open_contract_count).
+    """
+    total_value = 0
+    total_qty = 0
+
+    for position in cache.positions():
+        if position.is_closed:
+            continue
+        qty = int(position.quantity.as_double())
+        if qty <= 0:
+            continue
+
+        # Get last quote tick for this instrument
+        last_tick = cache.quote_tick(position.instrument_id)
+        if last_tick is not None:
+            bid_cents = round(float(last_tick.bid_price) * 100)
+            total_value += qty * bid_cents
+        # If no tick available, value at 0 (conservative)
+
+        total_qty += qty
+
+    return total_value, total_qty
 
 
 def _compute_max_drawdown_cents(filled_orders) -> int:
@@ -210,8 +252,10 @@ def format_report(results: BacktestResults) -> str:
         "=" * 60,
         "",
         "--- PnL ---",
-        f"  PnL:              {results.pnl_cents:+d}c  (${results.pnl_cents / 100:+.2f})",
-        f"  Adjusted PnL:     {results.adjusted_pnl_cents:+.1f}c  (fill_rate / assumed)",
+        f"  Realized PnL:     {results.pnl_cents:+d}c  (${results.pnl_cents / 100:+.2f})",
+        f"  Unrealized PnL:   {results.unrealized_pnl_cents:+d}c  (${results.unrealized_pnl_cents / 100:+.2f})  [{results.open_position_count} contracts @ last bid]",
+        f"  Total PnL:        {results.total_pnl_cents:+d}c  (${results.total_pnl_cents / 100:+.2f})",
+        f"  Adjusted PnL:     {results.adjusted_pnl_cents:+.1f}c  (total * fill_rate / assumed)",
         "",
         "--- Fill Statistics ---",
         f"  Orders placed (NT): {results.order_count}",

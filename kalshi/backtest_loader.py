@@ -1,7 +1,13 @@
-"""Load signal server backfill data into SignalScore events for backtesting."""
+"""Load signal data into SignalScore events for backtesting.
+
+Supports two sources:
+  1. Pre-computed parquet file (preferred — fast, no network, reproducible)
+  2. Signal server backfill HTTP endpoint (slow, requires running server)
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -16,6 +22,34 @@ def _iso_to_ns(ts_str: str) -> int:
     """
     dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     return int(dt.timestamp() * 1_000_000_000)
+
+
+def load_signal_file(path: str | Path) -> list[SignalScore]:
+    """Load pre-computed SignalScore events from a parquet file.
+
+    The file should be produced by scripts/precompute_signals.py using
+    NT's catalog.write_data(), which serializes via the @customdataclass
+    Arrow schema.
+
+    Returns chronologically sorted list of SignalScore events.
+    """
+    import pyarrow.parquet as pq
+    from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Signal file not found: {path}")
+
+    table = pq.read_table(str(path))
+    scores = ArrowSerializer.deserialize(SignalScore, table)
+
+    if not scores:
+        raise ValueError(f"No SignalScore data found in {path}")
+
+    # ArrowSerializer returns pyo3 objects — convert to Python
+    result = [SignalScore.from_pyo3(s) if hasattr(s, '__pyo3__') else s for s in scores]
+    result.sort(key=lambda s: s.ts_event)
+    return result
 
 
 def parse_backfill_response(data: list[dict]) -> list[SignalScore]:

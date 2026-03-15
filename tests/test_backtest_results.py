@@ -83,6 +83,7 @@ def _make_engine(
     cache = MagicMock()
     cache.orders.return_value = orders
     cache.positions.return_value = []
+    cache.quote_tick.return_value = None
 
     # instrument() returns None by default (heuristic fallback used)
     cache.instrument.return_value = None
@@ -107,12 +108,15 @@ class TestBacktestResultsDataclass:
     def test_fields_accessible(self):
         r = BacktestResults(
             pnl_cents=100,
+            unrealized_pnl_cents=500,
+            total_pnl_cents=600,
             fill_count=5,
             order_count=10,
             fill_rate=0.5,
             max_drawdown_cents=50,
             contracts_per_city={"ny": 20},
             avg_fill_price_cents=85.0,
+            open_position_count=3,
             signals_received=20,
             filter_passes=8,
             filter_fails=12,
@@ -122,19 +126,25 @@ class TestBacktestResultsDataclass:
             adjusted_pnl_cents=100.0,
         )
         assert r.pnl_cents == 100
+        assert r.unrealized_pnl_cents == 500
+        assert r.total_pnl_cents == 600
         assert r.fill_rate == 0.5
         assert r.contracts_per_city == {"ny": 20}
+        assert r.open_position_count == 3
         assert r.adjusted_pnl_cents == 100.0
 
     def test_zero_defaults_valid(self):
         r = BacktestResults(
             pnl_cents=0,
+            unrealized_pnl_cents=0,
+            total_pnl_cents=0,
             fill_count=0,
             order_count=0,
             fill_rate=0.0,
             max_drawdown_cents=0,
             contracts_per_city={},
             avg_fill_price_cents=0.0,
+            open_position_count=0,
             signals_received=0,
             filter_passes=0,
             filter_fails=0,
@@ -350,7 +360,7 @@ class TestExtractResults:
         assert results.filter_passes == 0
 
     def test_adjusted_pnl_scales_by_fill_rate(self):
-        # 3 filled / 10 total -> fill_rate = 0.3; pnl = 500c; assumed = 0.5
+        # 3 filled / 10 total -> fill_rate = 0.3; pnl = 500c; no open positions -> total = 500c
         # adjusted = 500 * (0.3 / 0.5) = 300c
         filled = [_make_filled_order() for _ in range(3)]
         unfilled = [_make_unfilled_order() for _ in range(7)]
@@ -358,6 +368,7 @@ class TestExtractResults:
         strategy = _make_strategy()
         results = extract_results(engine, strategy, assumed_fill_rate=0.5, starting_balance_usd=10000)
         assert results.pnl_cents == 500
+        assert results.total_pnl_cents == 500  # no open positions
         assert abs(results.adjusted_pnl_cents - 300.0) < 0.1
 
     def test_adjusted_pnl_zero_when_assumed_fill_rate_zero(self):
@@ -391,12 +402,15 @@ class TestFormatReport:
     def _make_results(self, **overrides) -> BacktestResults:
         defaults = dict(
             pnl_cents=250,
+            unrealized_pnl_cents=1000,
+            total_pnl_cents=1250,
             fill_count=10,
             order_count=20,
             fill_rate=0.5,
             max_drawdown_cents=100,
             contracts_per_city={"ny": 30, "chi": 10},
             avg_fill_price_cents=82.5,
+            open_position_count=5,
             signals_received=40,
             filter_passes=15,
             filter_fails=25,

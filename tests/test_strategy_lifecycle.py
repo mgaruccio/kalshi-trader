@@ -76,6 +76,7 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_market_exposure_cents",
         "_city_exposure_cents",
         "_check_circuit_breaker",
+        "_portfolio_value_cents",
         "_trigger_halt",
         "_in_entry_phase",
         "_is_tomorrow_contract",
@@ -207,22 +208,18 @@ class TestCircuitBreaker:
         assert strategy._halted is True
 
     def test_drawdown_circuit_breaker_triggers(self):
-        """Drawdown beyond max_drawdown_pct halts the strategy."""
+        """Drawdown beyond max_drawdown_pct halts the strategy (no open positions)."""
         cfg = WeatherMakerConfig(max_drawdown_pct=0.15)
         strategy = _make_strategy(cfg)
         strategy._initial_balance_cents = 100_000
         # Current balance = 84,000 → drawdown = 16% > 15%
         usd_balance = MagicMock()
         usd_balance.total.as_double.return_value = 840.0  # $840 = 84,000 cents
-        strategy.portfolio.account.return_value.balances.return_value = {
-            # Use a real Currency key or mock — strategy uses _USD module-level constant
-            # so we need the mock to return our balance for any key lookup
-        }
-        # Patch balances().get() directly
         mock_account = MagicMock()
         mock_account.balances.return_value.get.return_value = usd_balance
         strategy.portfolio.account.return_value = mock_account
         strategy.cache.orders_open.return_value = []
+        strategy.cache.positions.return_value = []  # no positions — pure cash loss
         strategy._check_circuit_breaker()
         assert strategy._halted is True
 
@@ -237,6 +234,50 @@ class TestCircuitBreaker:
         mock_account = MagicMock()
         mock_account.balances.return_value.get.return_value = usd_balance
         strategy.portfolio.account.return_value = mock_account
+        strategy.cache.positions.return_value = []
+        strategy._check_circuit_breaker()
+        assert strategy._halted is False
+
+    def test_positions_offset_cash_drawdown(self):
+        """Cash spent on positions doesn't trigger breaker when positions have value."""
+        cfg = WeatherMakerConfig(max_drawdown_pct=0.15)
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 2_000  # $20
+        # Cash dropped to 1,615c (bought 5 @ 77c), but positions worth 490c
+        # Portfolio value = 1615 + 490 = 2105 → no drawdown
+        usd_balance = MagicMock()
+        usd_balance.total.as_double.return_value = 16.15
+        mock_account = MagicMock()
+        mock_account.balances.return_value.get.return_value = usd_balance
+        strategy.portfolio.account.return_value = mock_account
+        # Mock an open position with last bid
+        position = MagicMock()
+        position.is_closed = False
+        position.quantity.as_double.return_value = 5.0
+        position.instrument_id = MagicMock()
+        strategy.cache.positions.return_value = [position]
+        last_tick = MagicMock()
+        last_tick.bid_price = 0.98  # 98c
+        strategy.cache.quote_tick.return_value = last_tick
+        strategy._check_circuit_breaker()
+        assert strategy._halted is False
+
+    def test_small_account_uses_relaxed_limit(self):
+        """Accounts below threshold use small_account_drawdown_pct."""
+        cfg = WeatherMakerConfig(
+            max_drawdown_pct=0.15,
+            small_account_drawdown_pct=0.25,
+            small_account_threshold_usd=100,
+        )
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 2_000  # $20 < $100 threshold
+        # 20% drawdown — exceeds 15% but within 25% small account limit
+        usd_balance = MagicMock()
+        usd_balance.total.as_double.return_value = 16.0  # $16 = 1600c
+        mock_account = MagicMock()
+        mock_account.balances.return_value.get.return_value = usd_balance
+        strategy.portfolio.account.return_value = mock_account
+        strategy.cache.positions.return_value = []
         strategy._check_circuit_breaker()
         assert strategy._halted is False
 
@@ -488,3 +529,136 @@ class TestDiagnosticCounters:
         assert strategy._exits_attempted == 0
         strategy._exit_position(ticker, instrument_id, 97)
         assert strategy._exits_attempted == 1
+
+
+class TestDryRunMode:
+    """Tests for dry-run (log-only) mode."""
+
+    def test_on_start_sets_simulated_balance(self):
+        """on_start in dry-run mode sets balance from config, skips portfolio."""
+        cfg = WeatherMakerConfig(dry_run=True, dry_run_balance_usd=20)
+        strategy = _make_strategy(cfg)
+        strategy.SIGNAL_CLIENT_ID = WeatherMakerStrategy.SIGNAL_CLIENT_ID
+        strategy.on_start()
+        assert strategy._initial_balance_cents == 2000
+        assert strategy._dry_run_balance_cents == 2000
+        # portfolio.account should NOT be called
+        strategy.portfolio.account.assert_not_called()
+
+    def test_reprice_ladder_logs_instead_of_submitting(self):
+        """In dry-run mode, _reprice_ladder logs DRY-RUN BUY and doesn't submit_order."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(dry_run=True, dry_run_balance_usd=20, ladder_depth=2)
+        strategy = _make_strategy(cfg)
+        strategy._dry_run_balance_cents = 2000
+        strategy._initial_balance_cents = 2000
+
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+        score = _make_score()
+
+        instrument = MagicMock()
+        instrument.make_qty.side_effect = lambda q: q
+        instrument.make_price.side_effect = lambda p: p
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+        strategy.cache.positions.return_value = []
+
+        strategy._reprice_ladder(ticker, instrument_id, "no", 85, score)
+
+        # No real orders submitted
+        strategy.submit_order.assert_not_called()
+        # But orders_submitted counter incremented
+        assert strategy._orders_submitted > 0
+        assert strategy._ladders_placed == 1
+        # Balance decreased
+        assert strategy._dry_run_balance_cents < 2000
+        # DRY-RUN BUY logged
+        log_messages = [str(call) for call in strategy.log.info.call_args_list]
+        assert any("DRY-RUN BUY" in msg for msg in log_messages)
+
+    def test_reprice_ladder_deducts_correct_cost(self):
+        """Simulated balance is reduced by qty * price for each ladder level."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(
+            dry_run=True, dry_run_balance_usd=100,
+            ladder_depth=1, level_quantity=10,
+        )
+        strategy = _make_strategy(cfg)
+        strategy._dry_run_balance_cents = 10_000
+        strategy._initial_balance_cents = 10_000
+
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+        score = _make_score()
+
+        instrument = MagicMock()
+        instrument.make_qty.side_effect = lambda q: q
+        instrument.make_price.side_effect = lambda p: p
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+        strategy.cache.positions.return_value = []
+
+        strategy._reprice_ladder(ticker, instrument_id, "no", 85, score)
+
+        # 10 contracts @ 85c = 850c deducted
+        assert strategy._dry_run_balance_cents == 10_000 - 850
+
+    def test_exit_position_logs_in_dry_run(self):
+        """In dry-run mode, _exit_position logs DRY-RUN EXIT and doesn't submit."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(dry_run=True, dry_run_balance_usd=20)
+        strategy = _make_strategy(cfg)
+        strategy._dry_run_balance_cents = 2000
+
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        strategy.cache.orders_open.return_value = []
+
+        strategy._exit_position(ticker, instrument_id, 97)
+
+        strategy.submit_order.assert_not_called()
+        assert strategy._exits_attempted == 1
+        log_messages = [str(call) for call in strategy.log.info.call_args_list]
+        assert any("DRY-RUN EXIT" in msg for msg in log_messages)
+
+    def test_circuit_breaker_uses_dry_run_balance(self):
+        """Circuit breaker in dry-run mode uses _dry_run_balance_cents, not portfolio."""
+        cfg = WeatherMakerConfig(
+            dry_run=True, dry_run_balance_usd=20,
+            small_account_drawdown_pct=0.25,
+            small_account_threshold_usd=100,
+        )
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 2000
+        strategy._dry_run_balance_cents = 1400  # 30% drawdown > 25% limit
+        strategy.cache.orders_open.return_value = []
+
+        strategy._check_circuit_breaker()
+
+        assert strategy._halted is True
+        # portfolio.account should NOT be called
+        strategy.portfolio.account.assert_not_called()
+
+    def test_circuit_breaker_within_limit_no_halt(self):
+        """Dry-run circuit breaker doesn't halt when drawdown is within limit."""
+        cfg = WeatherMakerConfig(
+            dry_run=True, dry_run_balance_usd=20,
+            small_account_drawdown_pct=0.25,
+            small_account_threshold_usd=100,
+        )
+        strategy = _make_strategy(cfg)
+        strategy._initial_balance_cents = 2000
+        strategy._dry_run_balance_cents = 1800  # 10% drawdown < 25% limit
+        strategy.cache.orders_open.return_value = []
+
+        strategy._check_circuit_breaker()
+
+        assert strategy._halted is False

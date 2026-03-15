@@ -1,0 +1,32 @@
+{
+  "pnl_cents": -1996,
+  "unrealized_pnl_cents": 3675,
+  "total_pnl_cents": 1679,
+  "fill_count": 324,
+  "order_count": 354,
+  "fill_rate": 0.9152542372881356,
+  "max_drawdown_cents": 2136,
+  "contracts_per_city": {
+    "ny": 20,
+    "phil": 198,
+    "thou": 37,
+    "tphx": 77,
+    "mia": 10,
+    "aus": 440,
+    "tsfo": 65,
+    "tokc": 3,
+    "tmin": 7,
+    "chi": 15,
+    "den": 493,
+    "lax": 17
+  },
+  "avg_fill_price_cents": 30.212962962962962,
+  "open_position_count": 1289,
+  "signals_received": 71,
+  "filter_passes": 46,
+  "filter_fails": 25,
+  "ladders_placed": 220,
+  "exits_attempted": 15,
+  "orders_submitted": 302,
+  "adjusted_pnl_cents": 3073.423728813559
+}

@@ -22,7 +22,7 @@ def _make_score(
         drn_no=0.98,
         yes_bid=85,
         yes_ask=90,
-        status="open",
+        status="active",
         ts_event=0,
         ts_init=0,
     )
@@ -124,6 +124,20 @@ class TestFilterLayer:
         score = _make_score(no_p_win=0.98, n_models=3, status="open")
         _, passes = should_quote(cfg, score, drift_cities=set())
         assert passes is True
+
+    def test_active_status_passes(self):
+        """Signal server returns 'active' — must be accepted by filter."""
+        cfg = WeatherMakerConfig(confidence_threshold=0.95, min_models=2)
+        score = _make_score(no_p_win=0.98, n_models=3, status="active")
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_closed_status_fails(self):
+        """Closed contracts must be rejected by filter."""
+        cfg = WeatherMakerConfig(confidence_threshold=0.95, min_models=2)
+        score = _make_score(no_p_win=0.98, n_models=3, status="closed")
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
 
     def test_model_spread_too_large_fails(self):
         """If per-model probabilities diverge too much, skip."""
