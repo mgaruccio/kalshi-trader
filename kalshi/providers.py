@@ -44,8 +44,9 @@ class KalshiInstrumentProvider(InstrumentProvider):
         private_key_path: str,
         rest_host: str,
         load_all: bool = True,
+        filters: dict | None = None,
     ):
-        super().__init__(InstrumentProviderConfig(load_all=load_all))
+        super().__init__(InstrumentProviderConfig(load_all=load_all, filters=filters))
         self._api_config = kalshi_python.Configuration()
         self._api_config.host = rest_host
         self._api_config.request_timeout = 10  # Correction #19

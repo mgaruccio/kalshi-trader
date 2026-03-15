@@ -19,6 +19,7 @@ def get_kalshi_instrument_provider(
     private_key_path: str,
     rest_host: str,
     load_all: bool = True,
+    filters: dict | None = None,
 ) -> KalshiInstrumentProvider:
     """Singleton instrument provider shared between data and exec clients."""
     global _SHARED_PROVIDER
@@ -28,6 +29,7 @@ def get_kalshi_instrument_provider(
             private_key_path=private_key_path,
             rest_host=rest_host,
             load_all=load_all,
+            filters=filters,
         )
     return _SHARED_PROVIDER
 
@@ -37,11 +39,13 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
     def create(loop, name, config, msgbus, cache, clock):
         from kalshi.data import KalshiDataClient  # deferred to avoid circular import
 
+        filters = {"series_ticker": config.series_ticker} if config.series_ticker else None
         provider = get_kalshi_instrument_provider(
             config.api_key_id,
             config.private_key_path,
             config.rest_url,
             load_all=config.load_all_instruments,
+            filters=filters,
         )
         return KalshiDataClient(
             loop=loop,
