@@ -13,8 +13,8 @@ uv run python -m pytest tests/mock_exchange/ -v          # mock exchange unit te
 uv run python -m pytest tests/test_live_confidence.py -v  # adapter confidence tests (run in isolation)
 uv run python -m pytest tests/test_execution.py tests/sim/ -v  # adapter unit tests
 
-# Run all tests (excluding confidence tests which need isolation due to event loop)
-uv run python -m pytest --ignore=tests/test_live_confidence.py -v
+# Run all tests (excluding live tests which need isolation / running services)
+uv run python -m pytest --ignore=tests/test_live_confidence.py --ignore=tests/test_live_signals.py -v
 
 # Run data collector
 uv run collector.py
@@ -22,17 +22,23 @@ uv run collector.py
 
 ## Architecture
 
-This repo contains the **Kalshi NautilusTrader adapter** and a **data collector** for KXHIGH (daily high temperature) prediction markets. The evaluator, trading node, and supporting modules are not yet on master.
+This repo contains the **Kalshi NautilusTrader adapter**, **data collector**, **backtest pipeline**, and **dry-run trader** for KXHIGH (daily high temperature) prediction markets.
 
 ### Collector (`collector.py`)
 WebSocket data ingestion into ParquetDataCatalog for backtesting archives. Runs as a systemd service on the production droplet (161.35.114.105). Discovery strategy finds KXHIGH series, subscribes to quote ticks, and persists via StreamingFeatherWriter. Production-hardened: heartbeat timer (tick count/60s), event loop reference caching, background thread error surfacing, consecutive failure escalation, unopened market discovery.
 
 ### Critical modules
 - **`kalshi/`**: Kalshi ↔ NautilusTrader adapter package. `KalshiDataClient` (WebSocket market data), `KalshiExecutionClient` (order routing), `KalshiInstrumentProvider` (market discovery). REST calls offloaded to `asyncio.to_thread()`. Config overrides via `base_url_http`/`base_url_ws`. Factory singleton `_SHARED_PROVIDER` must be reset to `None` between test runs.
+- **`kalshi/strategy.py`**: `WeatherMakerStrategy` — forecast-filtered passive market maker. Supports `dry_run` mode (log orders instead of submitting, simulated balance tracking). Config via `WeatherMakerConfig`.
+- **`kalshi/backtest.py`** + **`kalshi/backtest_results.py`**: Backtest engine and result extraction (mark-to-market PnL, per-city breakdown).
 - **`collector.py`**: Discovery strategy + TradingNode bootstrap. Uses `KalshiInstrumentProvider(load_all=False)` since the strategy discovers markets itself. Must call `cache.add_instrument(inst)` before subscribing to quote ticks — StreamingFeatherWriter silently drops ticks for instruments not in cache.
+- **`scripts/run_trader.py`**: Live/demo trader bootstrap. `--dry-run` skips exec client entirely. `--environment production --dry-run` is safe (no orders). KXHIGH instruments loaded via per-city `series_tickers` list (~204 markets in ~1s).
 
 ### Deployment
-Production droplet at `161.35.114.105`. Collector runs via `systemctl {start,stop,restart} collector.service`. Logs at `/root/kalshi-trader/collector.log`. Data at `kalshi_data_catalog/` (3.6GB+). Deploy by pushing to master and pulling on the droplet (or scp for hotfixes).
+Production droplet at `161.35.114.105`. Deploy by pushing to master and pulling on the droplet (or scp for hotfixes).
+- **Collector**: `systemctl {start,stop,restart} collector.service`. Logs at `/root/kalshi-trader/collector.log`. Data at `kalshi_data_catalog/` (3.6GB+).
+- **Trader**: `systemctl {start,stop,restart} trader.service`. Logs at `/root/kalshi-trader/trader.log`. Currently in dry-run mode ($20 simulated). Heartbeat at `/tmp/kalshi-trader-heartbeat`.
+- **PYTHONPATH**: `trader.service` sets `PYTHONPATH=/root/kalshi-trader` — required because systemd scripts set `sys.path[0]` to the scripts/ directory.
 
 ## Key Conventions
 
