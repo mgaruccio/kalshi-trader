@@ -39,7 +39,7 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
     def create(loop, name, config, msgbus, cache, clock):
         from kalshi.data import KalshiDataClient  # deferred to avoid circular import
 
-        filters = {"series_ticker": config.series_ticker} if config.series_ticker else None
+        filters = {"series_tickers": config.series_tickers} if config.series_tickers else None
         provider = get_kalshi_instrument_provider(
             config.api_key_id,
             config.private_key_path,

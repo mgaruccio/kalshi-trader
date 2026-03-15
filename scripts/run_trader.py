@@ -197,13 +197,19 @@ def main() -> None:
     from kalshi.strategy import WeatherMakerStrategy
 
     # --- Configs ---
-    # Filter to KXHIGH series only — loading all 90k instruments takes >120s
-    # and exceeds TradingNode's connection timeout.
+    # Load only KXHIGH city series — loading all 90k instruments takes >120s.
+    # Each city has its own series ticker (KXHIGHNY, KXHIGHCHI, etc).
+    kxhigh_series = [
+        "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHAUS", "KXHIGHDEN",
+        "KXHIGHPHIL", "KXHIGHTATL", "KXHIGHTBOS", "KXHIGHTDAL", "KXHIGHTDC",
+        "KXHIGHTHOU", "KXHIGHTLV", "KXHIGHTMIN", "KXHIGHTOKC", "KXHIGHTSATX",
+        "KXHIGHTSEA", "KXHIGHTSFO",
+    ]
     data_cfg = KalshiDataClientConfig(
         api_key_id=api_key_id,
         private_key_path=private_key_path,
         environment=args.environment,
-        series_ticker="KXHIGH",
+        series_tickers=kxhigh_series,
     )
 
     signal_actor_cfg = SignalActorConfig(

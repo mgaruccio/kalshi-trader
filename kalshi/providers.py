@@ -73,29 +73,40 @@ class KalshiInstrumentProvider(InstrumentProvider):
         await asyncio.to_thread(self._load_all_sync, filters)
 
     def _load_all_sync(self, filters: dict | None = None) -> None:
-        """Synchronous market loading — called via asyncio.to_thread."""
+        """Synchronous market loading — called via asyncio.to_thread.
+
+        Filters:
+            series_ticker: str — load a single series
+            series_tickers: list[str] — load multiple series (iterate each)
+            statuses: list[str] — market statuses to query (default: open, unopened)
+        """
         filters = filters or {}
         series_ticker = filters.get("series_ticker")
+        series_tickers = filters.get("series_tickers", [])
         statuses = filters.get("statuses", ["open", "unopened"])
 
-        for status in statuses:
-            cursor = None
-            while True:
-                resp = self._markets_api.get_markets(
-                    limit=200,
-                    cursor=cursor,
-                    status=status,
-                    series_ticker=series_ticker,
-                )
-                for m in getattr(resp, "markets", None) or []:
-                    if m.status not in ("active", "open", "unopened"):
-                        continue
-                    self.add(self._build_instrument(m, "YES"))
-                    self.add(self._build_instrument(m, "NO"))
+        # If series_tickers provided, iterate each; else single query
+        tickers_to_load = series_tickers or [series_ticker]
 
-                cursor = getattr(resp, "cursor", None)
-                if not cursor:
-                    break
+        for st in tickers_to_load:
+            for status in statuses:
+                cursor = None
+                while True:
+                    resp = self._markets_api.get_markets(
+                        limit=200,
+                        cursor=cursor,
+                        status=status,
+                        series_ticker=st,
+                    )
+                    for m in getattr(resp, "markets", None) or []:
+                        if m.status not in ("active", "open", "unopened"):
+                            continue
+                        self.add(self._build_instrument(m, "YES"))
+                        self.add(self._build_instrument(m, "NO"))
+
+                    cursor = getattr(resp, "cursor", None)
+                    if not cursor:
+                        break
 
         log.info(f"Loaded {self.count} instruments from Kalshi")
 
