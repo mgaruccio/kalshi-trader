@@ -17,6 +17,7 @@ class KalshiDataClientConfig(LiveDataClientConfig, frozen=True):
     base_url_http: str | None = None  # override auto-detected URL
     base_url_ws: str | None = None
     series_ticker: str | None = None  # filter instruments on load
+    load_all_instruments: bool = True  # False = lazy load (strategy discovers)
     update_instruments_interval_mins: PositiveInt | None = None
 
     @property

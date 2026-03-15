@@ -18,6 +18,7 @@ def get_kalshi_instrument_provider(
     api_key_id: str,
     private_key_path: str,
     rest_host: str,
+    load_all: bool = True,
 ) -> KalshiInstrumentProvider:
     """Singleton instrument provider shared between data and exec clients."""
     global _SHARED_PROVIDER
@@ -26,6 +27,7 @@ def get_kalshi_instrument_provider(
             api_key_id=api_key_id,
             private_key_path=private_key_path,
             rest_host=rest_host,
+            load_all=load_all,
         )
     return _SHARED_PROVIDER
 
@@ -39,6 +41,7 @@ class KalshiLiveDataClientFactory(LiveDataClientFactory):
             config.api_key_id,
             config.private_key_path,
             config.rest_url,
+            load_all=config.load_all_instruments,
         )
         return KalshiDataClient(
             loop=loop,

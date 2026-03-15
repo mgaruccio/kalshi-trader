@@ -197,10 +197,13 @@ def main() -> None:
     from kalshi.strategy import WeatherMakerStrategy
 
     # --- Configs ---
+    # In dry-run mode, skip loading all 90k instruments at startup.
+    # The SignalActor discovers markets; strategy loads on demand.
     data_cfg = KalshiDataClientConfig(
         api_key_id=api_key_id,
         private_key_path=private_key_path,
         environment=args.environment,
+        load_all_instruments=not args.dry_run,
     )
 
     signal_actor_cfg = SignalActorConfig(
