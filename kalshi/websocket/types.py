@@ -9,9 +9,9 @@ import msgspec
 
 class OrderbookSnapshotMsg(msgspec.Struct):
     market_ticker: str
-    yes_dollars_fp: list[list[str]]
-    no_dollars_fp: list[list[str]]
     market_id: str | None = None
+    yes_dollars_fp: list[list[str]] = []
+    no_dollars_fp: list[list[str]] = []
 
 
 class OrderbookDeltaMsg(msgspec.Struct):
