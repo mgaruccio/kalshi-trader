@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import pathlib
 import sys
@@ -176,6 +177,92 @@ def _heartbeat_path() -> str:
     return "/tmp/kalshi-trader-heartbeat"
 
 
+def _portfolio_snapshot_path() -> str:
+    return "/tmp/kalshi-trader-portfolio.json"
+
+
+def _write_portfolio_snapshot(strategy) -> None:
+    """Write current portfolio state to JSON for external monitoring."""
+    from kalshi.common.constants import KALSHI_VENUE
+    from nautilus_trader.model.objects import Currency
+
+    usd = Currency.from_str("USD")
+
+    try:
+        account = strategy.portfolio.account(KALSHI_VENUE)
+        if account is None:
+            return
+
+        usd_balance = account.balances().get(usd)
+        if usd_balance is None:
+            return
+
+        # Open positions
+        positions = []
+        for pos in strategy.cache.positions(venue=KALSHI_VENUE):
+            if pos.is_closed:
+                continue
+            qty = int(pos.quantity.as_double())
+            if qty <= 0:
+                continue
+
+            # Mark-to-market at last bid
+            last_tick = strategy.cache.quote_tick(pos.instrument_id)
+            bid_price = round(float(last_tick.bid_price) * 100) if last_tick else None
+            ask_price = round(float(last_tick.ask_price) * 100) if last_tick else None
+            mtm_value = qty * bid_price if bid_price is not None else None
+
+            positions.append({
+                "instrument": str(pos.instrument_id),
+                "side": str(pos.side),
+                "qty": qty,
+                "avg_entry_cents": round(pos.avg_px_open * 100),
+                "cost_cents": round(pos.avg_px_open * 100) * qty,
+                "bid_cents": bid_price,
+                "ask_cents": ask_price,
+                "mtm_value_cents": mtm_value,
+                "unrealized_pnl_cents": (
+                    mtm_value - round(pos.avg_px_open * 100) * qty
+                    if mtm_value is not None
+                    else None
+                ),
+                "realized_pnl_usd": float(pos.realized_pnl.as_double()),
+            })
+
+        total_cost = sum(p["cost_cents"] for p in positions)
+        total_mtm = sum(p["mtm_value_cents"] for p in positions if p["mtm_value_cents"] is not None)
+        total_unrealized = sum(
+            p["unrealized_pnl_cents"] for p in positions if p["unrealized_pnl_cents"] is not None
+        )
+
+        snapshot = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "account": {
+                "total_usd": float(usd_balance.total.as_double()),
+                "locked_usd": float(usd_balance.locked.as_double()),
+                "free_usd": float(usd_balance.free.as_double()),
+            },
+            "positions": sorted(positions, key=lambda p: -p["qty"]),
+            "summary": {
+                "open_position_count": len(positions),
+                "total_contracts": sum(p["qty"] for p in positions),
+                "total_cost_cents": total_cost,
+                "total_mtm_cents": total_mtm,
+                "total_unrealized_pnl_cents": total_unrealized,
+                "portfolio_value_cents": round(usd_balance.total.as_double() * 100) + total_mtm,
+            },
+        }
+
+        tmp = _portfolio_snapshot_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        os.replace(tmp, _portfolio_snapshot_path())
+
+    except Exception as e:
+        # Never crash the strategy for a monitoring write
+        strategy.log.warning(f"Portfolio snapshot failed: {e}")
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -305,7 +392,21 @@ def main() -> None:
         callback=_write_heartbeat,
     )
 
-    print(f"TradingNode built. Running (heartbeat → {_heartbeat_path()}). Press Ctrl+C to stop.")
+    def _snapshot_portfolio(event=None) -> None:
+        _write_portfolio_snapshot(strategy)
+
+    strategy.clock.set_timer(
+        "portfolio_snapshot",
+        interval=datetime.timedelta(seconds=60),
+        callback=_snapshot_portfolio,
+    )
+
+    print(
+        f"TradingNode built. Running.\n"
+        f"  heartbeat  → {_heartbeat_path()}\n"
+        f"  portfolio  → {_portfolio_snapshot_path()}\n"
+        f"Press Ctrl+C to stop."
+    )
     try:
         node.run()
     except KeyboardInterrupt:
