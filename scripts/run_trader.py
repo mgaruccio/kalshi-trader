@@ -212,9 +212,10 @@ def _write_portfolio_snapshot(strategy) -> None:
             ask_price = round(float(last_tick.ask_price) * 100) if last_tick else None
             mtm_value = qty * bid_price if bid_price is not None else None
 
+            side_name = pos.side.name if hasattr(pos.side, "name") else str(pos.side)
             positions.append({
                 "instrument": str(pos.instrument_id),
-                "side": str(pos.side),
+                "side": side_name,
                 "qty": qty,
                 "avg_entry_cents": round(pos.avg_px_open * 100),
                 "cost_cents": round(pos.avg_px_open * 100) * qty,
