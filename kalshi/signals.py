@@ -21,6 +21,7 @@ class SignalScore(Data):
     yes_bid: int = 0          # current market YES bid in cents
     yes_ask: int = 0          # current market YES ask in cents
     status: str = ""          # market status: "open", "unopened", "closed", "settled"
+    nws_max: float = 0.0      # NWS forecast max temperature (0.0 = unavailable)
 
 
 @customdataclass

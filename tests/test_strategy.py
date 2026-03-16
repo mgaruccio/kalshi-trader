@@ -2,7 +2,8 @@
 import pytest
 
 from kalshi.signals import SignalScore
-from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps
+from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps, compute_cap_multiplier
+from kalshi.signal_actor import parse_score_msg
 
 
 def _make_score(
@@ -23,6 +24,7 @@ def _make_score(
         yes_bid=85,
         yes_ask=90,
         status="active",
+        nws_max=0.0,
         ts_event=0,
         ts_init=0,
     )
@@ -58,6 +60,14 @@ class TestWeatherMakerConfig:
         cfg = WeatherMakerConfig(confidence_threshold=0.99, min_models=3)
         assert cfg.confidence_threshold == 0.99
         assert cfg.min_models == 3
+
+    def test_nws_config_defaults(self):
+        cfg = WeatherMakerConfig()
+        assert cfg.min_nws_margin == 2.0
+        assert cfg.max_nws_model_divergence == 5.0
+        assert cfg.nws_missing_cap_multiplier == 0.5
+        assert cfg.low_price_threshold_cents == 75
+        assert cfg.low_price_cap_multiplier == 0.5
 
 
 class TestFilterLayer:
@@ -315,3 +325,196 @@ class TestCheckRiskCaps:
             city_cap_pct=0.33,
         )
         assert allowed == 22  # floor(2000/90) = 22
+
+
+# ---------------------------------------------------------------------------
+# Task 1: nws_max field on SignalScore + parse_score_msg
+# ---------------------------------------------------------------------------
+
+class TestSignalScoreNwsMax:
+    def test_signal_score_has_nws_max(self):
+        score = _make_score(nws_max=70.0)
+        assert score.nws_max == 70.0
+
+    def test_signal_score_nws_max_defaults_to_zero(self):
+        score = _make_score()
+        assert score.nws_max == 0.0
+
+
+class TestParseScoreMsgNwsMax:
+    _base_msg = dict(
+        ticker="KXHIGHTDC-26MAR16-T69",
+        city="washington_dc",
+        threshold=69.0,
+        direction="above",
+        no_p_win=0.98,
+        yes_p_win=0.02,
+        no_margin=5.0,
+        n_models=3,
+        yes_bid=85,
+    )
+
+    def test_parse_score_msg_with_nws_max(self):
+        msg = {**self._base_msg, "nws_max": 70.0}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 70.0
+
+    def test_parse_score_msg_nws_max_null(self):
+        msg = {**self._base_msg, "nws_max": None}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 0.0
+
+    def test_parse_score_msg_nws_max_missing(self):
+        msg = {**self._base_msg}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3: NWS hard filters in should_quote()
+# ---------------------------------------------------------------------------
+
+class TestNwsFiltersInShouldQuote:
+    """NWS margin and divergence filters — only active when nws_max > 0."""
+
+    def _cfg(self, **kwargs) -> WeatherMakerConfig:
+        defaults = dict(
+            confidence_threshold=0.95,
+            min_models=2,
+            min_nws_margin=2.0,
+            max_nws_model_divergence=5.0,
+        )
+        defaults.update(kwargs)
+        return WeatherMakerConfig(**defaults)
+
+    def test_above_tight_nws_margin_fails(self):
+        """above: nws_max=70.5, threshold=69, margin=1.5 < 2.0 → reject."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=70.5,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_above_sufficient_nws_margin_passes(self):
+        """above: nws_max=72, threshold=69, margin=3.0 >= 2.0 → allow."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=72.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_below_tight_nws_margin_fails(self):
+        """below: nws_max=67.5, threshold=69, margin=1.5 < 2.0 → reject."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="below",
+            threshold=69.0, no_margin=5.0, nws_max=67.5,
+            emos_no=0.95, ngboost_no=0.99, drn_no=0.98,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_below_sufficient_nws_margin_passes(self):
+        """below: nws_max=66, threshold=69, margin=3.0 >= 2.0 → allow."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="below",
+            threshold=69.0, no_margin=5.0, nws_max=66.0,
+            emos_no=0.95, ngboost_no=0.99, drn_no=0.98,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_model_divergence_rejects(self):
+        """above: nws_max=80, consensus=74 (69+5), divergence=6 > 5.0 → reject."""
+        cfg = self._cfg(max_nws_model_divergence=5.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=80.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_nws_model_divergence_passes(self):
+        """above: nws_max=76, consensus=74 (69+5), divergence=2 <= 5.0 → allow."""
+        cfg = self._cfg(max_nws_model_divergence=5.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=76.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_zero_skips_filter(self):
+        """nws_max=0.0 means unavailable — NWS filters must be skipped."""
+        cfg = self._cfg(min_nws_margin=2.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=0.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_margin_exact_boundary_passes(self):
+        """above: nws_max=71, threshold=69, margin=2.0 == min_nws_margin → allow (>=)."""
+        cfg = self._cfg(min_nws_margin=2.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=71.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+
+# ---------------------------------------------------------------------------
+# Task 4: compute_cap_multiplier()
+# ---------------------------------------------------------------------------
+
+class TestComputeCapMultiplier:
+    """compute_cap_multiplier(nws_max, anchor_cents, config) → float."""
+
+    def _cfg(self, **kwargs) -> WeatherMakerConfig:
+        defaults = dict(
+            nws_missing_cap_multiplier=0.5,
+            low_price_threshold_cents=75,
+            low_price_cap_multiplier=0.5,
+        )
+        defaults.update(kwargs)
+        return WeatherMakerConfig(**defaults)
+
+    def test_full_caps_no_penalty(self):
+        """nws_max present, price above threshold → multiplier == 1.0."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=85, config=cfg) == pytest.approx(1.0)
+
+    def test_low_price_only(self):
+        """nws_max present, price below threshold → 0.5."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=70, config=cfg) == pytest.approx(0.5)
+
+    def test_nws_missing_only(self):
+        """nws_max==0 (unavailable), price above threshold → 0.5."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=85, config=cfg) == pytest.approx(0.5)
+
+    def test_both_penalties_stack(self):
+        """nws_max==0 AND price below threshold → 0.5 * 0.5 = 0.25."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=70, config=cfg) == pytest.approx(0.25)
+
+    def test_exact_boundary_no_penalty(self):
+        """anchor_cents == low_price_threshold_cents → not below threshold → no penalty."""
+        cfg = self._cfg(low_price_threshold_cents=75)
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=75, config=cfg) == pytest.approx(1.0)
+
+    def test_custom_multipliers_stack(self):
+        """Custom multipliers: nws=0.8, low_price=0.6, both → 0.48."""
+        cfg = self._cfg(nws_missing_cap_multiplier=0.8, low_price_cap_multiplier=0.6)
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=70, config=cfg) == pytest.approx(0.48)

@@ -33,6 +33,15 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
     reprice_threshold: int = 2          # cents — min bid movement to trigger reprice
     max_entry_cents: int = 96           # hard cap on anchor price
 
+    # NWS filters
+    min_nws_margin: float = 2.0
+    max_nws_model_divergence: float = 5.0
+    nws_missing_cap_multiplier: float = 0.5
+
+    # Low-price cap reduction
+    low_price_threshold_cents: int = 75
+    low_price_cap_multiplier: float = 0.5
+
     # Risk
     market_cap_pct: float = 0.20        # max fraction of account per contract
     city_cap_pct: float = 0.33          # max fraction of account per city
@@ -90,11 +99,50 @@ def should_quote(
         if spread > config.max_model_spread:
             return side, False
 
+    # NWS hard filters — only when nws_max is available (non-zero)
+    if score.nws_max > 0.0:
+        # Direction-aware NWS margin: how far forecast is on the winning side
+        if score.direction == "above":
+            nws_margin = score.nws_max - score.threshold
+        else:
+            nws_margin = score.threshold - score.nws_max
+
+        if abs(nws_margin) < config.min_nws_margin:
+            return side, False
+
+        # NWS vs ensemble consensus divergence
+        if score.direction == "above":
+            consensus = score.threshold + score.no_margin
+        else:
+            consensus = score.threshold - score.no_margin
+
+        if abs(score.nws_max - consensus) > config.max_nws_model_divergence:
+            return side, False
+
     # Check hard cap on entry price
     if anchor_cents > config.max_entry_cents:
         return side, False
 
     return side, True
+
+
+def compute_cap_multiplier(
+    nws_max: float,
+    anchor_cents: int,
+    config: WeatherMakerConfig,
+) -> float:
+    """Return a position cap multiplier for NWS-missing and low-price contracts.
+
+    Multipliers stack multiplicatively:
+    - nws_max == 0.0 (unavailable): multiply by nws_missing_cap_multiplier
+    - anchor_cents < low_price_threshold_cents: multiply by low_price_cap_multiplier
+    """
+    multiplier = 1.0
+    if nws_max == 0.0:
+        multiplier *= config.nws_missing_cap_multiplier
+    if anchor_cents < config.low_price_threshold_cents:
+        multiplier *= config.low_price_cap_multiplier
+    return multiplier
 
 
 def check_risk_caps(
@@ -375,6 +423,15 @@ class WeatherMakerStrategy(Strategy):
         market_exposure = self._market_exposure_cents(ticker)
         city_exposure = self._city_exposure_cents(score.city)
 
+        # Apply cap multipliers for NWS-missing and low-price contracts
+        cap_mult = compute_cap_multiplier(
+            nws_max=score.nws_max,
+            anchor_cents=bid_cents,
+            config=self._config,
+        )
+        effective_market_cap_pct = self._config.market_cap_pct * cap_mult
+        effective_city_cap_pct = self._config.city_cap_pct * cap_mult
+
         levels = compute_ladder(
             anchor_bid_cents=bid_cents,
             depth=self._config.ladder_depth,
@@ -390,8 +447,8 @@ class WeatherMakerStrategy(Strategy):
                 quantity=qty,
                 price_cents=price_cents,
                 account_balance_cents=balance_cents,
-                market_cap_pct=self._config.market_cap_pct,
-                city_cap_pct=self._config.city_cap_pct,
+                market_cap_pct=effective_market_cap_pct,
+                city_cap_pct=effective_city_cap_pct,
             )
             if allowed_qty <= 0:
                 break
