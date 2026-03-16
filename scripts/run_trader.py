@@ -239,6 +239,8 @@ def main() -> None:
     if args.dry_run:
         from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 
+        from nautilus_trader.live.config import LiveExecEngineConfig
+
         sandbox_exec_cfg = SandboxExecutionClientConfig(
             venue="KALSHI",
             oms_type="HEDGING",
@@ -246,10 +248,10 @@ def main() -> None:
             base_currency="USD",
             starting_balances=[f"{args.starting_balance} USD"],
             use_position_ids=True,
-            reconciliation=False,  # sandbox has no prior state to reconcile
         )
         node_config = TradingNodeConfig(
             trader_id="KALSHI-TRADER-001",
+            exec_engine=LiveExecEngineConfig(reconciliation=False),
             data_clients={
                 "KALSHI": data_cfg,
             },
