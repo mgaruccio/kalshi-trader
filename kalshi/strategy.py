@@ -7,7 +7,7 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol
+from nautilus_trader.model.identifiers import ClientId, ClientOrderId, InstrumentId, Symbol
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.trading.strategy import Strategy
 
@@ -176,8 +176,12 @@ class WeatherMakerStrategy(Strategy):
         self._orders_submitted: int = 0
 
     def on_start(self) -> None:
-        self.subscribe_data(DataType(SignalScore))
-        self.subscribe_data(DataType(ForecastDrift))
+        # client_id routes the SubscribeData command to the KALSHI data client
+        # (which no-ops for custom types). Without it, subscribe_data logs an
+        # error even though the msgbus subscription still registers.
+        data_client = ClientId("KALSHI")
+        self.subscribe_data(DataType(SignalScore), client_id=data_client)
+        self.subscribe_data(DataType(ForecastDrift), client_id=data_client)
         # Record initial balance for drawdown circuit breaker
         account = self.portfolio.account(KALSHI_VENUE)
         if account is not None:
