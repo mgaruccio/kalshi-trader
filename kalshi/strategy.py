@@ -33,6 +33,15 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
     reprice_threshold: int = 2          # cents — min bid movement to trigger reprice
     max_entry_cents: int = 96           # hard cap on anchor price
 
+    # NWS filters
+    min_nws_margin: float = 2.0
+    max_nws_model_divergence: float = 5.0
+    nws_missing_cap_multiplier: float = 0.5
+
+    # Low-price cap reduction
+    low_price_threshold_cents: int = 75
+    low_price_cap_multiplier: float = 0.5
+
     # Risk
     market_cap_pct: float = 0.20        # max fraction of account per contract
     city_cap_pct: float = 0.33          # max fraction of account per city

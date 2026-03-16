@@ -3,6 +3,7 @@ import pytest
 
 from kalshi.signals import SignalScore
 from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps
+from kalshi.signal_actor import parse_score_msg
 
 
 def _make_score(
@@ -23,6 +24,7 @@ def _make_score(
         yes_bid=85,
         yes_ask=90,
         status="active",
+        nws_max=0.0,
         ts_event=0,
         ts_init=0,
     )
@@ -58,6 +60,14 @@ class TestWeatherMakerConfig:
         cfg = WeatherMakerConfig(confidence_threshold=0.99, min_models=3)
         assert cfg.confidence_threshold == 0.99
         assert cfg.min_models == 3
+
+    def test_nws_config_defaults(self):
+        cfg = WeatherMakerConfig()
+        assert cfg.min_nws_margin == 2.0
+        assert cfg.max_nws_model_divergence == 5.0
+        assert cfg.nws_missing_cap_multiplier == 0.5
+        assert cfg.low_price_threshold_cents == 75
+        assert cfg.low_price_cap_multiplier == 0.5
 
 
 class TestFilterLayer:
@@ -315,3 +325,49 @@ class TestCheckRiskCaps:
             city_cap_pct=0.33,
         )
         assert allowed == 22  # floor(2000/90) = 22
+
+
+# ---------------------------------------------------------------------------
+# Task 1: nws_max field on SignalScore + parse_score_msg
+# ---------------------------------------------------------------------------
+
+class TestSignalScoreNwsMax:
+    def test_signal_score_has_nws_max(self):
+        score = _make_score(nws_max=70.0)
+        assert score.nws_max == 70.0
+
+    def test_signal_score_nws_max_defaults_to_zero(self):
+        score = _make_score()
+        assert score.nws_max == 0.0
+
+
+class TestParseScoreMsgNwsMax:
+    _base_msg = dict(
+        ticker="KXHIGHTDC-26MAR16-T69",
+        city="washington_dc",
+        threshold=69.0,
+        direction="above",
+        no_p_win=0.98,
+        yes_p_win=0.02,
+        no_margin=5.0,
+        n_models=3,
+        yes_bid=85,
+    )
+
+    def test_parse_score_msg_with_nws_max(self):
+        msg = {**self._base_msg, "nws_max": 70.0}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 70.0
+
+    def test_parse_score_msg_nws_max_null(self):
+        msg = {**self._base_msg, "nws_max": None}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 0.0
+
+    def test_parse_score_msg_nws_max_missing(self):
+        msg = {**self._base_msg}
+        score = parse_score_msg(msg, ts_ns=0)
+        assert score is not None
+        assert score.nws_max == 0.0
