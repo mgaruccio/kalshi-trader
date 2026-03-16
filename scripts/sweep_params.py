@@ -25,13 +25,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Parameter sweep grid — (param_name, field_name, values)
-# 4 + 3 + 3 + 4 + 3 = 17 runs total
+# 4 + 3 + 3 + 4 + 3 + 4 + 3 + 3 + 3 + 3 = 33 runs total
 _SWEEP_GRID: list[tuple[str, str, list]] = [
     ("confidence_threshold", "confidence_threshold", [0.90, 0.93, 0.95, 0.97]),
     ("ladder_depth",         "ladder_depth",         [2, 3, 4]),
     ("level_quantity",       "level_quantity",        [5, 10, 15]),
     ("exit_price_cents",     "exit_price_cents",      [95, 96, 97, 98]),
     ("reprice_threshold",    "reprice_threshold",     [1, 2, 3]),
+    ("min_nws_margin",           "min_nws_margin",           [1.0, 2.0, 3.0, 5.0]),
+    ("max_nws_model_divergence", "max_nws_model_divergence", [3.0, 5.0, 8.0]),
+    ("nws_missing_cap_mult",     "nws_missing_cap_multiplier", [0.25, 0.5, 0.75]),
+    ("low_price_threshold",      "low_price_threshold_cents",  [60, 75, 85]),
+    ("low_price_cap_mult",       "low_price_cap_multiplier",   [0.25, 0.5, 0.75]),
 ]
 
 _CSV_COLUMNS = [
