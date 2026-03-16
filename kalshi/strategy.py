@@ -126,6 +126,25 @@ def should_quote(
     return side, True
 
 
+def compute_cap_multiplier(
+    nws_max: float,
+    anchor_cents: int,
+    config: WeatherMakerConfig,
+) -> float:
+    """Return a position cap multiplier for NWS-missing and low-price contracts.
+
+    Multipliers stack multiplicatively:
+    - nws_max == 0.0 (unavailable): multiply by nws_missing_cap_multiplier
+    - anchor_cents < low_price_threshold_cents: multiply by low_price_cap_multiplier
+    """
+    multiplier = 1.0
+    if nws_max == 0.0:
+        multiplier *= config.nws_missing_cap_multiplier
+    if anchor_cents < config.low_price_threshold_cents:
+        multiplier *= config.low_price_cap_multiplier
+    return multiplier
+
+
 def check_risk_caps(
     market_exposure_cents: int,
     city_exposure_cents: int,
@@ -404,6 +423,15 @@ class WeatherMakerStrategy(Strategy):
         market_exposure = self._market_exposure_cents(ticker)
         city_exposure = self._city_exposure_cents(score.city)
 
+        # Apply cap multipliers for NWS-missing and low-price contracts
+        cap_mult = compute_cap_multiplier(
+            nws_max=score.nws_max,
+            anchor_cents=bid_cents,
+            config=self._config,
+        )
+        effective_market_cap_pct = self._config.market_cap_pct * cap_mult
+        effective_city_cap_pct = self._config.city_cap_pct * cap_mult
+
         levels = compute_ladder(
             anchor_bid_cents=bid_cents,
             depth=self._config.ladder_depth,
@@ -419,8 +447,8 @@ class WeatherMakerStrategy(Strategy):
                 quantity=qty,
                 price_cents=price_cents,
                 account_balance_cents=balance_cents,
-                market_cap_pct=self._config.market_cap_pct,
-                city_cap_pct=self._config.city_cap_pct,
+                market_cap_pct=effective_market_cap_pct,
+                city_cap_pct=effective_city_cap_pct,
             )
             if allowed_qty <= 0:
                 break

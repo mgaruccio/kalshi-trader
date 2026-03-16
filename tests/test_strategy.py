@@ -2,7 +2,7 @@
 import pytest
 
 from kalshi.signals import SignalScore
-from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps
+from kalshi.strategy import WeatherMakerConfig, should_quote, compute_ladder, check_risk_caps, compute_cap_multiplier
 from kalshi.signal_actor import parse_score_msg
 
 
@@ -471,3 +471,50 @@ class TestNwsFiltersInShouldQuote:
         )
         _, passes = should_quote(cfg, score, drift_cities=set())
         assert passes is True
+
+
+# ---------------------------------------------------------------------------
+# Task 4: compute_cap_multiplier()
+# ---------------------------------------------------------------------------
+
+class TestComputeCapMultiplier:
+    """compute_cap_multiplier(nws_max, anchor_cents, config) → float."""
+
+    def _cfg(self, **kwargs) -> WeatherMakerConfig:
+        defaults = dict(
+            nws_missing_cap_multiplier=0.5,
+            low_price_threshold_cents=75,
+            low_price_cap_multiplier=0.5,
+        )
+        defaults.update(kwargs)
+        return WeatherMakerConfig(**defaults)
+
+    def test_full_caps_no_penalty(self):
+        """nws_max present, price above threshold → multiplier == 1.0."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=85, config=cfg) == pytest.approx(1.0)
+
+    def test_low_price_only(self):
+        """nws_max present, price below threshold → 0.5."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=70, config=cfg) == pytest.approx(0.5)
+
+    def test_nws_missing_only(self):
+        """nws_max==0 (unavailable), price above threshold → 0.5."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=85, config=cfg) == pytest.approx(0.5)
+
+    def test_both_penalties_stack(self):
+        """nws_max==0 AND price below threshold → 0.5 * 0.5 = 0.25."""
+        cfg = self._cfg()
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=70, config=cfg) == pytest.approx(0.25)
+
+    def test_exact_boundary_no_penalty(self):
+        """anchor_cents == low_price_threshold_cents → not below threshold → no penalty."""
+        cfg = self._cfg(low_price_threshold_cents=75)
+        assert compute_cap_multiplier(nws_max=72.0, anchor_cents=75, config=cfg) == pytest.approx(1.0)
+
+    def test_custom_multipliers_stack(self):
+        """Custom multipliers: nws=0.8, low_price=0.6, both → 0.48."""
+        cfg = self._cfg(nws_missing_cap_multiplier=0.8, low_price_cap_multiplier=0.6)
+        assert compute_cap_multiplier(nws_max=0.0, anchor_cents=70, config=cfg) == pytest.approx(0.48)
