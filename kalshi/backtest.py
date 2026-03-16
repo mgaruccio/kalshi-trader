@@ -10,7 +10,7 @@ from nautilus_trader.backtest.models import BestPriceFillModel
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import AccountType, AssetClass, OmsType
-from nautilus_trader.model.identifiers import ClientId, Symbol, TraderId
+from nautilus_trader.model.identifiers import Symbol, TraderId
 from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -136,7 +136,7 @@ def load_signal_data(
         from nautilus_trader.model.data import CustomData
         data_type = DataType(SignalScore)
         wrapped = [CustomData(data_type=data_type, data=s) for s in scores]
-        engine.add_data(wrapped, client_id=ClientId("SIGNAL"), sort=False)
+        engine.add_data(wrapped, sort=False)
 
 
 def run_full_backtest(

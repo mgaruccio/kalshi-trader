@@ -538,7 +538,6 @@ class TestDryRunMode:
         """on_start in dry-run mode sets balance from config, skips portfolio."""
         cfg = WeatherMakerConfig(dry_run=True, dry_run_balance_usd=20)
         strategy = _make_strategy(cfg)
-        strategy.SIGNAL_CLIENT_ID = WeatherMakerStrategy.SIGNAL_CLIENT_ID
         strategy.on_start()
         assert strategy._initial_balance_cents == 2000
         assert strategy._dry_run_balance_cents == 2000

@@ -176,8 +176,8 @@ class KalshiDataClient(LiveMarketDataClient):
         price = float(msg.price_dollars)
         delta = float(msg.delta_fp)
 
-        if delta == 0.0:
-            # Remove the level
+        if delta <= 0.0:
+            # Negative delta = removal, zero = clear level
             book[side_key].pop(price, None)
         else:
             book[side_key][price] = delta

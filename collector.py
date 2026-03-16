@@ -52,10 +52,42 @@ class KalshiDiscoveryStrategy(Strategy):
         self.log.info(f"HEARTBEAT: {count} ticks/60s, {len(self.subscribed_ids)} instruments")
         if count == 0:
             self._zero_tick_streak += 1
-            if self._zero_tick_streak >= 5:
-                self.log.error("NO TICKS FOR 5 MINUTES — possible connection issue")
+            if self._zero_tick_streak >= 15:
+                self.log.critical(
+                    "NO TICKS FOR 15 MINUTES after recovery attempts — "
+                    "exiting for systemd restart"
+                )
+                import sys
+                sys.exit(1)
+            elif self._zero_tick_streak >= 5:
+                self.log.error(
+                    "NO TICKS FOR 5 MINUTES — triggering reconnection"
+                )
+                self._attempt_recovery()
         else:
             self._zero_tick_streak = 0
+
+    def _attempt_recovery(self):
+        """Force WS reconnection by clearing books and resubscribing."""
+        import asyncio
+        self.log.warning("Recovery: clearing books and forcing reconnection...")
+
+        async def _recover():
+            try:
+                data_client = self.cache.data_client("KALSHI")
+                if data_client is None:
+                    self.log.error("Recovery: no KALSHI data client found")
+                    return
+                # Clear local book state so snapshots rebuild cleanly
+                data_client._books.clear()
+                ws = data_client._ws_client
+                if ws is not None:
+                    await ws._rebuild_and_resubscribe()
+                self.log.info("Recovery: reconnection triggered successfully")
+            except Exception as e:
+                self.log.error(f"Recovery failed: {e}")
+
+        asyncio.run_coroutine_threadsafe(_recover(), self._loop)
 
     def on_timer(self, timer_id: str):
         if timer_id == "discovery_timer":

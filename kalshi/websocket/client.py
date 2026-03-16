@@ -30,6 +30,7 @@ class KalshiWebSocketClient:
         self._seq_tracker: dict[int, int] = {}
         self._next_cmd_id = 1
         self._sub_lock = asyncio.Lock()  # Correction #25
+        self._reconnect_failures: int = 0
 
     def _get_auth(self):
         """Lazily construct KalshiAuth to avoid PEM load at init time."""
@@ -119,7 +120,7 @@ class KalshiWebSocketClient:
         self._seq_tracker.clear()
         log.info("WebSocket reconnected, rebuilding with fresh auth...")
         task = asyncio.ensure_future(self._rebuild_and_resubscribe())
-        task.add_done_callback(self._reconnect_done)
+        task.add_done_callback(lambda t: self._reconnect_done(t))
 
     async def _rebuild_and_resubscribe(self) -> None:
         if self._ws_client:
@@ -127,15 +128,25 @@ class KalshiWebSocketClient:
         await self._build_and_connect()
         await self._subscribe_all()
 
-    @staticmethod
-    def _reconnect_done(task: asyncio.Task) -> None:
+    def _reconnect_done(self, task: asyncio.Task) -> None:
         if task.exception():
-            log.error(f"Reconnect failed: {task.exception()}")
+            self._reconnect_failures += 1
+            log.error(
+                f"Reconnect failed ({self._reconnect_failures} consecutive): "
+                f"{task.exception()}"
+            )
+        else:
+            self._reconnect_failures = 0
+            log.info("Reconnect succeeded")
 
     async def disconnect(self) -> None:
         if self._ws_client:
             await self._ws_client.disconnect()
             self._ws_client = None
+
+    @property
+    def reconnect_failures(self) -> int:
+        return self._reconnect_failures
 
     @property
     def is_connected(self) -> bool:
