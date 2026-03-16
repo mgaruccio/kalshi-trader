@@ -352,17 +352,9 @@ class WeatherMakerStrategy(Strategy):
         if bid_cents <= 0:
             return
 
-        # Check exit condition (always honored regardless of time gate)
+        # Check exit condition
         if bid_cents >= self._config.exit_price_cents:
             self._exit_position(base_ticker, tick.instrument_id, bid_cents)
-            return
-
-        # Time-of-day gate — only place new ladders during entry phase
-        if not self._in_entry_phase():
-            return
-
-        # Tomorrow contract delay — wait for price discovery to settle
-        if self._is_tomorrow_contract(base_ticker) and not self._tomorrow_delay_elapsed(base_ticker):
             return
 
         # Dead-zone check
