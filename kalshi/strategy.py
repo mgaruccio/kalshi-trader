@@ -99,6 +99,26 @@ def should_quote(
         if spread > config.max_model_spread:
             return side, False
 
+    # NWS hard filters — only when nws_max is available (non-zero)
+    if score.nws_max > 0.0:
+        # Direction-aware NWS margin: how far forecast is on the winning side
+        if score.direction == "above":
+            nws_margin = score.nws_max - score.threshold
+        else:
+            nws_margin = score.threshold - score.nws_max
+
+        if abs(nws_margin) < config.min_nws_margin:
+            return side, False
+
+        # NWS vs ensemble consensus divergence
+        if score.direction == "above":
+            consensus = score.threshold + score.no_margin
+        else:
+            consensus = score.threshold - score.no_margin
+
+        if abs(score.nws_max - consensus) > config.max_nws_model_divergence:
+            return side, False
+
     # Check hard cap on entry price
     if anchor_cents > config.max_entry_cents:
         return side, False

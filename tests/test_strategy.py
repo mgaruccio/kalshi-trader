@@ -371,3 +371,103 @@ class TestParseScoreMsgNwsMax:
         score = parse_score_msg(msg, ts_ns=0)
         assert score is not None
         assert score.nws_max == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3: NWS hard filters in should_quote()
+# ---------------------------------------------------------------------------
+
+class TestNwsFiltersInShouldQuote:
+    """NWS margin and divergence filters — only active when nws_max > 0."""
+
+    def _cfg(self, **kwargs) -> WeatherMakerConfig:
+        defaults = dict(
+            confidence_threshold=0.95,
+            min_models=2,
+            min_nws_margin=2.0,
+            max_nws_model_divergence=5.0,
+        )
+        defaults.update(kwargs)
+        return WeatherMakerConfig(**defaults)
+
+    def test_above_tight_nws_margin_fails(self):
+        """above: nws_max=70.5, threshold=69, margin=1.5 < 2.0 → reject."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=70.5,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_above_sufficient_nws_margin_passes(self):
+        """above: nws_max=72, threshold=69, margin=3.0 >= 2.0 → allow."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=72.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_below_tight_nws_margin_fails(self):
+        """below: nws_max=67.5, threshold=69, margin=1.5 < 2.0 → reject."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="below",
+            threshold=69.0, no_margin=5.0, nws_max=67.5,
+            emos_no=0.95, ngboost_no=0.99, drn_no=0.98,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_below_sufficient_nws_margin_passes(self):
+        """below: nws_max=66, threshold=69, margin=3.0 >= 2.0 → allow."""
+        cfg = self._cfg()
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="below",
+            threshold=69.0, no_margin=5.0, nws_max=66.0,
+            emos_no=0.95, ngboost_no=0.99, drn_no=0.98,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_model_divergence_rejects(self):
+        """above: nws_max=80, consensus=74 (69+5), divergence=6 > 5.0 → reject."""
+        cfg = self._cfg(max_nws_model_divergence=5.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=80.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is False
+
+    def test_nws_model_divergence_passes(self):
+        """above: nws_max=76, consensus=74 (69+5), divergence=2 <= 5.0 → allow."""
+        cfg = self._cfg(max_nws_model_divergence=5.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=76.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_zero_skips_filter(self):
+        """nws_max=0.0 means unavailable — NWS filters must be skipped."""
+        cfg = self._cfg(min_nws_margin=2.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=0.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
+
+    def test_nws_margin_exact_boundary_passes(self):
+        """above: nws_max=71, threshold=69, margin=2.0 == min_nws_margin → allow (>=)."""
+        cfg = self._cfg(min_nws_margin=2.0)
+        score = _make_score(
+            no_p_win=0.98, n_models=3, direction="above",
+            threshold=69.0, no_margin=5.0, nws_max=71.0,
+        )
+        _, passes = should_quote(cfg, score, drift_cities=set())
+        assert passes is True
