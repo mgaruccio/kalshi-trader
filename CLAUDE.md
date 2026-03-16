@@ -29,10 +29,11 @@ WebSocket data ingestion into ParquetDataCatalog for backtesting archives. Runs 
 
 ### Critical modules
 - **`kalshi/`**: Kalshi ↔ NautilusTrader adapter package. `KalshiDataClient` (WebSocket market data), `KalshiExecutionClient` (order routing), `KalshiInstrumentProvider` (market discovery). REST calls offloaded to `asyncio.to_thread()`. Config overrides via `base_url_http`/`base_url_ws`. Factory singleton `_SHARED_PROVIDER` must be reset to `None` between test runs.
-- **`kalshi/strategy.py`**: `WeatherMakerStrategy` — forecast-filtered passive market maker. Supports `dry_run` mode (log orders instead of submitting, simulated balance tracking). Config via `WeatherMakerConfig`.
+- **`kalshi/strategy.py`**: `WeatherMakerStrategy` — forecast-filtered passive market maker. No dry-run branching — strategy code is identical in live and sandbox modes. Config via `WeatherMakerConfig`.
+- **`kalshi/sandbox.py`**: `KalshiSandboxExecClientFactory` — wraps NT's `SandboxExecutionClient` with `BestPriceFillModel` for `--dry-run` mode. Real fills, positions, and portfolio tracking via simulated exchange.
 - **`kalshi/backtest.py`** + **`kalshi/backtest_results.py`**: Backtest engine and result extraction (mark-to-market PnL, per-city breakdown).
 - **`collector.py`**: Discovery strategy + TradingNode bootstrap. Uses `KalshiInstrumentProvider(load_all=False)` since the strategy discovers markets itself. Must call `cache.add_instrument(inst)` before subscribing to quote ticks — StreamingFeatherWriter silently drops ticks for instruments not in cache.
-- **`scripts/run_trader.py`**: Live/demo trader bootstrap. `--dry-run` skips exec client entirely. `--environment production --dry-run` is safe (no orders). KXHIGH instruments loaded via per-city `series_tickers` list (~204 markets in ~1s).
+- **`scripts/run_trader.py`**: Live/demo trader bootstrap. `--dry-run` uses `SandboxExecutionClient` (simulated exchange with real market data). `--environment production --dry-run` is safe (no real orders). KXHIGH instruments loaded via per-city `series_tickers` list (~204 markets in ~1s).
 
 ### Deployment
 Production droplet at `161.35.114.105`. Deploy by pushing to master and pulling on the droplet (or scp for hotfixes).

@@ -61,7 +61,7 @@ def _parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         default=False,
-        help="Log-only mode: log orders instead of submitting. No exec client needed.",
+        help="Sandbox mode: real market data, simulated execution via SandboxExecutionClient.",
     )
     parser.add_argument(
         "--starting-balance",
@@ -146,9 +146,6 @@ def _build_strategy_config(args: argparse.Namespace):
     from kalshi.strategy import WeatherMakerConfig
 
     overrides: dict = {}
-    if args.dry_run:
-        overrides["dry_run"] = True
-        overrides["dry_run_balance_usd"] = args.starting_balance
     if args.confidence_threshold is not None:
         overrides["confidence_threshold"] = args.confidence_threshold
     if args.ladder_depth is not None:
@@ -193,6 +190,7 @@ def main() -> None:
         KalshiLiveDataClientFactory,
         KalshiLiveExecClientFactory,
     )
+    from kalshi.sandbox import KalshiSandboxExecClientFactory
     from kalshi.signal_actor import SignalActor, SignalActorConfig
     from kalshi.strategy import WeatherMakerStrategy
 
@@ -222,8 +220,8 @@ def main() -> None:
     if args.dry_run:
         print(
             f"{'=' * 60}\n"
-            f"  DRY-RUN MODE — no orders will be submitted\n"
-            f"  Simulated balance: ${args.starting_balance}\n"
+            f"  SANDBOX MODE — real data, simulated execution\n"
+            f"  Starting balance: ${args.starting_balance}\n"
             f"{'=' * 60}"
         )
 
@@ -238,14 +236,24 @@ def main() -> None:
     )
 
     # --- TradingNode ---
-    # In dry-run mode, skip the exec client entirely — no connection to
-    # Kalshi order API. portfolio.account() will return None, which is
-    # fine since the strategy uses simulated balance in dry-run.
     if args.dry_run:
+        from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
+
+        sandbox_exec_cfg = SandboxExecutionClientConfig(
+            venue="KALSHI",
+            oms_type="HEDGING",
+            account_type="CASH",
+            base_currency="USD",
+            starting_balances=[f"{args.starting_balance} USD"],
+            use_position_ids=True,
+        )
         node_config = TradingNodeConfig(
             trader_id="KALSHI-TRADER-001",
             data_clients={
                 "KALSHI": data_cfg,
+            },
+            exec_clients={
+                "KALSHI": sandbox_exec_cfg,
             },
         )
     else:
@@ -267,7 +275,9 @@ def main() -> None:
     node = TradingNode(config=node_config)
 
     node.add_data_client_factory("KALSHI", KalshiLiveDataClientFactory)
-    if not args.dry_run:
+    if args.dry_run:
+        node.add_exec_client_factory("KALSHI", KalshiSandboxExecClientFactory)
+    else:
         node.add_exec_client_factory("KALSHI", KalshiLiveExecClientFactory)
     node.build()
 

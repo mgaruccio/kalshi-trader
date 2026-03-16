@@ -52,9 +52,6 @@ class TestWeatherMakerConfig:
         assert cfg.exit_price_cents == 97
         assert cfg.max_drawdown_pct == 0.15
         assert cfg.halt_file_path == "/tmp/kalshi-halt"
-        assert cfg.entry_phase_start_et == "10:30"
-        assert cfg.entry_phase_end_et == "15:00"
-        assert cfg.tomorrow_min_age_minutes == 30
         assert cfg.max_entry_cents == 96
 
     def test_custom_values(self):

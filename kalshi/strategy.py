@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, time
-from zoneinfo import ZoneInfo
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
@@ -17,7 +15,6 @@ from kalshi.common.constants import KALSHI_VENUE
 from kalshi.providers import parse_instrument_id
 from kalshi.signals import ForecastDrift, SignalScore
 
-_ET = ZoneInfo("America/New_York")
 _USD = Currency.from_str("USD")
 
 
@@ -43,20 +40,11 @@ class WeatherMakerConfig(StrategyConfig, frozen=True):
     # Exit
     exit_price_cents: int = 97          # close position when bid reaches this
 
-    # Time-of-day gating (ET)
-    entry_phase_start_et: str = "10:30"
-    entry_phase_end_et: str = "15:00"
-    tomorrow_min_age_minutes: int = 30  # delay for tomorrow contract entry
-
     # Circuit breaker
     max_drawdown_pct: float = 0.15
     small_account_drawdown_pct: float = 0.25   # relaxed limit when balance < threshold
     small_account_threshold_usd: int = 100     # accounts below this use relaxed limit
     halt_file_path: str = "/tmp/kalshi-halt"
-
-    # Dry-run mode — log orders instead of submitting
-    dry_run: bool = False
-    dry_run_balance_usd: int = 20              # simulated starting capital
 
 
 def should_quote(
@@ -177,12 +165,8 @@ class WeatherMakerStrategy(Strategy):
         self._last_anchor: dict[str, int] = {}
         self._halted: bool = False
         self._initial_balance_cents: int = 0
-        # ticker -> ns timestamp when it first passed filter (for tomorrow gating)
-        self._first_quoted_ns: dict[str, int] = {}
         # tickers with an IOC exit order in-flight (prevents duplicate exits)
         self._exiting_tickers: set[str] = set()
-        # Dry-run simulated balance tracker
-        self._dry_run_balance_cents: int = 0
         # Diagnostic counters
         self._signals_received: int = 0
         self._filter_passes: int = 0
@@ -195,23 +179,15 @@ class WeatherMakerStrategy(Strategy):
         self.subscribe_data(DataType(SignalScore))
         self.subscribe_data(DataType(ForecastDrift))
         # Record initial balance for drawdown circuit breaker
-        if self._config.dry_run:
-            self._initial_balance_cents = self._config.dry_run_balance_usd * 100
-            self._dry_run_balance_cents = self._initial_balance_cents
-            self.log.info(
-                f"DRY-RUN MODE — no orders will be submitted, "
-                f"simulated balance {self._initial_balance_cents}c"
-            )
-        else:
-            account = self.portfolio.account(KALSHI_VENUE)
-            if account is not None:
-                bal = account.balances().get(_USD)
-                if bal is not None:
-                    self._initial_balance_cents = int(bal.total.as_double() * 100)
-            self.log.info(
-                f"WeatherMakerStrategy started — subscribed to signals, "
-                f"initial balance {self._initial_balance_cents}c"
-            )
+        account = self.portfolio.account(KALSHI_VENUE)
+        if account is not None:
+            bal = account.balances().get(_USD)
+            if bal is not None:
+                self._initial_balance_cents = int(bal.total.as_double() * 100)
+        self.log.info(
+            f"WeatherMakerStrategy started — subscribed to signals, "
+            f"initial balance {self._initial_balance_cents}c"
+        )
 
     def on_stop(self) -> None:
         open_orders = self.cache.orders_open(strategy_id=self.id)
@@ -291,9 +267,6 @@ class WeatherMakerStrategy(Strategy):
         if passes and ticker not in self._quoted_tickers:
             self._filter_passes += 1
             self._quoted_tickers.add(ticker)
-            # Record first-seen time for tomorrow contract gating
-            if ticker not in self._first_quoted_ns:
-                self._first_quoted_ns[ticker] = self.clock.timestamp_ns()
             self.log.info(
                 f"Filter PASS: {ticker} ({side} side, "
                 f"p_win={score.no_p_win if side == 'no' else score.yes_p_win:.3f})"
@@ -378,18 +351,14 @@ class WeatherMakerStrategy(Strategy):
             return
         self._cancel_all_for_ticker(ticker)
 
-        # Resolve balance — dry-run uses simulated tracker, live uses portfolio
-        if self._config.dry_run:
-            balance_cents = self._dry_run_balance_cents
-        else:
-            account = self.portfolio.account(instrument_id.venue)
-            if account is None:
-                self.log.warning(f"No account for {instrument_id.venue}")
-                return
-            usd_balance = account.balances().get(_USD)
-            if usd_balance is None:
-                return
-            balance_cents = int(usd_balance.total.as_double() * 100)
+        account = self.portfolio.account(instrument_id.venue)
+        if account is None:
+            self.log.warning(f"No account for {instrument_id.venue}")
+            return
+        usd_balance = account.balances().get(_USD)
+        if usd_balance is None:
+            return
+        balance_cents = int(usd_balance.total.as_double() * 100)
 
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
@@ -421,26 +390,16 @@ class WeatherMakerStrategy(Strategy):
             if allowed_qty <= 0:
                 break
 
-            if self._config.dry_run:
-                cost_cents = allowed_qty * price_cents
-                self.log.info(
-                    f"DRY-RUN BUY: {instrument_id} {allowed_qty}@{price_cents}c "
-                    f"(cost={cost_cents}c, balance={balance_cents}c→{balance_cents - cost_cents}c)"
-                )
-                self._dry_run_balance_cents -= cost_cents
-                balance_cents = self._dry_run_balance_cents
-                self._orders_submitted += 1
-            else:
-                order = self.order_factory.limit(
-                    instrument_id=instrument_id,
-                    order_side=OrderSide.BUY,
-                    quantity=instrument.make_qty(allowed_qty),
-                    price=instrument.make_price(price_cents / 100.0),
-                    time_in_force=TimeInForce.GTC,
-                )
-                self.submit_order(order)
-                self._orders_submitted += 1
-                new_order_ids.append(order.client_order_id)
+            order = self.order_factory.limit(
+                instrument_id=instrument_id,
+                order_side=OrderSide.BUY,
+                quantity=instrument.make_qty(allowed_qty),
+                price=instrument.make_price(price_cents / 100.0),
+                time_in_force=TimeInForce.GTC,
+            )
+            self.submit_order(order)
+            self._orders_submitted += 1
+            new_order_ids.append(order.client_order_id)
 
             # Update local tally for subsequent ladder levels
             market_exposure += allowed_qty * price_cents
@@ -448,9 +407,7 @@ class WeatherMakerStrategy(Strategy):
 
         self._resting_orders[ticker] = new_order_ids
         self._last_anchor[ticker] = bid_cents
-        if self._config.dry_run:
-            self._ladders_placed += 1
-        elif new_order_ids:
+        if new_order_ids:
             self._ladders_placed += 1
 
     def _exit_position(self, ticker: str, instrument_id: InstrumentId, bid_cents: int) -> None:
@@ -463,23 +420,11 @@ class WeatherMakerStrategy(Strategy):
 
         Guard against duplicate exits: if exits are already in-flight for
         this ticker, skip. Cleared in on_order_filled / on_order_rejected.
-
-        In dry-run mode: log the exit and credit simulated proceeds.
         """
         if ticker in self._exiting_tickers:
             return
 
         self._cancel_all_for_ticker(ticker)
-
-        if self._config.dry_run:
-            # In dry-run mode, we don't have real positions. Credit proceeds
-            # based on the bid price for any simulated cost already deducted.
-            self._exits_attempted += 1
-            self.log.info(
-                f"DRY-RUN EXIT: {ticker} at {bid_cents}c "
-                f"(balance={self._dry_run_balance_cents}c)"
-            )
-            return
 
         instrument = self.cache.instrument(instrument_id)
         if instrument is None:
@@ -540,45 +485,6 @@ class WeatherMakerStrategy(Strategy):
         return total
 
     # ------------------------------------------------------------------
-    # Time-of-day and tomorrow contract helpers
-    # ------------------------------------------------------------------
-
-    def _in_entry_phase(self) -> bool:
-        """Return True if current ET time is within the entry phase window."""
-        now_ns = self.clock.timestamp_ns()
-        now_et = datetime.fromtimestamp(now_ns / 1e9, tz=_ET).time()
-        h_start, m_start = (int(x) for x in self._config.entry_phase_start_et.split(":"))
-        h_end, m_end = (int(x) for x in self._config.entry_phase_end_et.split(":"))
-        start = time(h_start, m_start)
-        end = time(h_end, m_end)
-        return start <= now_et < end
-
-    def _is_tomorrow_contract(self, ticker: str) -> bool:
-        """Return True if this ticker settles tomorrow (not today)."""
-        # Ticker format: KXHIGHNY-26MAR15-T54 — date part is index 1
-        parts = ticker.split("-")
-        if len(parts) < 2:
-            return False
-        date_str = parts[1]  # e.g. "26MAR15"
-        try:
-            # Parse YYMONDD: e.g. "26MAR15" -> 2026-03-15
-            settlement = datetime.strptime(date_str, "%y%b%d").date()
-            now_ns = self.clock.timestamp_ns()
-            today = datetime.fromtimestamp(now_ns / 1e9, tz=_ET).date()
-            return settlement > today
-        except ValueError:
-            return False
-
-    def _tomorrow_delay_elapsed(self, ticker: str) -> bool:
-        """Return True if enough time has passed since first quote for a tomorrow contract."""
-        first_ns = self._first_quoted_ns.get(ticker, 0)
-        if first_ns == 0:
-            return False
-        elapsed_ns = self.clock.timestamp_ns() - first_ns
-        delay_ns = self._config.tomorrow_min_age_minutes * 60 * 1_000_000_000
-        return elapsed_ns >= delay_ns
-
-    # ------------------------------------------------------------------
     # Circuit breaker
     # ------------------------------------------------------------------
 
@@ -599,11 +505,7 @@ class WeatherMakerStrategy(Strategy):
 
         # Drawdown check — portfolio value vs initial balance
         if self._initial_balance_cents > 0:
-            portfolio_cents = (
-                self._dry_run_balance_cents
-                if self._config.dry_run
-                else self._portfolio_value_cents()
-            )
+            portfolio_cents = self._portfolio_value_cents()
             if portfolio_cents is not None:
                 drawdown = (self._initial_balance_cents - portfolio_cents) / self._initial_balance_cents
                 # Small accounts get a relaxed drawdown limit
