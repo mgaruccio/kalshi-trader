@@ -246,6 +246,7 @@ def main() -> None:
             base_currency="USD",
             starting_balances=[f"{args.starting_balance} USD"],
             use_position_ids=True,
+            reconciliation=False,  # sandbox has no prior state to reconcile
         )
         node_config = TradingNodeConfig(
             trader_id="KALSHI-TRADER-001",
