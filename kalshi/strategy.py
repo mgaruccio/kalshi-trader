@@ -7,7 +7,7 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import DataType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.identifiers import ClientId, ClientOrderId, InstrumentId, Symbol
+from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId, Symbol
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.trading.strategy import Strategy
 
@@ -176,12 +176,14 @@ class WeatherMakerStrategy(Strategy):
         self._orders_submitted: int = 0
 
     def on_start(self) -> None:
-        # client_id routes the SubscribeData command to the KALSHI data client
-        # (which no-ops for custom types). Without it, subscribe_data logs an
-        # error even though the msgbus subscription still registers.
-        data_client = ClientId("KALSHI")
-        self.subscribe_data(DataType(SignalScore), client_id=data_client)
-        self.subscribe_data(DataType(ForecastDrift), client_id=data_client)
+        # Subscribe directly to msgbus for custom data published by SignalActor.
+        # subscribe_data() requires client_id or instrument_id to route a
+        # SubscribeData command, but SignalActor publishes via publish_data()
+        # which writes directly to the bus — no data client subscription needed.
+        for data_type in (DataType(SignalScore), DataType(ForecastDrift)):
+            topic = f"data.{data_type.topic}"
+            if not self.msgbus.is_subscribed(topic=topic, handler=self.handle_data):
+                self.msgbus.subscribe(topic=topic, handler=self.handle_data)
         # Record initial balance for drawdown circuit breaker
         account = self.portfolio.account(KALSHI_VENUE)
         if account is not None:
