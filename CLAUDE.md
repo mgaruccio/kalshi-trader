@@ -22,7 +22,7 @@ uv run collector.py
 
 ## Architecture
 
-This repo contains the **Kalshi NautilusTrader adapter**, **data collector**, **backtest pipeline**, and **dry-run trader** for KXHIGH (daily high temperature) prediction markets.
+This repo contains the **Kalshi NautilusTrader adapter**, **data collector**, **backtest pipeline**, and **sandbox trader** for KXHIGH (daily high temperature) prediction markets.
 
 ### Collector (`collector.py`)
 WebSocket data ingestion into ParquetDataCatalog for backtesting archives. Runs as a systemd service on the production droplet (161.35.114.105). Discovery strategy finds KXHIGH series, subscribes to quote ticks, and persists via StreamingFeatherWriter. Production-hardened: heartbeat timer (tick count/60s), event loop reference caching, background thread error surfacing, consecutive failure escalation, unopened market discovery.
@@ -38,7 +38,7 @@ WebSocket data ingestion into ParquetDataCatalog for backtesting archives. Runs 
 ### Deployment
 Production droplet at `161.35.114.105`. Deploy by pushing to master and pulling on the droplet (or scp for hotfixes).
 - **Collector**: `systemctl {start,stop,restart} collector.service`. Logs at `/root/kalshi-trader/collector.log`. Data at `kalshi_data_catalog/` (3.6GB+).
-- **Trader**: `systemctl {start,stop,restart} trader.service`. Logs at `/root/kalshi-trader/trader.log`. Currently in dry-run mode ($20 simulated). Heartbeat at `/tmp/kalshi-trader-heartbeat`.
+- **Trader**: `systemctl {start,stop,restart} trader.service`. Logs at `/root/kalshi-trader/trader.log`. Currently in sandbox mode ($20 simulated via SandboxExecutionClient). Heartbeat at `/tmp/kalshi-trader-heartbeat`.
 - **PYTHONPATH**: `trader.service` sets `PYTHONPATH=/root/kalshi-trader` — required because systemd scripts set `sys.path[0]` to the scripts/ directory.
 
 ## Key Conventions
