@@ -65,6 +65,7 @@ def parse_score_msg(msg: dict, ts_ns: int) -> SignalScore | None:
         yes_bid=yes_bid,
         yes_ask=int(msg.get("yes_ask", 0)),
         status=str(msg.get("status", "")),
+        nws_max=float(msg.get("nws_max") or 0.0),
         ts_event=ts_ns,
         ts_init=ts_ns,
     )
