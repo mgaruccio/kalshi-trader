@@ -356,12 +356,25 @@ class WeatherMakerStrategy(Strategy):
         # Cheap halt check on every tick (halt file only, no position iteration)
         if not self._halted and os.path.exists(self._config.halt_file_path):
             self._trigger_halt("halt file present")
-        if self._halted:
-            return
 
         try:
             base_ticker, tick_side = parse_instrument_id(tick.instrument_id)
         except ValueError:
+            return
+
+        bid_cents = round(float(tick.bid_price) * 100)
+        if bid_cents <= 0:
+            return
+
+        # Exit check runs ALWAYS — even when halted, positions must be closeable.
+        # Without this, the circuit breaker strands open positions that can never
+        # be exited, causing phantom drawdown and capital lockup.
+        if bid_cents >= self._config.exit_price_cents:
+            self._exit_position(base_ticker, tick.instrument_id, bid_cents)
+            return
+
+        # All order-placement logic is blocked while halted
+        if self._halted:
             return
 
         if base_ticker not in self._quoted_tickers:
@@ -373,15 +386,6 @@ class WeatherMakerStrategy(Strategy):
 
         side, passes = should_quote(self._config, score, self._drift_cities)
         if not passes or tick_side != side:
-            return
-
-        bid_cents = round(float(tick.bid_price) * 100)
-        if bid_cents <= 0:
-            return
-
-        # Check exit condition
-        if bid_cents >= self._config.exit_price_cents:
-            self._exit_position(base_ticker, tick.instrument_id, bid_cents)
             return
 
         # Dead-zone check

@@ -78,6 +78,7 @@ def _make_strategy(config: WeatherMakerConfig | None = None):
         "_check_circuit_breaker",
         "_portfolio_value_cents",
         "_trigger_halt",
+        "on_quote_tick",
         "on_order_filled",
         "on_order_rejected",
         "on_stop",
@@ -277,6 +278,149 @@ class TestCircuitBreaker:
         strategy.cache.positions.return_value = []
         strategy._check_circuit_breaker()
         assert strategy._halted is False
+
+
+class TestExitWhileHalted:
+    """Exit check must run even when the circuit breaker has halted quoting.
+
+    Without this, positions get stranded: the CB cancels existing orders and
+    blocks _reprice_ladder, but the _exit_position path (triggered by
+    bid >= exit_price_cents) was ALSO blocked by the early return.
+    """
+
+    def _make_tick(self, instrument_id, bid_price: float, ask_price: float = 0.99):
+        tick = MagicMock()
+        tick.instrument_id = instrument_id
+        tick.bid_price = bid_price
+        tick.ask_price = ask_price
+        return tick
+
+    def test_exit_fires_when_halted(self, tmp_path):
+        """Halted strategy still exits positions when bid >= exit_price_cents."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(
+            exit_price_cents=97,
+            halt_file_path=str(tmp_path / "no-such-file"),
+        )
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        # Set up an open position
+        pos = MagicMock()
+        pos.instrument_id = instrument_id
+        pos.is_closed = False
+        pos.is_long = True
+        pos.quantity.as_double.return_value = 3.0
+        strategy.cache.positions.return_value = [pos]
+        instrument = MagicMock()
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+
+        # Halt the strategy
+        strategy._halted = True
+
+        # Send a tick at exit price
+        tick = self._make_tick(instrument_id, bid_price=0.97)
+        strategy.on_quote_tick(tick)
+
+        # Should have submitted a SELL order despite being halted
+        assert strategy.submit_order.call_count == 1
+        assert strategy._exits_attempted == 1
+
+    def test_no_new_orders_when_halted_below_exit(self, tmp_path):
+        """Halted strategy does NOT place new buy orders even below exit price."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(
+            exit_price_cents=97,
+            halt_file_path=str(tmp_path / "no-such-file"),
+        )
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        # Even with a score and quoted ticker, halted should block new orders
+        strategy._quoted_tickers.add(ticker)
+        strategy._scores[ticker] = _make_score()
+
+        strategy._halted = True
+
+        tick = self._make_tick(instrument_id, bid_price=0.90)
+        strategy.on_quote_tick(tick)
+
+        # No orders should be placed
+        strategy.submit_order.assert_not_called()
+
+    def test_exit_fires_when_halted_multiple_positions(self, tmp_path):
+        """All open positions on an instrument are exited even when halted."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(
+            exit_price_cents=97,
+            halt_file_path=str(tmp_path / "no-such-file"),
+        )
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        # Three separate open positions (as NT creates per-fill)
+        positions = []
+        for qty in [3, 2, 1]:
+            pos = MagicMock()
+            pos.instrument_id = instrument_id
+            pos.is_closed = False
+            pos.is_long = True
+            pos.quantity.as_double.return_value = float(qty)
+            positions.append(pos)
+        strategy.cache.positions.return_value = positions
+        instrument = MagicMock()
+        strategy.cache.instrument.return_value = instrument
+        strategy.cache.orders_open.return_value = []
+
+        strategy._halted = True
+
+        tick = self._make_tick(instrument_id, bid_price=0.98)
+        strategy.on_quote_tick(tick)
+
+        # One SELL per position
+        assert strategy.submit_order.call_count == 3
+        assert strategy._exits_attempted == 1
+
+    def test_exit_does_not_fire_below_exit_price(self, tmp_path):
+        """Below exit_price_cents, no exit even if not halted."""
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol
+        from kalshi.common.constants import KALSHI_VENUE
+
+        cfg = WeatherMakerConfig(
+            exit_price_cents=97,
+            halt_file_path=str(tmp_path / "no-such-file"),
+        )
+        strategy = _make_strategy(cfg)
+        ticker = "KXHIGHNY-26MAR15-T54"
+        instrument_id = InstrumentId(Symbol(f"{ticker}-NO"), KALSHI_VENUE)
+
+        pos = MagicMock()
+        pos.instrument_id = instrument_id
+        pos.is_closed = False
+        pos.is_long = True
+        pos.quantity.as_double.return_value = 3.0
+        strategy.cache.positions.return_value = [pos]
+
+        # NOT halted, but bid below exit price — should enter reprice path
+        strategy._halted = False
+        strategy._quoted_tickers.add(ticker)
+        strategy._scores[ticker] = _make_score()
+
+        tick = self._make_tick(instrument_id, bid_price=0.95)
+        strategy.on_quote_tick(tick)
+
+        # _exit_position should NOT have been called
+        assert strategy._exits_attempted == 0
 
 
 class TestExitGuard:
